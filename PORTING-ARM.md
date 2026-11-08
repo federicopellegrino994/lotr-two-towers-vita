@@ -1,0 +1,161 @@
+# Port ARM / PS Vita — stato delle modifiche
+
+Prima tappa verso la Vita: far girare il runtime su un host a 32 bit non x86
+(Linux armhf, poi vitasdk). Le modifiche sono attive solo con
+`RECOMP_COMPACT_GUEST`: senza, il comportamento per Windows/Linux x86-64 è
+identico all'originale (il test `tests/memory_layout_posix` passa uguale).
+
+## Cosa è stato fatto
+
+### 1. Memoria guest compatta (`RECOMP_COMPACT_GUEST`)
+Il modello originale riserva tutti i 4 GB del guest più 28 copie speculari
+della RAM a indirizzi host fissi: impossibile su un processo a 32 bit.
+
+Ora lo spazio guest è diviso in 256 fette da 16 MB e una tabella dice dove
+vive ciascuna:
+
+    host = g_xbox_region_base[va >> 24] + (va & g_xbox_region_mask[va >> 24])
+
+- RAM (64 MB): un solo blocco; le copie speculari fino a 0x80000000 le fa la
+  maschera, senza memoria in più.
+- Finestra contigua 0x80000000 (64 MB): blocco separato, come l'originale.
+- Apertura "tiled" 0xF0000000: alias della finestra contigua via tabella.
+- NV2A 0xFD000000, MCPX 0xFE800000, flash 0xFF000000: blocchi propri.
+- Fette non mappate: base 0, quindi crash all'indirizzo 0 invece di
+  corrompere memoria in silenzio.
+
+Totale ≈ 176 MB di memoria host, nessun indirizzo fisso.
+
+File: `templates/runtime/recomp_types.h` (macro del codice generato),
+`src/kernel/xbox_memory_layout.c/.h` (allocazione, tabella, `xbox_HostPtr`),
+`CMakeLists.txt` (opzione `XBOXRECOMP_COMPACT_GUEST`, accesa di default su
+qualunque CPU non x86 e propagata al gioco).
+
+### 2. Accessi non allineati sicuri
+Su ARMv7 `VLDR/VSTR` (float/double) e `LDRD/STRD` (64 bit) vanno in crash
+con indirizzi non allineati; il codice Xbox non garantisce l'allineamento.
+Su host non x86 ogni `MEMx` passa per una struct packed a un campo: resta un
+lvalue (`MEMF(a) = x;` funziona) e il compilatore sceglie da solo la forma
+sicura. Verificato sull'assembly ARMv7 (clang, -O2):
+
+| macro      | istruzioni generate            |
+|------------|--------------------------------|
+| `MEM32`    | `ldr`                          |
+| `MEMF`     | `ldr` + `vmov` (niente `vldr`) |
+| `MEMD`     | `vst1.8` (tollera disallineo)  |
+| `SMEM64`   | due `ldr` (niente `ldrd`)      |
+
+Costo della traduzione indirizzi: due load dalla tabella, un AND, un ADD.
+
+### 3. Registri hardware (MMIO)
+APU, AC'97 e USB venivano emulati intercettando i fault e decodificando
+l'istruzione x86-64 che li causava: su ARM non può funzionare. In modalità
+compatta queste trappole sono spente con un messaggio chiaro nel log.
+- Gli accessi APU a indirizzo costante passano già per chiamate dirette
+  (`postproc_apu.py` → `xbox_apu_r32/w32`), che funzionano su qualunque host.
+- Restano da fare: accessi APU a indirizzo calcolato e USB (OHCI). Per il
+  primo avvio: `[Input] usb=0` nell'ini (input HLE) e audio da considerare
+  incompleto.
+
+### 4. Strumento di verifica: `tools/compact_audit.py`
+Elenca il codice del runtime che fa ancora `offset + va` in modo piatto.
+- `WRONG`: indirizzo sicuramente fuori dalla RAM → 0 (i 5 casi trovati con
+  0x80000000 fisso in `heroes.c` e `ohci.c` sono stati convertiti a
+  `xbox_HostPtr`).
+- `CHECK`: 147 punti in cui l'indirizzo arriva da una variabile. Giusti solo
+  se è sempre RAM. Il grosso è nel renderer (`nv2a_pb_exec.c`,
+  `nv2a_gl.inc`, `nv2a_d3d11.inc`): texture e pushbuffer stanno nella
+  finestra contigua, quindi vanno convertiti. Visto che il backend grafico
+  va comunque riscritto per la Vita, conviene farlo lì.
+- Con `--gen <cartella>` controlla anche il codice generato.
+
+## Test
+`tests/compact_guest/` — 18 controlli: specchi della RAM, finestra contigua
+separata, alias tiled, aperture NV2A/MCPX/flash, fette non mappate,
+coerenza `g_xbox_mem_offset` per la RAM, `MEMF/MEMD/SMEM64/MEM16` a indirizzi
+dispari. Tutti passano su x86-64 sia con le macro dirette sia con quelle
+packed. Il test originale `memory_layout_posix` passa invariato.
+
+## Prossimi passi
+1. Generare il codice dal proprio `default.xbe` (Xbox USA retail):
+   `python3 generate.py <cartella del disco>`.
+2. Build Linux armhf (Raspberry Pi 2/3) con `XBOXRECOMP_COMPACT_GUEST=ON`:
+   prima misura reale delle prestazioni.
+3. Convertire i `CHECK` del renderer a `xbox_HostPtr`.
+4. Stack del thread principale: il gioco ne usa fino a 64 MB su desktop;
+   sulla Vita va creato un thread dedicato con stack grande.
+5. Backend grafico per vitaGL (o GXM) al posto di GL 3.3 core.
+
+
+---
+
+# Stato PS Vita (8 novembre 2026, sera)
+
+**Il gioco gira sulla Vita**: arriva al menu iniziale, la schermata di
+caricamento si vede, ~9 fps con il renderer software. Testato su console.
+
+## Come si costruisce
+- vitasdk 2026-10-15 (x86_64 linux), più dal sorgente: SDL2 (branch SDL2),
+  vitaGL (HAVE_GLSL_SUPPORT=1), vitaShaRK, SceShaccCgExt, math-neon; stub
+  taiHEN generati con vita-elf-export dagli exports.yml (NID dai nomi).
+  SceShaccCgExt e vitaShaRK vanno compilati con -std=gnu17 (GCC 15).
+- `python generate.py default.xbe` (copia Xbox USA retail), poi
+  `cmake -S twotowers -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake`
+  e `ninja`: produce TwoTowers.vpk.
+- Sulla Vita: ux0:data/twotowers/game_files/ = contenuto del disco
+  (tools/xiso_extract_xbe.py estrae default.xbe; serve l'estrazione completa).
+  Log: ux0:data/twotowers/twotowers_log.txt; crash: ux0:data/*.psp2dmp
+  (letti con un parser Python dei core Vita + arm-vita-eabi-addr2line,
+  testo a 0x81000000).
+
+## Problemi risolti sulla console (in ordine)
+1. emutls di libgcc rotto con pthread-embedded -> vita_emutls.c (stessa ABI).
+2. Accessi a regioni non-RAM con la somma piatta -> XR_HOST/XR_PTR inline
+   (xbox_memory_layout.h) + tools/compact_rewrite.py su ~80 punti; inverso
+   xbox_GuestVa.
+3. APU: lettura fisica della finestra contigua tramite tabella.
+4. Log una scrittura su card per riga (~12 ms) -> buffer + flush ogni 500 ms.
+5. Stack dei thread 64 MB (la Vita li alloca subito) -> 2 MB runtime,
+   4 MB thread del gioco, 16 MB thread principale; heap newlib 240 MB.
+
+## Prossimi passi
+1. **Renderer GPU con vitaGL** (il collo di bottiglia: ~113 ms su ~117 ms per
+   frame sono il rasterizzatore software). Piano: portare nv2a_gl.inc
+   mantenendo la trasformazione vertici su CPU (gpu_transform_all) e i pixel
+   shader specializzati (hwps_translate) generati in **Cg** invece di GLSL
+   330; contesto con vglInit e presentazione con vglSwapBuffers (niente SDL
+   video: vitaGL e il renderer GXM di SDL non convivono); UBO -> glUniform.
+   Tappe: clear+present, triangoli senza texture, texture, combiner.
+   Funzioni GL mancanti in vitaGL: glBlendColor, glDrawBuffer,
+   glRenderbufferStorageMultisample, glMaxShaderCompilerThreadsKHR.
+2. Audio: l'APU non avanza ("apu 0 periods").
+3. Prestazioni CPU: l'emutls costa una chiamata per accesso ai registri
+   emulati (RECOMP_TLS); valutare TLS nativa o registri per-thread in un
+   blocco puntato da un registro.
+4. printf di newlib senza %zu (estetico nei log).
+5. 147 punti CHECK residui (tools/compact_audit.py), soprattutto renderer.
+
+## vitaGL: tappa 1 fatta (verificata sulla console, VPK v9)
+- fb_present.c (`fb_vgl_loop`, solo __vita__): vglInitExtended(0, 960, 544,
+  1 MB, no MSAA), shader Cg compilati sulla console, immagine CPU come
+  texture 4:3, vglSwapBuffers. ~24 immagini/s presentate; il gioco resta a
+  ~9 fps (119 ms/frame nel rasterizzatore software).
+- Lezioni:
+  * vglInitExtended restituisce GL_TRUE solo se abbassa la risoluzione: non
+    è un flag di successo.
+  * Con HAVE_GLSL_SUPPORT=1, glCreateShader(GL_VERTEX_SHADER) tratta il testo
+    come GLSL: per sorgenti Cg usare GL_CG_VERTEX_SHADER_EXT /
+    GL_CG_FRAGMENT_SHADER_EXT, altrimenti glLinkProgram crasha in SceGxm.
+  * vitaGL e il renderer GXM di SDL non convivono: una volta su vitaGL non si
+    torna a SDL video.
+  * Lo splash di vitaGL resta (scelta di progetto).
+  * La libreria video del runtime deve linkare vitaGL & co. (ordine del
+    linker): src/video/CMakeLists.txt.
+- Tappa 2 (prossima): rasterizzazione su GPU. Punto d'aggancio: il
+  rasterizzatore software (nv2a_sw3d.inc) riceve i triangoli già trasformati;
+  un backend vitaGL può prenderli lì (stessa trasformazione su CPU) e
+  disegnarli in una texture-render-target per superficie, con shader Cg
+  generati per configurazione dei combiner (da hwps_translate in
+  nv2a_gl.inc). Il presentatore deve allora mostrare la render target invece
+  della copia CPU. Attenzione alle letture CPU delle superfici (render to
+  texture, screenshot): servirà un readback o il tracciamento GSurf.
