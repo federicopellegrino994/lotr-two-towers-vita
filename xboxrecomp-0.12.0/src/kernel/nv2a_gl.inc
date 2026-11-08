@@ -537,7 +537,7 @@ static void gpu_fbo_ms_forget(GLuint rb)
 
 static uint32_t gpu_mem_sum(uint32_t base, uint32_t bytes)
 {
-    const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset() + base;
+    const uint8_t *m = (const uint8_t *)XR_PTR(base);
     uint32_t h = 2166136261u, i, step = bytes / 1024;
     if (step < 4) step = 4;
     for (i = 0; i + 4 <= bytes && i < 1024 * step; i += step)
@@ -835,7 +835,7 @@ static GSurf *gsurf_get(uint32_t base, uint32_t w, uint32_t h, int depth)
     if (!depth) {
         /* Start from what the guest has there: a surface the CPU filled (or
          * the software path drew before the switch) keeps its picture. */
-        const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset() + base;
+        const uint8_t *m = (const uint8_t *)XR_PTR(base);
         uint32_t pitch = s_gpu.pitch && (s_gpu.pitch & 0xFFFF) >= w * 4 ? (s_gpu.pitch & 0xFFFF) : w * 4;
         if (dma_resolve(s_gpu.color_offset) != base) pitch = w * 4;
         gsurf_upload(s, m, pitch);
@@ -857,7 +857,7 @@ static void gsurf_sync_from_mem(GSurf *s)
     s->synced_run = g_pb_runs;
     sum = gpu_mem_sum(s->base, s->pitch * s->h);
     if (sum == s->mem_sum) return;
-    gsurf_upload(s, (const uint8_t *)xbox_GetMemoryOffset() + s->base, s->pitch);
+    gsurf_upload(s, (const uint8_t *)XR_PTR(s->base), s->pitch);
     s->mem_sum = sum;
 }
 
@@ -2834,6 +2834,13 @@ static GLuint hwps_lookup(const PsKey *k)
         if (!src) e->state = 2;
         else { e->fs = gpu_shader_start(GL_FRAGMENT_SHADER, src); free(src); }
     }
+#if defined(__vita__)
+    {
+        GLint ok = 0;
+        if (e->fs) glGetShaderiv(e->fs, GL_COMPILE_STATUS, &ok);
+        if (n < 8 || !ok) { fprintf(stderr, "  [VGL] combiner shader %u (%08X): %s\n", n, h, ok ? "compiled" : "FAILED"); fflush(stderr); }
+    }
+#endif
     g_hwps[n] = e;
     g_hwps_n = (LONG)(n + 1);
     last = e;
@@ -2932,6 +2939,18 @@ static void gpu_batch(void)
         g_slot_gen = (uint32_t *)calloc(SW3D_CACHE, 4);
         if (!g_slot || !g_slot_gen) return;
     }
+#if defined(__vita__)
+    {   /* (the first batches, written out at once: a crash keeps them) */
+        static unsigned nb;
+        if (nb < 4) {
+            fprintf(stderr, "  [VGL] batch %u: prim %u, %u indices, target %08X %ux%u%s\n", nb, s_gpu.prim, n,
+                    dma_resolve(s_gpu.color_offset), s_gpu.clip_x + s_gpu.clip_w, s_gpu.clip_y + s_gpu.clip_h,
+                    need_depth ? " + zeta" : "");
+            fflush(stderr);
+        }
+        nb++;
+    }
+#endif
     if (!gpu_bind_targets(need_depth)) return;
     if (!gpu_set_raster()) return;
     g_gen++; if (!g_gen) g_gen = 1;
@@ -3155,7 +3174,7 @@ static int gpu_blit(uint32_t sb, uint32_t db, uint32_t ix, uint32_t iy, uint32_t
 static void gpu_readback(uint32_t base, uint32_t pitch)
 {
     GSurf *s = gsurf_find(base, 0);
-    uint8_t *m = (uint8_t *)xbox_GetMemoryOffset() + base;
+    uint8_t *m = XR_PTR(base);
     if (!s) return;
     gsurf_resolve(s);
     if (!pitch) pitch = s->w * 4;

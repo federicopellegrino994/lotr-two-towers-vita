@@ -205,6 +205,15 @@ sulla CPU (gpu_transform_all), come previsto.
 - Rischi noti, da verificare sulla console: sintassi Cg accettata da
   SceShaccCg (provata solo a occhio), velocità di vitaGL con molti draw e
   upload BGRA->RGBA sulla CPU, memoria video con molte texture (GTEX_MAX 512).
+- Prima prova sulla console (v10): vitaGL parte, gli shader Cg compilano,
+  autotest "as OpenGL" (nessun flip). Poi data abort nel thread
+  dell'executor: vitaGL copiava una superficie 640 px da 0x05cc4000 --
+  nv2a_gl.inc faceva ancora `xbox_GetMemoryOffset() + base` (somma piatta,
+  sbagliata con la memoria compatta). v11: i 4 punti convertiti a XR_PTR,
+  piu' righe di log scritte subito ([VGL] batch N, [VGL] combiner shader N).
+  Lettura dei dump: in THREAD_INFO lo stop reason e' all'offset 0x74
+  (0x30004 = data abort); in THREAD_REG_INFO l'ultima parola dopo i
+  registri e' l'indirizzo del fault.
 - Prossimi passi: provare il VPK; se il quadro è capovolto forzare vita_flip;
   poi profilare (s_3d batches, tempo per frame) e, se serve, vertex program
   su GPU in Cg (hwvp_translate) e meno upload.
