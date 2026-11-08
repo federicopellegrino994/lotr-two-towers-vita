@@ -159,3 +159,52 @@ caricamento si vede, ~9 fps con il renderer software. Testato su console.
   nv2a_gl.inc). Il presentatore deve allora mostrare la render target invece
   della copia CPU. Attenzione alle letture CPU delle superfici (render to
   texture, screenshot): servirà un readback o il tracciamento GSurf.
+
+## vitaGL: tappa 2 — rasterizzazione su GPU (VPK v10, DA PROVARE SULLA CONSOLE)
+Scelta: invece di un backend nuovo agganciato a nv2a_sw3d.inc, il renderer
+OpenGL 3.3 esistente (nv2a_gl.inc: superfici GSurf, texture, blit, clear,
+combiner specializzati, presentazione) gira su vitaGL attraverso uno strato
+di compatibilità, `src/kernel/nv2a_gl_vita.inc`. Vertici sempre trasformati
+sulla CPU (gpu_transform_all), come previsto.
+
+- Cosa fa lo strato (dettagli in testa al file):
+  * shader in Cg: vertex shader principale, programmi a triangolo pieno
+    (copia, blit, clear, presentazione con gamma/saturazione) e un pixel
+    shader Cg per ogni configurazione dei combiner (hwps_translate_cg in
+    nv2a_gl.inc, stessa logica di hwps_translate). Compilati alla prima
+    occorrenza e messi in cache in ux0:data/twotowers/shader_cache/;
+  * niente UBO (glUniformBlockBinding in vitaGL è uno stub di 4 byte):
+    i dati di gpu_ub() vanno con glUniform4fv a uniform con nome prima di
+    ogni draw; le righe intere del blocco combiner diventano float;
+  * depth/stencil come renderbuffer GL_DEPTH24_STENCIL8 (vitaGL attacca solo
+    texture colore): non campionabili, il primo clear di una zeta aspetta un
+    target colore;
+  * vertici e indici da array client (vitaGL li copia al draw), indici a
+    32 bit; programmi a triangolo con attributo posizione (niente
+    gl_VertexID);
+  * orientamento delle superfici: autotest all'avvio (disegna in una
+    texture e ne legge la memoria). Se vitaGL riempie i framebuffer al
+    contrario di OpenGL, y, front face, scissor, viewport e blit vengono
+    compensati. Override: [Display] vita_flip=0/1 nell'ini
+    (RECOMP_VGL_FLIP);
+  * mancano: glBlendColor (fattori costanti -> ONE/ZERO), MSAA, FXAA e
+    sharpening (niente derivate), texture BC7 "Ultra", mipmap (spente di
+    default: RECOMP_MIPMAPS=1), vertex program su GPU (hwvp off).
+- Chi possiede vitaGL (fb_present.c): xbox_VitaGLAcquire/Release. Il renderer
+  GPU lo avvia sul thread dell'executor e presenta con vglSwapBuffers; il
+  thread dell'immagine aspetta fino a 30 s e, se il renderer non parte o
+  fallisce, torna al percorso CPU della tappa 1. Un solo thread chiama GL.
+- Default: main.c non forza più renderer=software; l'ini della Vita ha già
+  renderer=gpu. `[Display] renderer=software` = comportamento della v9.
+- Log da guardare (ux0:data/twotowers/twotowers_log.txt):
+  `[VGL] GPU renderer on ...`, `[VGL] surface test: row 0 = ...`,
+  `[GL] renderer up`, `[HWPS] ...`, `[VGL] frame N presented`,
+  eventuali `[GL] ... did not compile:` (errori Cg) e
+  `[VGL] the GPU renderer could not start`.
+  RECOMP_VGL_PSLOG=1 scrive i primi shader combiner generati.
+- Rischi noti, da verificare sulla console: sintassi Cg accettata da
+  SceShaccCg (provata solo a occhio), velocità di vitaGL con molti draw e
+  upload BGRA->RGBA sulla CPU, memoria video con molte texture (GTEX_MAX 512).
+- Prossimi passi: provare il VPK; se il quadro è capovolto forzare vita_flip;
+  poi profilare (s_3d batches, tempo per frame) e, se serve, vertex program
+  su GPU in Cg (hwvp_translate) e meno upload.

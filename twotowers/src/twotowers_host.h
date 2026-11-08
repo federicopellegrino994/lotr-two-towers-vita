@@ -365,6 +365,16 @@ static void twotowers_setup_paths_and_log(void)
         GetPrivateProfileStringA("Display", "renderer", "d3d11", r, sizeof(r), g_ini_path);
         _putenv_s("RECOMP_RENDERER", r[0] ? r : "d3d11");
     }
+#if defined(__vita__)
+    if (!getenv("RECOMP_VGL_FLIP")) {
+        /* (PS Vita) which way up vitaGL fills the game's surfaces: auto = the
+         * start-up test decides; 0 / 1 = force it (if the picture is upside
+         * down or the menus' render-to-texture is) */
+        char v[16] = "";
+        GetPrivateProfileStringA("Display", "vita_flip", "auto", v, sizeof(v), g_ini_path);
+        if (v[0] == '0' || v[0] == '1') { v[1] = 0; _putenv_s("RECOMP_VGL_FLIP", v); }
+    }
+#endif
 
     /* D3D waits on the NV2A vertical-blank interrupt; xboxrecomp only
      * delivers it when RECOMP_VBLANK is set. */

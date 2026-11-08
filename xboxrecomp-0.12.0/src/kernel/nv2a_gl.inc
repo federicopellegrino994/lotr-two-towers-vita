@@ -24,7 +24,11 @@
  * here, on the executor's thread, which is the only one that calls GL.
  */
 #include <SDL.h>
+#if defined(__vita__)
+#include "nv2a_gl_vita.inc"
+#else
 #include <SDL_opengl.h>
+#endif
 #include "../video/gfx_menu.h"
 
 extern void *xbox_FramebufferHwnd(void);
@@ -130,6 +134,7 @@ extern void xbox_FramebufferSetGpuOwned(int on);
     X(void, RenderbufferStorageMultisample, (GLenum, GLsizei, GLenum, GLsizei, GLsizei)) \
     X(void, FramebufferRenderbuffer, (GLenum, GLenum, GLenum, GLuint))
 
+#if !defined(__vita__)   /* (vitaGL: linked directly, nv2a_gl_vita.inc) */
 #define GLX_DECL(ret, name, args) static ret (APIENTRY *p_gl##name) args;
 GLFUNCS(GLX_DECL)
 #undef GLX_DECL
@@ -222,14 +227,17 @@ static void (APIENTRY *p_glMaxShaderCompilerThreadsKHR)(GLuint);
 #define glBindRenderbuffer p_glBindRenderbuffer
 #define glRenderbufferStorageMultisample p_glRenderbufferStorageMultisample
 #define glFramebufferRenderbuffer p_glFramebufferRenderbuffer
+#endif /* !__vita__ */
 
 static int gl_load(void)
 {
+#if !defined(__vita__)
 #define GLX_LOAD(ret, name, args) \
     if (!(*(void **)&p_gl##name = SDL_GL_GetProcAddress("gl" #name))) { \
         fprintf(stderr, "  [GL] the driver lacks gl" #name "\n"); return 0; }
     GLFUNCS(GLX_LOAD)
 #undef GLX_LOAD
+#endif
     return 1;
 }
 
@@ -324,7 +332,11 @@ static void gpu_filter_opts(void)
         g_aniso = a ? atoi(a) : 1;
         if (g_aniso < 1) g_aniso = 1;
         if (g_aniso > 16) g_aniso = 16;
+#if defined(__vita__)
+        g_mips = m && m[0] == '1';
+#else
         g_mips = !(m && m[0] == '0');
+#endif
         fprintf(stderr, "  [GL] texture filtering: mipmaps %s, anisotropic x%d\n", g_mips ? "on" : "off", g_aniso);
     }
 }
@@ -371,6 +383,10 @@ static uint32_t gpu_ring(GRing *r, const void *data, uint32_t bytes, uint32_t al
 /* a uniform block's data, bound at its binding point */
 static void gpu_ub(int binding, const void *data, uint32_t bytes)
 {
+#if defined(__vita__)
+    vgl_ub_set(binding, data, bytes);
+    return;
+#endif
     uint32_t at = gpu_ring(&g_rub, data, bytes, (uint32_t)g_ubo_align);
     if (at != 0xFFFFFFFFu) glBindBufferRange(GL_UNIFORM_BUFFER, (GLuint)binding, g_rub.buf, at, bytes);
 }
@@ -418,7 +434,12 @@ static void gpu_sh_reset(void) { memset(&g_sh, 0, sizeof g_sh); }
 
 static void gpu_set_fbo(GLuint fbo)
 {
-    if (!g_sh.tg || g_sh.fbo != fbo) { glBindFramebuffer(GL_FRAMEBUFFER, fbo); g_sh.fbo = fbo; g_sh.tg = 1; }
+    if (!g_sh.tg || g_sh.fbo != fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo); g_sh.fbo = fbo; g_sh.tg = 1;
+#if defined(__vita__)
+        if (g_vgl_flip) g_sh.sc_ok = 0;   /* (a flipped scissor depends on the target's height) */
+#endif
+    }
 }
 
 /* Framebuffer objects, one per (colour, depth) texture pair. */
@@ -433,14 +454,27 @@ static GLuint gpu_fbo(GLuint col, GLuint dep)
         if (!g_fbo[i].fbo) { v = i; break; }
         if (v < 0 || g_fbo[i].used < g_fbo[v].used) v = i;
     }
+#if defined(__vita__)
+    /* (a fresh object for every pair: vitaGL's attachments are not swapped
+     * on a framebuffer in use, and none is attached as 0) */
+    if (g_fbo[v].fbo) { glDeleteFramebuffers(1, &g_fbo[v].fbo); g_fbo[v].fbo = 0; }
+#endif
     if (!g_fbo[v].fbo) glGenFramebuffers(1, &g_fbo[v].fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo[v].fbo);
+#if defined(__vita__)
+    if (col) glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, col, 0);
+    if (dep) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, dep);
+    vfb_note(g_fbo[v].fbo, col ? vtx_h(col) : vtx_h(dep | 0x80000000u));
+#else
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, col, 0);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, dep, 0);
+#endif
     /* a zeta-only framebuffer has no colour to draw to (GL 3.3 calls it
      * incomplete otherwise) */
     glDrawBuffer(col ? GL_COLOR_ATTACHMENT0 : GL_NONE);
+#if !defined(__vita__)
     glReadBuffer(col ? GL_COLOR_ATTACHMENT0 : GL_NONE);
+#endif
     {
         GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         static int said;
@@ -515,6 +549,26 @@ static uint32_t gpu_mem_sum(uint32_t base, uint32_t bytes)
 static GLuint gpu_tex2d(uint32_t w, uint32_t h, int depth)
 {
     GLuint t = 0;
+#if defined(__vita__)
+    /* vitaGL: a colour texture, or a depth-stencil renderbuffer (only colour
+     * textures attach to its framebuffers) */
+    if (depth) {
+        glGenRenderbuffers(1, &t);
+        glBindRenderbuffer(GL_RENDERBUFFER, t);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei)w, (GLsizei)h);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        vtx_note(t | 0x80000000u, h);
+        return t;
+    }
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)w, (GLsizei)h, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+    vtx_note(t, h);
+    g_sh.tex_ok = 0;
+    return t;
+#endif
     glGenTextures(1, &t);
     glBindTexture(GL_TEXTURE_2D, t);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
@@ -579,7 +633,11 @@ static void gpu_copy_scaled(GLuint src, uint32_t uw, uint32_t uh, uint32_t sw, u
 static void gsurf_free(GSurf *s)
 {
     if (s->mrb) { gpu_fbo_ms_forget(s->mrb); glDeleteRenderbuffers(1, &s->mrb); }
+#if defined(__vita__)
+    if (s->tex) { gpu_fbo_forget(s->tex); if (s->is_depth) glDeleteRenderbuffers(1, &s->tex); else glDeleteTextures(1, &s->tex); }
+#else
     if (s->tex) { gpu_fbo_forget(s->tex); glDeleteTextures(1, &s->tex); }
+#endif
     memset(s, 0, sizeof *s);
     g_sh.tex_ok = 0;
 }
@@ -732,8 +790,12 @@ static GSurf *gsurf_get(uint32_t base, uint32_t w, uint32_t h, int depth)
         /* A zeta surface starts at the title's clear value, as the software
          * z-buffer does: titles with an inverted depth range never clear
          * depth and rely on it. */
+#if defined(__vita__)
+        s->ss_new = 2;   /* (cleared when first drawn with a colour target: gpu_bind_targets) */
+#else
         uint32_t zv = s_cb_scratch[0];
         gpu_clear_ds(gpu_fbo(0, s->tex), 3, (float)(zv >> 8) / 16777215.0f, (int)(zv & 0xFF));
+#endif
     } else {
         GLuint fbo = gpu_fbo(s->tex, 0);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -757,6 +819,9 @@ static GSurf *gsurf_get(uint32_t base, uint32_t w, uint32_t h, int depth)
         }
         gpu_sh_reset();
     }
+#if defined(__vita__)
+    if (!depth) s->ss_new = 0;
+#endif
     s->base = base; s->w = w; s->h = h; s->is_depth = (uint32_t)depth; s->used = ++g_clock;
     s->pw = tw; s->ph = th;
     if (g_msaa > 1) gsurf_ms_make(s);
@@ -836,6 +901,9 @@ static int s_ultra_used, g_ultra_bptc = -1;
 static GLuint ultra_gpu_get(int idx)
 {
     UltraFile *u = &g_uf[idx];
+#if defined(__vita__)
+    g_ultra_bptc = 0;
+#endif
     if (g_ultra_bptc < 0) {
         GLint mj = 0, mn = 0;
         glGetIntegerv(0x821B /* GL_MAJOR_VERSION */, &mj); glGetIntegerv(0x821C /* GL_MINOR_VERSION */, &mn);
@@ -1321,14 +1389,22 @@ static GLuint gpu_tri_program(const char *vs_def, const char *fs_def, GLint *ys_
 {
     const char *vsrc[3], *fsrc[3];
     GLuint vs, fs, p;
+#if defined(__vita__)
+    vsrc[0] = ""; vsrc[1] = vs_def; vsrc[2] = s_cg_vs_tri;
+    fsrc[0] = ""; fsrc[1] = fs_def; fsrc[2] = s_cg_ps_tri;
+#else
     vsrc[0] = "#version 330 core\n"; vsrc[1] = vs_def; vsrc[2] = s_glsl_vs_tri + strlen("#version 330 core\n");
     fsrc[0] = "#version 330 core\n"; fsrc[1] = fs_def; fsrc[2] = s_glsl_ps_tri + strlen("#version 330 core\n");
+#endif
     vs = gpu_shader_now(GL_VERTEX_SHADER, vsrc, 3, what);
     fs = vs ? gpu_shader_now(GL_FRAGMENT_SHADER, fsrc, 3, what) : 0;
     if (!vs || !fs) { if (vs) glDeleteShader(vs); return 0; }
     p = gpu_link_now(vs, fs, what);
     glDeleteShader(vs); glDeleteShader(fs);
     if (p && ys_loc) *ys_loc = glGetUniformLocation(p, "u_ys");
+#if defined(__vita__)
+    if (p) vgl_mark_tri(p);
+#endif
     return p;
 }
 
@@ -1437,11 +1513,37 @@ static int gpu_shader_done(GLuint *s, const char *what, uint32_t id)
 /* ---------------- init ---------------- */
 
 static void gpu_apply_settings(void);
+static int gpu_init_fail(void)
+{
+#if defined(__vita__)
+    fprintf(stderr, "  [VGL] the GPU renderer could not start: back to the CPU picture\n");
+    fflush(stderr);
+    xbox_VitaGLRelease();
+#else
+    SDL_GL_MakeCurrent(g_win, NULL);
+#endif
+    return 0;
+}
+#if defined(__vita__)
+static void vgl_surface_test(void);
+#endif
 static int gpu_init(void)
 {
     const char *e = getenv("RECOMP_RENDERER");
     GLint maj = 0, mnr = 0;
     if (e && !strcasecmp(e, "software")) return 0;
+#if defined(__vita__)
+    (void)maj; (void)mnr;
+    if (!xbox_VitaGLAcquire()) {
+        fprintf(stderr, "  [VGL] vitaGL belongs to the picture thread: software renderer\n");
+        return 0;
+    }
+    g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
+    fprintf(stderr, "  [VGL] GPU renderer on %s / %s; shaders compiled when first used (cached)\n",
+            (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
+    if (0)
+#endif
+    {
     g_glc = (SDL_GLContext)xbox_FramebufferGLContext(10000);
     g_win = (SDL_Window *)xbox_FramebufferHwnd();
     if (!g_win || !g_glc) {
@@ -1476,22 +1578,32 @@ static int gpu_init(void)
     }
     fprintf(stderr, "  [GL] shaders compiled %s; anisotropic filtering up to x%.0f\n",
             g_parallel ? "in the background" : "when first used", g_max_aniso);
+    }
 
     {
+#if defined(__vita__)
+        const char *vs[1] = { s_cg_vs_main };
+        const char *fs[2] = { "", s_cg_ps_main };
+#else
         const char *vs[1] = { s_glsl_vs_main };
         const char *fs[2] = { s_glsl_ps_head, s_glsl_ps_main };
+#endif
         g_vs_main = gpu_shader_now(GL_VERTEX_SHADER, vs, 1, "the main vertex shader");
         g_fs_main = gpu_shader_now(GL_FRAGMENT_SHADER, fs, 2, "the combiner shader");
-        if (!g_vs_main || !g_fs_main) { SDL_GL_MakeCurrent(g_win, NULL); return 0; }
+        if (!g_vs_main || !g_fs_main) return gpu_init_fail();
         g_pr_main = gpu_link_now(g_vs_main, g_fs_main, "the main program");
-        if (!g_pr_main) { SDL_GL_MakeCurrent(g_win, NULL); return 0; }
+        if (!g_pr_main) return gpu_init_fail();
     }
     g_pr_copy = gpu_tri_program("", "", &g_loc_ys_copy, "the copy shader");
     g_pr_present = gpu_tri_program("", "#define PRESENT\n", &g_loc_ys_present, "the present shader");
+#if defined(__vita__)
+    g_pr_fxaa = 0;   /* (no derivatives in the Vita's fragment shaders) */
+#else
     g_pr_fxaa = gpu_tri_program("", "#define FXAA\n", &g_loc_ys_fxaa, "the FXAA shader");
+#endif
     g_pr_blit = gpu_tri_program("#define BLIT\n", "", &g_loc_ys_blit, "the blit shader");
     g_pr_clear = gpu_tri_program("", "#define CLEAR\n", NULL, "the clear shader");
-    if (!g_pr_copy || !g_pr_present || !g_pr_blit || !g_pr_clear) { SDL_GL_MakeCurrent(g_win, NULL); return 0; }
+    if (!g_pr_copy || !g_pr_present || !g_pr_blit || !g_pr_clear) return gpu_init_fail();
     if (g_pr_clear) { glUseProgram(g_pr_clear); glUniform1f(glGetUniformLocation(g_pr_clear, "u_ys"), 1.0f); }
 
     glGenVertexArrays(1, &g_vao);
@@ -1506,7 +1618,11 @@ static int gpu_init(void)
     }
     {
         const char *rs = getenv("RECOMP_RENDER_SCALE");
+#if defined(__vita__)
+        g_msaa = 1;
+#else
         g_msaa = xbox_GfxMsaa();
+#endif
         if (g_msaa > 1) fprintf(stderr, "  [GL] MSAA %dx\n", g_msaa);
         g_rsf = rs ? (float)atof(rs) : 1.0f;
         if (!(g_rsf >= 1.0f)) g_rsf = 1.0f;
@@ -1536,10 +1652,79 @@ static int gpu_init(void)
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     gpu_sh_reset();
+#if defined(__vita__)
+    vgl_surface_test();
+    gpu_sh_reset();
+#endif
     fprintf(stderr, "  [GL] renderer up\n");
     fflush(stderr);
     return 1;
 }
+
+#if defined(__vita__)
+/* Which way up vitaGL fills a framebuffer object (see nv2a_gl_vita.inc):
+ * a 64x64 texture cleared green, the lower half in OpenGL's terms (clip
+ * y < 0) drawn red, then its memory's first pixel read. OpenGL puts clip
+ * y = -1 at row 0: red there. RECOMP_VGL_FLIP=0/1 skips the test. */
+static void vgl_surface_test(void)
+{
+    const char *e = getenv("RECOMP_VGL_FLIP");
+    GLuint t, f;
+    float v[6][32];
+    static const float q[6][2] = { {0, 0}, {64, 0}, {64, 32}, {0, 0}, {64, 32}, {0, 32} };
+    float c[4] = { 2.0f / 64.0f, 2.0f / 64.0f, 0.5f, 1.0f };
+    const uint8_t *px;
+    int i, k;
+    if (e && (e[0] == '0' || e[0] == '1')) {
+        g_vgl_flip = e[0] == '1';
+        fprintf(stderr, "  [VGL] surfaces %s (RECOMP_VGL_FLIP)\n", g_vgl_flip ? "flipped" : "as OpenGL");
+        return;
+    }
+    g_vgl_flip = 0;
+    t = gpu_tex2d(64, 64, 0);
+    f = gpu_fbo(t, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, f);
+    glViewport(0, 0, 64, 64);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClearColor(0, 1, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    memset(v, 0, sizeof v);
+    for (i = 0; i < 6; i++) {
+        v[i][0] = q[i][0]; v[i][1] = q[i][1]; v[i][2] = 1.0f; v[i][3] = 1.0f;   /* window x, y, z (clip z 0); w = 1 */
+        v[i][4] = 1.0f; v[i][5] = 0.0f; v[i][6] = 0.0f; v[i][7] = 1.0f;         /* diffuse: red */
+    }
+    gpu_ub(UB_VSC, c, 16);
+    glUseProgram(g_pr_main);
+    glBindVertexArray(g_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    for (k = 0; k < 8; k++) {
+        glEnableVertexAttribArray(k);
+        glVertexAttribPointer(k, 4, GL_FLOAT, GL_FALSE, sizeof v[0], &v[0][4 * k]);
+    }
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glFinish();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, t);
+    px = (const uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+    if (!px) fprintf(stderr, "  [VGL] surface test: no texture memory; surfaces taken as OpenGL's\n");
+    else {
+        int red = (px[0] > 0x80 || px[2] > 0x80) && px[1] < 0x80, green = px[1] > 0x80 && px[0] < 0x80 && px[2] < 0x80;
+        g_vgl_flip = green && !red;
+        fprintf(stderr, "  [VGL] surface test: row 0 = %02X %02X %02X %02X -> %s\n", px[0], px[1], px[2], px[3],
+                red ? "as OpenGL" : green ? "flipped (compensated)" : "unclear (taken as OpenGL)");
+    }
+    {
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) fprintf(stderr, "  [VGL] GL error 0x%04X during start-up\n", err);
+    }
+    gpu_fbo_forget(t);
+    glDeleteTextures(1, &t);
+    fflush(stderr);
+}
+#endif
 
 static int gpu_on(void)
 {
@@ -1647,11 +1832,16 @@ static int gpu_set_raster(void)
      * counter-clockwise here. */
     {
         int fccw = (s_3d.front_face != 0x900) ^ (getenv("RECOMP_GPU_CULLFLIP") != NULL);
+#if defined(__vita__)
+        fccw ^= g_vgl_flip;   /* (y flipped back: the winding too) */
+#endif
         k = ((uint64_t)cull << 40) | ((uint64_t)face << 8) | (uint64_t)fccw | (1ull << 41);
         if (g_sh.rs_ok && g_sh.rs == k) return 1;
         if (cull) { glEnable(GL_CULL_FACE); glCullFace(face); } else glDisable(GL_CULL_FACE);
         glFrontFace(fccw ? GL_CW : GL_CCW);
+#if !defined(__vita__)
         if (getenv("RECOMP_GPU_NOZCLIP")) glEnable(GL_DEPTH_CLAMP); else glDisable(GL_DEPTH_CLAMP);
+#endif
         glEnable(GL_SCISSOR_TEST);
     }
     g_sh.rs = k; g_sh.rs_ok = 1;
@@ -1691,6 +1881,13 @@ static int gpu_bind_targets(int need_depth)
         g_cur_rt->ms_new = 1;
         if (g_cur_ds) g_cur_ds->ms_new = 1;
     }
+#if defined(__vita__)
+    if (g_cur_ds && g_cur_ds->ss_new == 2) {
+        uint32_t zv = s_cb_scratch[0];
+        g_cur_ds->ss_new = 0;
+        gpu_clear_ds(gsurf_draw_fbo(g_cur_rt, g_cur_ds), 3, (float)(zv >> 8) / 16777215.0f, (int)(zv & 0xFF));
+    }
+#endif
     gpu_set_fbo(gsurf_draw_fbo(g_cur_rt, g_cur_ds));
     if (!g_sh.vp_ok || g_sh.vw != (int)g_cur_rt->pw || g_sh.vh != (int)g_cur_rt->ph) {
         glViewport(0, 0, (GLsizei)g_cur_rt->pw, (GLsizei)g_cur_rt->ph);
@@ -1710,6 +1907,9 @@ static int gpu_bind_targets(int need_depth)
         float zmax = (((s_gpu.format >> 4) & 0xF) == 1) ? 65535.0f : 16777215.0f;
         if (s_clip_max > 0.0f && !getenv("RECOMP_GPU_ZFORMAT")) zmax = s_clip_max;
         c[0] = 2.0f / (float)g_cur_rt->w; c[1] = 2.0f / (float)g_cur_rt->h; c[2] = 1.0f / zmax; c[3] = 0;
+#if defined(__vita__)
+        c[3] = g_vgl_flip ? -1.0f : 1.0f;   /* (the Cg vertex shader's y sign) */
+#endif
         if (!g_sh.cbvs_ok || memcmp(g_sh.cbvs, c, sizeof c)) {
             gpu_ub(UB_VSC, c, 16);
             memcpy(g_sh.cbvs, c, sizeof c); g_sh.cbvs_ok = 1;
@@ -1730,6 +1930,13 @@ static GSurf *gpu_surface_for_texture(uint32_t off, uint32_t tw, uint32_t th, in
     for (i = 0; i < GSURF_MAX; i++)
         if (g_surf[i].tex && g_surf[i].base == off) {
             GSurf *c = &g_surf[i];
+#if defined(__vita__)
+            if (c->is_depth) {   /* (renderbuffers: not readable as textures) */
+                static int said;
+                if (!said++) fprintf(stderr, "  [VGL] a zeta surface is sampled: not available, read as memory\n");
+                continue;
+            }
+#endif
             int cm = tw && c->w == tw && c->h == th, sm = s && tw && s->w == tw && s->h == th;
             if (!s || (cm != sm ? cm : c->wr > s->wr)) s = c;
         }
@@ -2235,6 +2442,9 @@ static void hwvp_poll(HwVp *e)
 /* The shader for the current program, or NULL to use the CPU path. */
 static HwVp *hwvp_lookup(void)
 {
+#if defined(__vita__)
+    return NULL;   /* (the CPU transforms: nv2a_gl_vita.inc has no vertex-program translator) */
+#endif
     uint32_t h, i;
     HwVp *e;
     if (!g_hwvp_user || !hwvp_enabled() || s_3d.mode != 2 || s_vp_slow || !s_vpd_len) return NULL;
@@ -2445,6 +2655,123 @@ static char *hwps_translate(const PsKey *K)
     return p;
 }
 
+#if defined(__vita__)
+/* hwps_translate in Cg (nv2a_gl_vita.inc has the helpers and the head) */
+#define CG_Z4 "float4(0.0, 0.0, 0.0, 0.0)"
+static void cg_gen_stex(char **p, size_t *cap, size_t *len, const PsKey *K, int k)
+{
+    int mode = K->smode[k], fl = K->sflags[k];
+    if (mode == 0) { hwvp_cat(p, cap, len, "  R%d = " CG_Z4 ";\n", 8 + k); return; }
+    if (mode == 4) { hwvp_cat(p, cap, len, "  R%d = saturate(v_t%d);\n", 8 + k, k); return; }
+    if (!(fl & 1)) { hwvp_cat(p, cap, len, "  R%d = float4(0.0, 0.0, 0.0, 1.0);\n", 8 + k); return; }
+    hwvp_cat(p, cap, len, "  { float2 uv = v_t%d.xy;\n", k);
+    if (mode == 1) hwvp_cat(p, cap, len, "    if (v_t%d.w != 0.0 && v_t%d.w != 1.0) uv /= v_t%d.w;\n", k, k, k);
+    if (!(fl & 4)) hwvp_cat(p, cap, len, "    uv *= ss%d.xy;\n", k);
+    hwvp_cat(p, cap, len, "    R%d = tex2D(tx%d, uv); }\n", 8 + k, k);
+}
+
+static char *hwps_translate_cg(const PsKey *K)
+{
+    size_t cap = 8192, len = 0;
+    char *p = (char *)malloc(cap), a[160], b2[160], c[160], d[160], t[256];
+    int k;
+    if (!p) return NULL;
+    p[0] = 0;
+    hwvp_cat(&p, &cap, &len, "%s", s_cg_ps_head);
+    hwvp_cat(&p, &cap, &len, "float4 main(float4 v_t0 : TEXCOORD0, float4 v_t1 : TEXCOORD1, float4 v_t2 : TEXCOORD2,\n"
+                             "  float4 v_t3 : TEXCOORD3, float4 v_d0 : TEXCOORD4, float4 v_d1 : TEXCOORD5,\n"
+                             "  float4 v_fog : TEXCOORD6) : COLOR {\n");
+    for (k = 0; k < 16; k++) hwvp_cat(&p, &cap, &len, "  float4 R%d = " CG_Z4 ";\n", k);
+    hwvp_cat(&p, &cap, &len, "  float dp1 = 0.0, dp2 = 0.0;\n");
+    if (K->sflags[0] & 2) cg_gen_stex(&p, &cap, &len, K, 0);
+    if (K->smode[1] == 17) hwvp_cat(&p, &cap, &len, "  dp1 = dot(v_t1.xyz, %s); R9 = " CG_Z4 ";\n", cg_dnorm(K->sdot[1], "R8", a, sizeof a));
+    else if (K->sflags[1] & 2) cg_gen_stex(&p, &cap, &len, K, 1);
+    if (K->smode[2] == 17)
+        hwvp_cat(&p, &cap, &len, "  dp2 = dot(v_t2.xyz, %s); R10 = " CG_Z4 ";\n", cg_dnorm(K->sdot[2], K->sinp[2] ? "R9" : "R8", a, sizeof a));
+    else if (K->smode[2] == 9) {
+        if (K->sflags[2] & 1)
+            hwvp_cat(&p, &cap, &len, "  R10 = tex2D(tx2, float2(dp1, dot(v_t2.xyz, %s)));\n",
+                     cg_dnorm(K->sdot[2], K->sinp[2] ? "R9" : "R8", a, sizeof a));
+        else hwvp_cat(&p, &cap, &len, "  R10 = float4(0.0, 0.0, 0.0, 1.0);\n");
+    } else if (K->sflags[2] & 2) cg_gen_stex(&p, &cap, &len, K, 2);
+    if (K->smode[3] == 9) {
+        const char *nn = K->sinp[3] == 2 ? "R10" : K->sinp[3] == 1 ? "R9" : "R8";
+        if (K->sflags[3] & 1)
+            hwvp_cat(&p, &cap, &len, "  R11 = tex2D(tx3, float2(dp2, dot(v_t3.xyz, %s)));\n", cg_dnorm(K->sdot[3], nn, a, sizeof a));
+        else hwvp_cat(&p, &cap, &len, "  R11 = float4(0.0, 0.0, 0.0, 1.0);\n");
+    } else if (K->sflags[3] & 2) cg_gen_stex(&p, &cap, &len, K, 3);
+    hwvp_cat(&p, &cap, &len, "  R4 = v_d0; R5 = v_d1;\n  R3 = float4(fogc.rgb, 1.0);\n");
+    if (K->fogen) {
+        int fm = K->fogmode;
+        hwvp_cat(&p, &cap, &len, "  { float dd = v_fog.x, f;\n");
+        if (fm == 0x800 || fm == 0x802)
+            hwvp_cat(&p, &cap, &len, "%s    f = fogp.x + exp2(dd * fogp.y * 16.0) - 1.5;\n", fm == 0x802 ? "    dd = abs(dd);\n" : "");
+        else if (fm == 0x801 || fm == 0x803)
+            hwvp_cat(&p, &cap, &len, "%s    f = fogp.x + exp2(-dd * dd * fogp.y * fogp.y * 32.0) - 1.5;\n", fm == 0x803 ? "    dd = abs(dd);\n" : "");
+        else hwvp_cat(&p, &cap, &len, "%s    f = fogp.x + dd * fogp.y - 1.0;\n", fm == 0x804 ? "    dd = abs(dd);\n" : "");
+        hwvp_cat(&p, &cap, &len, "    R3.a = saturate(f); }\n");
+    }
+    hwvp_cat(&p, &cap, &len, "  R12.a = R8.a;\n  float4 o = " CG_Z4 ";\n");
+    if (K->misc[3] == 0) {
+        hwvp_cat(&p, &cap, &len, "  o = %s;\n", K->at_s0 ? "R8 * R4" : "R4");
+    } else {
+        for (k = 0; k < K->misc[0] && k < 8; k++) {
+            const int *S = K->st[k];
+            int f1y = S[9], op = S[10], aop = S[11];
+            hwvp_cat(&p, &cap, &len, "  { R1 = c0_%d; R2 = c1_%d;\n", k, k);
+            hwvp_cat(&p, &cap, &len, "    float3 A = %s, B = %s, C = %s, D = %s;\n",
+                     cg_crgb(S[0], a, sizeof a), cg_crgb(S[1], b2, sizeof b2), cg_crgb(S[2], c, sizeof c), cg_crgb(S[3], d, sizeof d));
+            hwvp_cat(&p, &cap, &len, "    float3 ab = %s, cd = %s;\n", (f1y & 2) ? "f3(dot(A, B))" : "A * B", (f1y & 1) ? "f3(dot(C, D))" : "C * D");
+            if ((f1y & 4) || (f1y & 8))
+                hwvp_cat(&p, &cap, &len, "    bool sel = %s;\n", K->misc[1] ? "R12.a >= 0.5" : "fmod(floor(R12.a * 255.0 + 0.5), 2.0) >= 1.0");
+            hwvp_cat(&p, &cap, &len, "    float3 sm = %s;\n", (f1y & 4) ? "sel ? cd : ab" : "ab + cd");
+            hwvp_cat(&p, &cap, &len, "    float3 rab = %s;\n", cg_cop_v(op, "ab", 1, t, sizeof t));
+            hwvp_cat(&p, &cap, &len, "    float3 rcd = %s;\n", cg_cop_v(op, "cd", 1, t, sizeof t));
+            hwvp_cat(&p, &cap, &len, "    float3 rsm = %s;\n", cg_cop_v(op, "sm", 1, t, sizeof t));
+            hwvp_cat(&p, &cap, &len, "    float a0 = %s, a1 = %s, a2 = %s, a3 = %s;\n",
+                     cg_calp(S[4], a, sizeof a), cg_calp(S[5], b2, sizeof b2), cg_calp(S[6], c, sizeof c), cg_calp(S[7], d, sizeof d));
+            hwvp_cat(&p, &cap, &len, "    float aab = a0 * a1, acd = a2 * a3, asum = %s;\n", (f1y & 8) ? "sel ? acd : aab" : "aab + acd");
+            hwvp_cat(&p, &cap, &len, "    float ra0 = %s;\n", cg_cop(aop, "aab", t, sizeof t));
+            hwvp_cat(&p, &cap, &len, "    float ra1 = %s;\n", cg_cop(aop, "acd", t, sizeof t));
+            hwvp_cat(&p, &cap, &len, "    float ra2 = %s;\n", cg_cop(aop, "asum", t, sizeof t));
+            if (S[12]) { hwvp_cat(&p, &cap, &len, "    R%d.rgb = rab;\n", S[12]); if (S[19] & 2) hwvp_cat(&p, &cap, &len, "    R%d.a = rab.b;\n", S[12]); }
+            if (S[13]) { hwvp_cat(&p, &cap, &len, "    R%d.rgb = rcd;\n", S[13]); if (S[19] & 1) hwvp_cat(&p, &cap, &len, "    R%d.a = rcd.b;\n", S[13]); }
+            if (S[14]) hwvp_cat(&p, &cap, &len, "    R%d.rgb = rsm;\n", S[14]);
+            if (S[16]) hwvp_cat(&p, &cap, &len, "    R%d.a = ra0;\n", S[16]);
+            if (S[17]) hwvp_cat(&p, &cap, &len, "    R%d.a = ra1;\n", S[17]);
+            if (S[18]) hwvp_cat(&p, &cap, &len, "    R%d.a = ra2;\n", S[18]);
+            hwvp_cat(&p, &cap, &len, "  }\n");
+        }
+        if (K->fin1[3] == 0) {
+            hwvp_cat(&p, &cap, &len, "  o = saturate(R12);\n");
+        } else {
+            hwvp_cat(&p, &cap, &len, "  R1 = ff0; R2 = ff1;\n");
+            hwvp_cat(&p, &cap, &len, "  { float3 E = %s, F = %s;\n    R15.rgb = E * F; }\n",
+                     cg_crgb(K->fin1[0], a, sizeof a), cg_crgb(K->fin1[1], b2, sizeof b2));
+            hwvp_cat(&p, &cap, &len, "  R14.rgb = R5.rgb + R12.rgb;\n");
+            if (K->misc[2]) hwvp_cat(&p, &cap, &len, "  R14.rgb = min(R14.rgb, f3(1.0));\n");
+            hwvp_cat(&p, &cap, &len, "  { float3 A = %s, B = %s, C = %s, D = %s;\n",
+                     cg_crgb(K->fin0[0], a, sizeof a), cg_crgb(K->fin0[1], b2, sizeof b2), cg_crgb(K->fin0[2], c, sizeof c), cg_crgb(K->fin0[3], d, sizeof d));
+            hwvp_cat(&p, &cap, &len, "    float3 sa = saturate(A);\n    o.rgb = saturate(sa * B + (1.0 - sa) * C + D);\n");
+            hwvp_cat(&p, &cap, &len, "    o.a = saturate(%s); }\n", cg_calp(K->fin1[2], a, sizeof a));
+        }
+    }
+    if (K->at_en) {
+        static const char *cmp[7] = { "false", "a8 < r", "a8 == r", "a8 <= r", "a8 > r", "a8 != r", "a8 >= r" };
+        int f = K->at_func & 15;
+        if (f < 7)
+            hwvp_cat(&p, &cap, &len, "  { float a8 = floor(saturate(o.a) * 255.0 + 0.5), r = atest.z;\n"
+                                     "    if (!(%s)) discard; }\n", cmp[f]);
+    }
+    hwvp_cat(&p, &cap, &len, "  return o;\n}\n");
+    if (getenv("RECOMP_VGL_PSLOG")) {
+        static int n;
+        if (n++ < 4) fprintf(stderr, "  [VGL] combiner shader:\n%s\n", p);
+    }
+    return p;
+}
+#endif
+
 static uint32_t hwps_hash(const PsKey *k)
 {
     const uint32_t *w = (const uint32_t *)k;
@@ -2499,7 +2826,11 @@ static GLuint hwps_lookup(const PsKey *k)
     if (!e) return g_fs_main;
     e->key = *k; e->hash = h;
     {
+#if defined(__vita__)
+        char *src = hwps_translate_cg(k);
+#else
         char *src = hwps_translate(k);
+#endif
         if (!src) e->state = 2;
         else { e->fs = gpu_shader_start(GL_FRAGMENT_SHADER, src); free(src); }
     }
@@ -2683,6 +3014,26 @@ static void gpu_batch(void)
 cpu_verts_ready:
     {
         GLuint prog;
+#if defined(__vita__)
+        /* vitaGL copies client arrays at the draw */
+        (void)vb_at; (void)ib_at;
+        gpu_bind_stages();
+        gpu_set_blend(0);
+        gpu_set_depth(g_cur_ds != NULL);
+        glBindVertexArray(g_vao);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        for (i = 0; i < 8; i++) {
+            glEnableVertexAttribArray(i);
+            glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, sizeof(GVert), (const char *)g_verts + 16 * i);
+        }
+        g_sh.vao = 0;
+        prog = gpu_program_for(g_vs_main);
+        gpu_use(prog);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx);
+        if (0)
+#endif
+        {
         vb_at = gpu_ring(&g_rvb, g_verts, nverts * sizeof(GVert), sizeof(GVert));
         ib_at = gpu_ring(&g_rib, g_idx, g_nidx * 4, 4);
         if (vb_at == 0xFFFFFFFFu || ib_at == 0xFFFFFFFFu) return;
@@ -2704,6 +3055,7 @@ cpu_verts_ready:
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_rib.buf);
         glDrawElementsBaseVertex(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, (const void *)(uintptr_t)ib_at,
                                  (GLint)(vb_at / sizeof(GVert)));
+        }
     }
     s_gpu.tris_drawn += g_nidx / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
@@ -2807,6 +3159,42 @@ static void gpu_readback(uint32_t base, uint32_t pitch)
     if (!s) return;
     gsurf_resolve(s);
     if (!pitch) pitch = s->w * 4;
+#if defined(__vita__)
+    {
+        /* the surface's memory (its row 0 is the guest's top row: see
+         * nv2a_gl_vita.inc), RGBA bytes back to the guest's BGRA */
+        GLuint src = s->tex;
+        const uint8_t *tp;
+        uint32_t stride, x, y, wb = s->w * 4 < pitch ? s->w : pitch / 4;
+        if (s->pw != s->w || s->ph != s->h) {
+            if (!gpu_one(s->w, s->h)) return;
+            gpu_copy_scaled(s->tex, s->pw, s->ph, s->pw, s->ph, gpu_fbo(g_one_tex, 0), s->w, s->h);
+            src = g_one_tex;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glFinish();
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, src);
+        tp = (const uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+        {
+            SceGxmTexture *gt = vglGetGxmTexture(GL_TEXTURE_2D);
+            stride = gt ? sceGxmTextureGetStride(gt) : 0;
+        }
+        if (!stride) stride = ((src == g_one_tex ? g_one_w : s->w) + 7) / 8 * 8 * 4;
+        if (tp)
+            for (y = 0; y < s->h; y++) {
+                const uint8_t *r = tp + (size_t)y * stride;
+                uint8_t *d = m + (size_t)y * pitch;
+                for (x = 0; x < wb; x++) {
+                    d[4 * x + 0] = r[4 * x + 2]; d[4 * x + 1] = r[4 * x + 1];
+                    d[4 * x + 2] = r[4 * x + 0]; d[4 * x + 3] = r[4 * x + 3];
+                }
+            }
+        s->mem_sum = gpu_mem_sum(base, (s->pitch ? s->pitch : s->w * 4) * s->h);
+        gpu_sh_reset();
+        return;
+    }
+#endif
     if (s->pw == s->w && s->ph == s->h) {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, gpu_fbo(s->tex, 0));
     } else {
@@ -2912,7 +3300,11 @@ static void gpu_apply_settings(void)
     asp = xbox_GfxAspect();
     if (asp < 1.34f) asp = 4.0f / 3.0f;
     {
+#if defined(__vita__)
+        int ms = 1;
+#else
         int ms = g_msaa_bad ? 1 : xbox_GfxMsaa();
+#endif
         if (ms != g_msaa) { g_msaa = ms; g_rsf = -1.0f; }   /* (MSAA changed: every surface made again) */
     }
     if (rsf != g_rsf || asp != g_aspect) {
@@ -3006,6 +3398,10 @@ static void gpu_dump_window(const char *nm)
     uint8_t *buf;
     FILE *o;
     uint32_t w = (uint32_t)g_sc_w, h = (uint32_t)g_sc_h;
+#if defined(__vita__)
+    (void)buf; (void)o; (void)nm; (void)w; (void)h;
+    return;
+#endif
     if (!w || !h) return;
     buf = (uint8_t *)malloc((size_t)w * h * 4);
     if (!buf) return;
@@ -3061,8 +3457,12 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         gpu_draw_overlays(s, wide);
     }
     g_fhash_cur ^= 1; g_fhash_n[g_fhash_cur] = 0;
+#if defined(__vita__)
+    g_sc_w = 960; g_sc_h = 544;
+#else
     if (SDL_GetWindowFlags(g_win) & SDL_WINDOW_MINIMIZED) goto settings;
     SDL_GL_GetDrawableSize(g_win, &g_sc_w, &g_sc_h);
+#endif
     if (g_sc_w < 8 || g_sc_h < 8) goto settings;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
@@ -3128,6 +3528,20 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         }
     }
     if (g_vsync_on < 0) { const char *v = getenv("RECOMP_VSYNC"); g_vsync_on = v && v[0] == '1'; }
+#if defined(__vita__)
+    if (g_vsync_applied != g_vsync_on) {
+        vglWaitVblankStart(g_vsync_on ? GL_TRUE : GL_FALSE);
+        g_vsync_applied = g_vsync_on;
+    }
+    frame_limit();
+    vglSwapBuffers(GL_FALSE);
+    {   /* (the first frames: say it works) */
+        static unsigned shown;
+        if (shown < 3 || (shown % 1800) == 0)
+            fprintf(stderr, "  [VGL] frame %u presented (surface %ux%u)\n", shown, s->w, s->h);
+        shown++;
+    }
+#else
     if (g_vsync_applied != g_vsync_on) {
         /* adaptive vsync where the driver has it, else plain */
         if (!g_vsync_on || SDL_GL_SetSwapInterval(-1) != 0) SDL_GL_SetSwapInterval(g_vsync_on ? 1 : 0);
@@ -3135,6 +3549,7 @@ static void gpu_present(uint32_t base, uint32_t pitch)
     }
     frame_limit();
     SDL_GL_SwapWindow(g_win);
+#endif
     gpu_sh_reset();
     {
         static int said;

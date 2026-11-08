@@ -1305,8 +1305,7 @@ int main(int argc, char **argv)
     (void)argv;
 #if defined(__vita__)
     {   /* data folder, CPU at full speed, and the desktop defaults that do
-         * not apply: the CPU picture through SDL's GXM renderer for now
-         * (renderer=software), full screen at the Vita's 960x544 */
+         * not apply: full screen at the Vita's 960x544 */
         const char *d = getenv("XBOXRECOMP_VITA_DIR");
         char sub[256];
         if (!d || !*d) d = "ux0:data/twotowers";
@@ -1317,7 +1316,8 @@ int main(int argc, char **argv)
         scePowerSetBusClockFrequency(222);
         scePowerSetGpuClockFrequency(222);
         scePowerSetGpuXbarClockFrequency(166);
-        if (!getenv("RECOMP_RENDERER")) setenv("RECOMP_RENDERER", "software", 1);
+        /* (the renderer: [Display] renderer in the ini -- gpu, the default,
+         * draws with vitaGL; software keeps the CPU rasteriser) */
         if (!getenv("RECOMP_FULLSCREEN")) setenv("RECOMP_FULLSCREEN", "1", 1);
         if (!getenv("RECOMP_WINDOW_SIZE")) setenv("RECOMP_WINDOW_SIZE", "960x544", 1);
         if (!getenv("RECOMP_FB_WINDOW")) setenv("RECOMP_FB_WINDOW", "1", 1);

@@ -1145,6 +1145,7 @@ extern void xbox_UnpinServiceThread(void);
  * a texture, 4:3 inside 960x544. Once vitaGL is up it owns the display:
  * this does not return to the SDL path. */
 #include <vitaGL.h>
+#include <psp2/io/stat.h>
 
 static const char s_vgl_vs[] =
     "void main(float2 aPos, float2 aUv,\n"
@@ -1156,6 +1157,45 @@ static const char s_vgl_fs[] =
     "float4 main(float2 vUv : TEXCOORD0, uniform sampler2D tex) {\n"
     "  float4 c = tex2D(tex, vUv); return float4(c.b, c.g, c.r, 1.0);\n"
     "}\n";
+
+/* Who owns vitaGL: the GPU renderer (nv2a_gl.inc, on the pushbuffer
+ * executor's thread) or this picture thread -- never both, so only one
+ * thread ever calls GL. 0 nobody yet, 1 the renderer, 2 the renderer gave
+ * it back (it could not start), 3 the picture thread. */
+static volatile LONG s_vgl_owner;
+static volatile LONG s_vgl_up;
+static void vgl_start(void)
+{
+    char dir[256];
+    const char *d = getenv("XBOXRECOMP_VITA_DIR");
+    if (s_vgl_up) return;
+    if (!d || !*d) d = "ux0:data/twotowers";
+    snprintf(dir, sizeof dir, "%s/shader_cache", d);
+    sceIoMkdir(dir, 0777);
+    snprintf(dir, sizeof dir, "%s/shader_cache/", d);
+    vglSetShaderCachePath(dir);
+    fprintf(stderr, "  [VGL] starting vitaGL (shader cache %s)\n", dir); fflush(stderr);
+    /* vglInitExtended's result is GL_TRUE only when it had to lower the
+     * resolution asked for -- not a success flag (GL_FALSE: all as asked) */
+    if (vglInitExtended(0, 960, 544, 0x100000, SCE_GXM_MULTISAMPLE_NONE))
+        fprintf(stderr, "  [VGL] display resolution lowered by vitaGL\n");
+    vglWaitVblankStart(GL_FALSE);
+    InterlockedExchange(&s_vgl_up, 1);
+}
+/* the GPU renderer asks for vitaGL: 1 it is its own (started), 0 the
+ * picture thread has it */
+int xbox_VitaGLAcquire(void)
+{
+    LONG o = InterlockedCompareExchange(&s_vgl_owner, 1, 0);
+    if (o != 0 && o != 1) return 0;
+    vgl_start();
+    return 1;
+}
+/* the renderer could not start: the picture thread draws from now on */
+void xbox_VitaGLRelease(void)
+{
+    InterlockedExchange(&s_vgl_owner, 2);
+}
 
 static GLuint vgl_shader(GLenum type, const char *src)
 {
@@ -1187,12 +1227,7 @@ static int fb_vgl_loop(void)
     const float xw = (544.0f * 4.0f / 3.0f) / 960.0f;
     const float pos[8] = { -xw, -1,  xw, -1,  -xw, 1,  xw, 1 };
 
-    fprintf(stderr, "  [VGL] starting vitaGL\n"); fflush(stderr);
-    /* vglInitExtended's result is GL_TRUE only when it had to lower the
-     * resolution asked for -- not a success flag (GL_FALSE: all as asked) */
-    if (vglInitExtended(0, 960, 544, 0x100000, SCE_GXM_MULTISAMPLE_NONE))
-        fprintf(stderr, "  [VGL] display resolution lowered by vitaGL\n");
-    vglWaitVblankStart(GL_FALSE);
+    vgl_start();
     fprintf(stderr, "  [VGL] vitaGL up; compiling the picture shaders\n"); fflush(stderr);
     vs = vgl_shader(GL_VERTEX_SHADER, s_vgl_vs);
     fs = vgl_shader(GL_FRAGMENT_SHADER, s_vgl_fs);
@@ -1279,7 +1314,21 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     {
         const char *vp = getenv("RECOMP_VITA_PRESENT");
         if (!(vp && !strcasecmp(vp, "sdl"))) {
-            InterlockedExchange(&s_gl_state, -1);   /* no GL context for the GL renderer (yet) */
+            /* the GPU renderer (renderer=gpu, the default) starts vitaGL on
+             * its own thread and draws the display; this thread shows the
+             * CPU's picture only when it does not (renderer=software, or it
+             * could not start, or nothing asked within 30 s) */
+            InterlockedExchange(&s_gl_state, -1);   /* (no SDL GL context on the Vita) */
+            if (want_gl) {
+                DWORD t0 = GetTickCount();
+                fprintf(stderr, "  [VGL] waiting for the GPU renderer\n"); fflush(stderr);
+                while (s_fb_running && s_vgl_owner == 0 && GetTickCount() - t0 < 30000) Sleep(20);
+                InterlockedCompareExchange(&s_vgl_owner, 3, 0);
+                while (s_fb_running && s_vgl_owner == 1) Sleep(100);
+                if (!s_fb_running) return 0;
+                fprintf(stderr, "  [VGL] the CPU picture on the display (%s)\n",
+                        s_vgl_owner == 2 ? "the GPU renderer could not start" : "no GPU renderer came");
+            } else InterlockedCompareExchange(&s_vgl_owner, 3, 0);
             if (fb_vgl_loop()) { InterlockedExchange(&s_fb_running, 0); return 0; }
             fprintf(stderr, "  [VGL] falling back to SDL\n");
         }

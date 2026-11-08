@@ -49,6 +49,13 @@ else()
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_kernel PUBLIC platform SDL2::SDL2)
 endif()
+if(VITA)
+    # the GPU renderer (nv2a_gl.inc through nv2a_gl_vita.inc) calls vitaGL
+    target_link_libraries(xbox_kernel PUBLIC vitaGL vitashark SceShaccCgExt mathneon
+        taihen_stub SceShaccCg_stub SceKernelDmacMgr_stub SceGxm_stub
+        SceDisplay_stub SceAppMgr_stub SceCommonDialog_stub SceSysmodule_stub
+        SceLibKernel_stub m)
+endif()
 
 if(MSVC)
     target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
