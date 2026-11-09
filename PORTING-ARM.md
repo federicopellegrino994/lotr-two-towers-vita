@@ -336,3 +336,17 @@ sulla CPU (gpu_transform_all), come previsto.
   va in ux0:data/twotowers/hwvp_fail.txt. [VGLPERF] dice quanti draw passano
   dalla GPU e quanti programmi sono compilati/falliti. RECOMP_HW_VP=0 o
   l'overlay lo spengono. DA PROVARE SULLA CONSOLE.
+- v22–v27 (diagnostica): v21 mostrava solo l'HUD (che passa ancora dalla CPU:
+  programmi di <= 3 istruzioni). Verificato: la traduzione Cg è giusta
+  (simulatore /home/claude/tools/cgsim.py sui dump ux0:data/twotowers/hwvp/),
+  gli array di uniform funzionano in vitaGL (test all'avvio [VGL] uniform
+  test), un programma vero dà la posizione giusta sulla GPU, e ridisegnati da
+  soli in una texture 64x64 ([HWVP] probe, RECOMP_VGL_PROBE=1) tutti i
+  programmi del livello coprono i pixel attesi. Trovato anche: la cache degli
+  uniform teneva le posizioni di un programma cancellato quando vitaGL ne
+  riusa il numero (vprog_forget in vgl_link).
+- v28: ipotesi sul nero nel gioco: ogni draw ricaricava tutte le 192 costanti
+  (3 KB) e sceGxm le tiene nel vertex ring buffer (2 MB) fino a fine scena:
+  1500 draw non ci stanno. Ora ogni programma dichiara solo le righe di c[]
+  che legge (tutte solo con indirizzamento relativo) e il ring buffer è 4 MB
+  (RECOMP_VGL_VTXRING_MB). DA PROVARE.

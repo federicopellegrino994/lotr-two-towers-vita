@@ -1638,7 +1638,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v27) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v28) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -2564,6 +2564,7 @@ typedef struct {
     GLuint vs;
 #if defined(__vita__)
     char *src;                        /* (the Cg, kept for hwvp_dump) */
+    uint16_t c_lo, c_n;               /* (the rows of c[] it declares: only those are sent each draw) */
     int dumped, probed;
 #endif
 } HwVp;
@@ -2578,6 +2579,7 @@ static float *g_xin; static uint32_t g_xin_cap;
 static uint32_t g_hwvp_stat_hw, g_hwvp_stat_cpu, g_hwvp_compiled, g_hwvp_failed;
 #if defined(__vita__)
 static uint8_t s_hwvp_cg_in[16];   /* (hwvp_translate_cg: guest input register at each location) */
+static int s_hwvp_cg_lo, s_hwvp_cg_n;   /* (and the constants' rows it declares) */
 #endif
 
 static uint32_t hwvp_hash(const uint32_t (*w)[4], uint32_t len)
@@ -2746,7 +2748,7 @@ static const char *hwvp_src_cg(const VpSrc *d, char *buf, size_t bs)
               if (at >= 0) snprintf(base, sizeof base, "vin%d", at); else snprintf(base, sizeof base, "float4(0.0, 0.0, 0.0, 1.0)"); } break;
     case 3:
         if (d->rel) snprintf(base, sizeof base, "kc(%d.0 + a0)", d->ci);
-        else if (d->ci >= 0 && d->ci < VP_CONSTS) snprintf(base, sizeof base, "c[%d]", d->ci);
+        else if (d->ci >= 0 && d->ci < VP_CONSTS) snprintf(base, sizeof base, "c[%d]", d->ci - s_hwvp_cg_lo);
         else snprintf(base, sizeof base, "float4(0.0, 0.0, 0.0, 1.0)");
         break;
     default: snprintf(base, sizeof base, "float4(0.0, 0.0, 0.0, 1.0)"); break;
@@ -2772,12 +2774,32 @@ static char *hwvp_translate_cg(HwVp *e)
     e->nin = 0;
     for (i = 0; i < 16; i++) if (used & (1u << i)) e->inreg[e->nin++] = (uint8_t)i;
     for (i = 0; i < 16; i++) s_hwvp_cg_in[i] = i < e->nin ? e->inreg[i] : 0xFF;
+    {   /* the constants' rows: every draw sends them all again (sceGxm's
+         * vertex ring buffer: 192 rows x 1500 draws a frame did not fit and
+         * the world drew nothing), so only the range the program reads; with
+         * relative addressing, all of them */
+        int lo = VP_CONSTS, hi = -1, rel = 0, s2;
+        for (k = 0; k < s_vpd_len; k++) {
+            for (s2 = 0; s2 < 3; s2++) {
+                const VpSrc *d = &s_vpd[k].s[s2];
+                if (d->mux != 3) continue;
+                if (d->rel) rel = 1;
+                else if (d->ci >= 0 && d->ci < VP_CONSTS) { if (d->ci < lo) lo = d->ci; if (d->ci > hi) hi = d->ci; }
+            }
+            if (s_vpd[k].final) break;
+        }
+        if (rel) { lo = 0; hi = VP_CONSTS - 1; }
+        if (hi < 0) { lo = 0; hi = 0; }
+        s_hwvp_cg_lo = lo; s_hwvp_cg_n = hi - lo + 1;
+        e->c_lo = (uint16_t)lo; e->c_n = (uint16_t)(hi - lo + 1);
+    }
 
     hwvp_cat(&p, &cap, &len,
-        "uniform float4 vp;\n"
-        "uniform float4 c[192];\n"
+        "uniform float4 vp;\n");
+    hwvp_cat(&p, &cap, &len, "uniform float4 c[%d];\n", s_hwvp_cg_n);
+    hwvp_cat(&p, &cap, &len, "float4 kc(float i) { return (i >= 0.0 && i < %d.0) ? c[(int)i] : float4(0.0, 0.0, 0.0, 1.0); }\n", s_hwvp_cg_n);
+    hwvp_cat(&p, &cap, &len,
         "float4 f4(float x) { return float4(x, x, x, x); }\n"
-        "float4 kc(float i) { return (i >= 0.0 && i < 192.0) ? c[(int)i] : float4(0.0, 0.0, 0.0, 1.0); }\n"
         "float4 rcc(float x) { float r = 1.0 / x; float ar = abs(r);\n"
         "  ar = (ar < 5.42101e-20) ? 5.42101e-20 : ((ar > 1.884467e+19) ? 1.884467e+19 : ar);\n"
         "  return f4(r < 0.0 ? -ar : ar); }\n"
@@ -3528,13 +3550,19 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
         gpu_ub(UB_VPC, g_vpc_shadow, sizeof g_vpc_shadow);
     }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    if (!hv->probed && g_pb_n < 64 && hv->len > 3 && g_cur_rt && g_cur_rt->w >= 640 && g_nidx >= 6) {
+    static int probe_on = -1;
+    if (probe_on < 0) probe_on = getenv("RECOMP_VGL_PROBE") != NULL;
+    if (probe_on && !hv->probed && g_pb_n < 64 && hv->len > 3 && g_cur_rt && g_cur_rt->w >= 640 && g_nidx >= 6) {
         hv->probed = 1;
         g_pb_n++;
         hwvp_probe(hv, prog, nverts);
         glBindVertexArray(g_vao_x);
         g_sh.vao = 2;
         glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+    {
+        VProg *ve = vprog_get(prog, 1);
+        if (ve && (ve->c_lo != hv->c_lo || ve->c_n != hv->c_n)) { ve->c_lo = hv->c_lo; ve->c_n = hv->c_n; ve->known = 0; }
     }
     gpu_set_blend(0);
     gpu_set_depth(g_cur_ds != NULL);

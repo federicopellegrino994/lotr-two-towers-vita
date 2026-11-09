@@ -314,6 +314,7 @@ static const VUni g_vuni[] = {
 typedef struct {
     GLuint prog;
     uint8_t tri, known;
+    uint16_t c_lo, c_n;          /* (vertex programs: the rows of c[] the program declares; 0, 0 = all 192) */
     GLint loc[VUNI_N];
     uint32_t gen[VUNI_N];
 } VProg;
@@ -343,7 +344,7 @@ static VProg *vprog_get(GLuint p, int make)
 static void vprog_forget(GLuint p)
 {
     VProg *e = vprog_get(p, 0);
-    if (e) { e->known = 0; e->tri = 0; }
+    if (e) { e->known = 0; e->tri = 0; e->c_lo = 0; e->c_n = 0; }
 }
 static void vprog_locs(VProg *e)
 {
@@ -373,7 +374,8 @@ static void vgl_ub_flush(void)
         /* (vitaGL's locations are minus the uniform's address: any value but
          * -1 or 0 is one -- an address under 0x80000000 gives a negative) */
         if (e->loc[u] == -1 || e->loc[u] == 0 || e->gen[u] == g_vub_gen[U->block]) continue;
-        glUniform4fv(e->loc[u], U->n ? U->n : 1, g_vub[U->block][U->row]);
+        if (U->block == VB_VPC && e->c_n) glUniform4fv(e->loc[u], e->c_n, g_vub[VB_VPC][e->c_lo]);
+        else glUniform4fv(e->loc[u], U->n ? U->n : 1, g_vub[U->block][U->row]);
         e->gen[u] = g_vub_gen[U->block];
     }
 }

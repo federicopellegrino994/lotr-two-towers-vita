@@ -1193,6 +1193,14 @@ static void vgl_start(void)
         if (sceKernelGetFreeMemorySize(&mi) >= 0)
             fprintf(stderr, "  [VGL] free memory before vitaGL: RAM %d MB, CDRAM %d MB, phycont %d MB; %d MB of RAM kept back\n",
                     mi.size_user >> 20, mi.size_cdram >> 20, mi.size_phycont >> 20, keep);
+        {   /* sceGxm's vertex ring buffer holds every draw's vertex uniforms
+             * until the frame is done: the GPU vertex programs send their
+             * constants with each draw (default 2 MB; RECOMP_VGL_VTXRING_MB) */
+            const char *vr = getenv("RECOMP_VGL_VTXRING_MB");
+            int mb = vr && atoi(vr) > 0 ? atoi(vr) : 4;
+            vglSetVertexBufferSize((uint32_t)mb << 20);
+            fprintf(stderr, "  [VGL] vertex ring buffer %d MB\n", mb);
+        }
         if (vglInitExtended(0, 960, 544, keep << 20, SCE_GXM_MULTISAMPLE_NONE))
             fprintf(stderr, "  [VGL] display resolution lowered by vitaGL\n");
         mi.size = sizeof mi;
