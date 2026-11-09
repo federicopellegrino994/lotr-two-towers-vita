@@ -568,6 +568,12 @@ static struct { uint16_t u[KB_U]; int n; } s_kb_orig[KB_TXT_N];
 static int s_kb_orig_ok;
 static uint16_t s_kb_last[KB_TXT_MAX][KB_U];
 static int s_kb_last_n[KB_TXT_MAX];
+#if defined(__vita__)
+#define KB_SCAN_STEP 0x00200000u   /* (2 MB of the window per call) */
+#else
+#define KB_SCAN_STEP 0x04000000u
+#endif
+static uint32_t s_kb_scan_at;   /* where the scan for the hints goes on; 0 none under way */
 static void kb_txt_apply(int keys)   /* 0 the game's words, 1 the keys', 2 the controller's buttons as bound */
 {
     static DWORD scanned;
@@ -581,21 +587,38 @@ static void kb_txt_apply(int keys)   /* 0 the game's words, 1 the keys', 2 the c
         if (kb_txt_is(at, s_kb_orig[w].u, s_kb_orig[w].n) || (s_kb_last_n[i] && kb_txt_is(at, s_kb_last[i], s_kb_last_n[i]))) ok++;
         else s_kb_txt_at[i].at = 0;   /* (not the game's words any more: never written to) */
     }
-    if ((!s_kb_txt_n || ok < s_kb_txt_n) && keys && GetTickCount() - scanned > 1000u) {
-        /* find them: the game's memory, for each one's words */
+    if ((!s_kb_txt_n || ok < s_kb_txt_n) && keys && (s_kb_scan_at || GetTickCount() - scanned > 1000u)) {
+        /* find them: the game's memory, for each one's words. A piece of the
+         * window per call (KB_SCAN_STEP; the whole of it on the desktop),
+         * with the words' first characters looked up in a bitmap first: the
+         * whole 64 MB at once took seconds a frame on the PS Vita, and it is
+         * done again every second while nothing is found */
         const uint8_t *m = TT_GBIAS(0x80000000u);   /* (the window: see tt_guest.h) */
-        uint32_t a;
-        scanned = GetTickCount();
-        s_kb_txt_n = 0;
-        for (a = 0x80010000u; a < 0x83FFFF00u && s_kb_txt_n < KB_TXT_MAX; a += 2) {   /* (the heap: 0x80000000 on) */
-            uint16_t c0 = (uint16_t)(m[a] | m[a + 1] << 8), c1 = (uint16_t)(m[a + 2] | m[a + 3] << 8);
+        static uint8_t first[8192];
+        static int first_ok;
+        uint32_t a, end;
+        if (!first_ok) {
+            for (i = 0; i < KB_TXT_N; i++) first[s_kb_orig[i].u[0] >> 3] |= (uint8_t)(1u << (s_kb_orig[i].u[0] & 7));
+            first_ok = 1;
+        }
+        if (!s_kb_scan_at) { s_kb_scan_at = 0x80010000u; s_kb_txt_n = 0; }
+        end = s_kb_scan_at + KB_SCAN_STEP;
+        if (end > 0x83FFFF00u || end < s_kb_scan_at) end = 0x83FFFF00u;
+        for (a = s_kb_scan_at; a < end && s_kb_txt_n < KB_TXT_MAX; a += 2) {   /* (the heap: 0x80000000 on) */
+            uint16_t c0 = (uint16_t)(m[a] | m[a + 1] << 8), c1;
+            if (!(first[c0 >> 3] & (1u << (c0 & 7)))) continue;
+            c1 = (uint16_t)(m[a + 2] | m[a + 3] << 8);
             for (i = 0; i < KB_TXT_N; i++)
                 if (c0 == s_kb_orig[i].u[0] && c1 == s_kb_orig[i].u[1] && kb_txt_is(a, s_kb_orig[i].u, s_kb_orig[i].n)) {
                     s_kb_txt_at[s_kb_txt_n].at = a; s_kb_txt_at[s_kb_txt_n].which = i; s_kb_last_n[s_kb_txt_n] = 0; s_kb_txt_n++;
                     break;
                 }
         }
-        tt_dbg("[PROMPTS] the hints naming the pad's buttons: %d found in memory\n", s_kb_txt_n);
+        s_kb_scan_at = (a >= 0x83FFFF00u || s_kb_txt_n >= KB_TXT_MAX) ? 0 : a;
+        if (!s_kb_scan_at) {
+            scanned = GetTickCount();
+            tt_dbg("[PROMPTS] the hints naming the pad's buttons: %d found in memory\n", s_kb_txt_n);
+        }
     }
     for (i = 0; i < s_kb_txt_n; i++) {
         uint32_t at = s_kb_txt_at[i].at;

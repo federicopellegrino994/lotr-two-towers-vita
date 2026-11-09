@@ -102,14 +102,14 @@ static int g_vgl_flip;                 /* see the top of this file */
 /* Start-up trace: the first GL calls after the renderer starts, each written
  * to the log at once (the log is otherwise flushed twice a second, and a
  * crash loses the last half second). [VGLT] <line in nv2a_gl.inc> <call>.
- * RECOMP_VGL_TRACE=<n> calls (default 1500; 0 = off). */
+ * RECOMP_VGL_TRACE=<n> calls (default 0: off). */
 #include <stdarg.h>
 static int g_vgl_tr = -1;
 static unsigned g_vgl_tr_n;
 static void vgl_tr_init(void)
 {
     const char *e = getenv("RECOMP_VGL_TRACE");
-    g_vgl_tr = e && *e ? atoi(e) : 1500;
+    g_vgl_tr = e && *e ? atoi(e) : 0;   /* (off unless asked: each line is a write to the card) */
 }
 static void vgl_tr(const char *fn, int line)
 {
