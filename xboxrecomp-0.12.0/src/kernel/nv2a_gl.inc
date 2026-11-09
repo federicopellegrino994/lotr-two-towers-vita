@@ -1449,7 +1449,11 @@ static void gpu_prog_bindings(GLuint p)
         GLint loc;
         snprintf(nm, sizeof nm, "tx%d", i);
         loc = glGetUniformLocation(p, nm);
+#if defined(__vita__)
+        if (loc != -1 && loc != 0) glUniform1i(loc, i);   /* (vitaGL: see vgl_ub_flush) */
+#else
         if (loc >= 0) glUniform1i(loc, i);
+#endif
     }
     g_sh.prog = 0;
 }
@@ -1633,7 +1637,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v22) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v23) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3176,10 +3180,15 @@ static void hwvp_dump(HwVp *hv, uint32_t nverts)
         const float *c = s_3d.c[i];
         if (c[0] || c[1] || c[2] || c[3]) fprintf(f, "  c[%u] = %.9g %.9g %.9g %.9g\n", i, c[0], c[1], c[2], c[3]);
     }
-    fprintf(f, "uniform c[] as uploaded (rows 0, 58, 59): %g %g %g %g | %g %g %g %g | %g %g %g %g\n",
-            g_vub[VB_VPC][0][0], g_vub[VB_VPC][0][1], g_vub[VB_VPC][0][2], g_vub[VB_VPC][0][3],
-            g_vub[VB_VPC][58][0], g_vub[VB_VPC][58][1], g_vub[VB_VPC][58][2], g_vub[VB_VPC][58][3],
-            g_vub[VB_VPC][59][0], g_vub[VB_VPC][59][1], g_vub[VB_VPC][59][2], g_vub[VB_VPC][59][3]);
+    fprintf(f, "uniform c[] as uploaded (rows 96, 99): %g %g %g %g | %g %g %g %g\n",
+            g_vub[VB_VPC][96][0], g_vub[VB_VPC][96][1], g_vub[VB_VPC][96][2], g_vub[VB_VPC][96][3],
+            g_vub[VB_VPC][99][0], g_vub[VB_VPC][99][1], g_vub[VB_VPC][99][2], g_vub[VB_VPC][99][3]);
+    if (g_vgl_cur) {
+        int u;
+        fprintf(f, "uniform locations:");
+        for (u = 0; u < VUNI_N; u++) if (g_vgl_cur->loc[u] != -1) fprintf(f, " %s=%d", g_vuni[u].name, (int)g_vgl_cur->loc[u]);
+        fprintf(f, "\n");
+    }
     fprintf(f, "Cg:\n%s\n", hv->src ? hv->src : "(none)");
     fclose(f);
     fprintf(stderr, "  [HWVP] program %08X written to %s\n", hv->hash, path);

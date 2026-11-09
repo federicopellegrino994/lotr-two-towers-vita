@@ -363,7 +363,9 @@ static void vgl_ub_flush(void)
     if (!e->known) vprog_locs(e);
     for (u = 0; u < VUNI_N; u++) {
         const VUni *U = &g_vuni[u];
-        if (e->loc[u] < 0 || e->gen[u] == g_vub_gen[U->block]) continue;
+        /* (vitaGL's locations are minus the uniform's address: any value but
+         * -1 or 0 is one -- an address under 0x80000000 gives a negative) */
+        if (e->loc[u] == -1 || e->loc[u] == 0 || e->gen[u] == g_vub_gen[U->block]) continue;
         glUniform4fv(e->loc[u], U->n ? U->n : 1, g_vub[U->block][U->row]);
         e->gen[u] = g_vub_gen[U->block];
     }
