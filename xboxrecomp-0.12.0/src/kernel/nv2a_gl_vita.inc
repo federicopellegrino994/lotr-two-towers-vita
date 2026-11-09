@@ -211,6 +211,8 @@ static void vgl_blit(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLin
 
 /* ---- shaders: Cg, one source string ---- */
 
+#define VGL_IDS 8192
+static uint8_t g_vgl_vin_sh[VGL_IDS], g_vgl_vin_pr[VGL_IDS];
 static GLuint vgl_create_shader(GLenum t)
 {
     return glCreateShader(t == GL_VERTEX_SHADER ? GL_CG_VERTEX_SHADER_EXT
@@ -231,25 +233,39 @@ static void vgl_shader_source(GLuint s, GLsizei n, const GLchar *const *src, con
     }
     b[at] = 0;
     L = (GLint)at;
+    if (s < VGL_IDS) g_vgl_vin_sh[s] = strstr(b, "float4 vin0") != NULL || strstr(b, "uniform float4 c[192]") != NULL;
     {
         const GLchar *one = b;
         glShaderSource(s, 1, &one, &L);
     }
     free(b);
 }
-/* every program gets the CPU path's attribute locations before linking */
+/* (which shaders are vertex programs, which programs have one attached:
+ * their inputs are vin<i>, the others' the CPU path's a_*) */
+static void vgl_attach(GLuint p, GLuint s)
+{
+    if (p < VGL_IDS && s < VGL_IDS && g_vgl_vin_sh[s]) g_vgl_vin_pr[p] = 1;
+    glAttachShader(p, s);
+}
+/* every program gets its attribute locations before linking */
 static void vgl_link(GLuint p)
 {
     static const char *nm[8] = { "a_p", "a_d0", "a_d1", "a_fog", "a_t0", "a_t1", "a_t2", "a_t3" };
     int i;
-    for (i = 0; i < 8; i++) glBindAttribLocation(p, (GLuint)i, nm[i]);
+    static const char *vin[16] = { "vin0", "vin1", "vin2", "vin3", "vin4", "vin5", "vin6", "vin7",
+                                   "vin8", "vin9", "vin10", "vin11", "vin12", "vin13", "vin14", "vin15" };
+    if (p < VGL_IDS && g_vgl_vin_pr[p])
+        for (i = 0; i < 16; i++) glBindAttribLocation(p, (GLuint)i, vin[i]);   /* (vertex programs: nv2a_gl.inc hwvp_translate_cg) */
+    else
+        for (i = 0; i < 8; i++) glBindAttribLocation(p, (GLuint)i, nm[i]);
     glLinkProgram(p);
+    if (p < VGL_IDS) g_vgl_vin_pr[p] = 0;   /* (ids come back after a delete) */
 }
 
 /* ---- uniform blocks as plain uniforms ---- */
 
 enum { VB_VSC = 0, VB_PSC = 1, VB_CLC = 2, VB_POST = 3, VB_VPC = 4, VB_N = 5 };
-#define VB_ROWS 72
+#define VB_ROWS 192   /* (VPC: the vertex program's 192 constants) */
 static float g_vub[VB_N][VB_ROWS][4];
 static uint32_t g_vub_gen[VB_N] = { 1, 1, 1, 1, 1 };
 
@@ -278,7 +294,7 @@ static void vgl_ub_set(int binding, const void *data, uint32_t bytes)
 }
 
 /* the uniforms a program may have, and where their values come from */
-typedef struct { const char *name; uint8_t block, row; } VUni;
+typedef struct { const char *name; uint8_t block, row; uint16_t n; } VUni;   /* (n: rows, 0 = 1) */
 static const VUni g_vuni[] = {
     { "vp", VB_VSC, 0 }, { "clear_color", VB_CLC, 0 }, { "clc_f", VB_CLC, 0 }, { "post", VB_POST, 0 },
     { "c0_0", VB_PSC, 5 }, { "c0_1", VB_PSC, 12 }, { "c0_2", VB_PSC, 19 }, { "c0_3", VB_PSC, 26 },
@@ -288,6 +304,7 @@ static const VUni g_vuni[] = {
     { "ff0", VB_PSC, 59 }, { "ff1", VB_PSC, 60 }, { "fogc", VB_PSC, 61 }, { "fogp", VB_PSC, 62 },
     { "ss0", VB_PSC, 65 }, { "ss1", VB_PSC, 66 }, { "ss2", VB_PSC, 67 }, { "ss3", VB_PSC, 68 },
     { "atest", VB_PSC, 69 },
+    { "c", VB_VPC, 0, 192 },
 };
 #define VUNI_N ((int)(sizeof g_vuni / sizeof g_vuni[0]))
 
@@ -346,7 +363,7 @@ static void vgl_ub_flush(void)
     for (u = 0; u < VUNI_N; u++) {
         const VUni *U = &g_vuni[u];
         if (e->loc[u] < 0 || e->gen[u] == g_vub_gen[U->block]) continue;
-        glUniform4fv(e->loc[u], 1, g_vub[U->block][U->row]);
+        glUniform4fv(e->loc[u], U->n ? U->n : 1, g_vub[U->block][U->row]);
         e->gen[u] = g_vub_gen[U->block];
     }
 }
@@ -575,6 +592,7 @@ static void vgl_del_rbs(GLsizei n, const GLuint *r)
 #define glShaderSource(s, n, src, len) vgl_shader_source(s, n, src, len)
 #define glCompileShader(s) (VGLT("glCompileShader"), glCompileShader(s))
 #define glLinkProgram(p) (VGLT("glLinkProgram"), vgl_link(p))
+#define glAttachShader(p, s) (VGLT("glAttachShader"), vgl_attach(p, s))
 #define glUseProgram(p) (VGLT("glUseProgram"), vgl_use(p))
 #define glDrawArrays(m, f, c) (VGLT("glDrawArrays"), vgl_draw_arrays(m, f, c))
 #define glUniform1f(l, v) vgl_uniform1f(l, v)
@@ -613,4 +631,4 @@ static void (*p_glMaxShaderCompilerThreadsKHR)(GLuint);   /* (desktop only: KHR_
 /* (nv2a_gl.inc, after its texture cache) */
 static void vgl_mem_report(const char *why);
 static void vgl_make_room(uint64_t need);
-static unsigned g_vp_draws, g_vp_verts, g_vp_up, g_vp_upkb;   /* ([VGLPERF] counters: nv2a_gl.inc) */
+static unsigned g_vp_draws, g_vp_verts, g_vp_up, g_vp_upkb, g_vp_hw;   /* ([VGLPERF] counters: nv2a_gl.inc) */

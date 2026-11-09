@@ -1633,7 +1633,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v20) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v21) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -2383,6 +2383,9 @@ static float g_vpc_shadow[VP_CONSTS][4];
 static int g_vpc_ok;
 static float *g_xin; static uint32_t g_xin_cap;
 static uint32_t g_hwvp_stat_hw, g_hwvp_stat_cpu, g_hwvp_compiled, g_hwvp_failed;
+#if defined(__vita__)
+static uint8_t s_hwvp_cg_in[16];   /* (hwvp_translate_cg: guest input register at each location) */
+#endif
 
 static uint32_t hwvp_hash(const uint32_t (*w)[4], uint32_t len)
 {
@@ -2534,6 +2537,128 @@ static char *hwvp_translate(HwVp *e)
     return p;
 }
 
+#if defined(__vita__)
+/* hwvp_translate in Cg (PS Vita): the same program, line for line, for sce
+ * Cg -- no integer bit casts (rcc keeps the sign of r; log of 0 gives the
+ * largest negative float), comparisons through step(), the address register
+ * a float. Inputs vin<i> at location i (nv2a_gl_vita.inc binds them), the
+ * constants a uniform array c[192] (uploaded from gpu_ub(UB_VPC)). */
+static const char *hwvp_src_cg(const VpSrc *d, char *buf, size_t bs)
+{
+    static const char sw[] = "xyzw";
+    char base[64];
+    switch (d->mux) {
+    case 1: if (d->reg == 12) snprintf(base, sizeof base, "o0"); else snprintf(base, sizeof base, "R%u", d->reg); break;
+    case 2: { uint32_t i; int at = -1; for (i = 0; i < 16; i++) if (s_hwvp_cg_in[i] == d->reg) { at = (int)i; break; }
+              if (at >= 0) snprintf(base, sizeof base, "vin%d", at); else snprintf(base, sizeof base, "float4(0.0, 0.0, 0.0, 1.0)"); } break;
+    case 3:
+        if (d->rel) snprintf(base, sizeof base, "kc(%d.0 + a0)", d->ci);
+        else if (d->ci >= 0 && d->ci < VP_CONSTS) snprintf(base, sizeof base, "c[%d]", d->ci);
+        else snprintf(base, sizeof base, "float4(0.0, 0.0, 0.0, 1.0)");
+        break;
+    default: snprintf(base, sizeof base, "float4(0.0, 0.0, 0.0, 1.0)"); break;
+    }
+    snprintf(buf, bs, "%s(%s).%c%c%c%c", d->neg ? "-" : "", base,
+             sw[d->sw[0]], sw[d->sw[1]], sw[d->sw[2]], sw[d->sw[3]]);
+    return buf;
+}
+static char *hwvp_translate_cg(HwVp *e)
+{
+    size_t cap = 16384, len = 0;
+    char *p = (char *)malloc(cap);
+    uint32_t k, used = 0, i;
+    char a[128], b[128], c[128], mk[8];
+    if (!p) return NULL;
+    p[0] = 0;
+    for (k = 0; k < s_vpd_len; k++) {
+        const VpIns *I = &s_vpd[k];
+        int s;
+        if (I->o_mask && !I->orb) { free(p); return NULL; }
+        for (s = 0; s < 3; s++) if (I->s[s].mux == 2) used |= 1u << I->s[s].reg;
+    }
+    e->nin = 0;
+    for (i = 0; i < 16; i++) if (used & (1u << i)) e->inreg[e->nin++] = (uint8_t)i;
+    for (i = 0; i < 16; i++) s_hwvp_cg_in[i] = i < e->nin ? e->inreg[i] : 0xFF;
+
+    hwvp_cat(&p, &cap, &len,
+        "uniform float4 vp;\n"
+        "uniform float4 c[192];\n"
+        "float4 f4(float x) { return float4(x, x, x, x); }\n"
+        "float4 kc(float i) { return (i >= 0.0 && i < 192.0) ? c[(int)i] : float4(0.0, 0.0, 0.0, 1.0); }\n"
+        "float4 rcc(float x) { float r = 1.0 / x; float ar = abs(r);\n"
+        "  ar = (ar < 5.42101e-20) ? 5.42101e-20 : ((ar > 1.884467e+19) ? 1.884467e+19 : ar);\n"
+        "  return f4(r < 0.0 ? -ar : ar); }\n"
+        "float4 vexp(float x) { float fl = floor(x); return float4(exp2(fl), x - fl, exp2(x), 1.0); }\n"
+        "float4 vlog(float x) { x = abs(x); if (x == 0.0) return float4(-3.402823e38, 1.0, -3.402823e38, 1.0);\n"
+        "  float e = floor(log2(x)); return float4(e, x / exp2(e), log2(x), 1.0); }\n"
+        "float4 vlit(float4 s) { float nl = max(s.x, 0.0), nh = max(s.y, 0.0); float pw = clamp(s.w, -127.9961, 127.9961);\n"
+        "  return float4(1.0, nl, (s.x > 0.0) ? pow(nh, pw) : 0.0, 1.0); }\n"
+        "void main(");
+    for (i = 0; i < e->nin; i++) hwvp_cat(&p, &cap, &len, "float4 vin%u, ", i);
+    hwvp_cat(&p, &cap, &len,
+        "float4 out gl_Position : POSITION, float4 out v_t0 : TEXCOORD0, float4 out v_t1 : TEXCOORD1,\n"
+        "  float4 out v_t2 : TEXCOORD2, float4 out v_t3 : TEXCOORD3, float4 out v_d0 : TEXCOORD4,\n"
+        "  float4 out v_d1 : TEXCOORD5, float4 out v_fog : TEXCOORD6) {\n"
+        "  float a0 = 0.0; float4 m, l;\n");
+    for (i = 0; i < 16; i++) hwvp_cat(&p, &cap, &len, "  float4 R%u = f4(0.0);\n", i);
+    for (i = 0; i < 13; i++) hwvp_cat(&p, &cap, &len, "  float4 o%u = %s;\n", i, i == 3 ? "f4(1.0)" : "float4(0.0, 0.0, 0.0, 1.0)");
+    for (k = 0; k < s_vpd_len; k++) {
+        const VpIns *I = &s_vpd[k];
+        hwvp_src_cg(&I->s[0], a, sizeof a);
+        hwvp_src_cg(&I->s[1], b, sizeof b);
+        hwvp_src_cg(&I->s[2], c, sizeof c);
+        hwvp_cat(&p, &cap, &len, "  m = f4(0.0); l = f4(0.0);\n");
+        switch (I->mac) {
+        case MAC_MOV: hwvp_cat(&p, &cap, &len, "  m = %s;\n", a); break;
+        case MAC_MUL: hwvp_cat(&p, &cap, &len, "  m = %s * %s;\n", a, b); break;
+        case MAC_ADD: hwvp_cat(&p, &cap, &len, "  m = %s + %s;\n", a, c); break;
+        case MAC_MAD: hwvp_cat(&p, &cap, &len, "  m = %s * %s + %s;\n", a, b, c); break;
+        case MAC_DP3: hwvp_cat(&p, &cap, &len, "  m = f4(dot((%s).xyz, (%s).xyz));\n", a, b); break;
+        case MAC_DPH: hwvp_cat(&p, &cap, &len, "  { float4 A_ = %s, B_ = %s; m = f4(dot(A_.xyz, B_.xyz) + B_.w); }\n", a, b); break;
+        case MAC_DP4: hwvp_cat(&p, &cap, &len, "  m = f4(dot(%s, %s));\n", a, b); break;
+        case MAC_DST: hwvp_cat(&p, &cap, &len, "  { float4 A_ = %s, B_ = %s; m = float4(1.0, A_.y * B_.y, A_.z, B_.w); }\n", a, b); break;
+        case MAC_MIN: hwvp_cat(&p, &cap, &len, "  m = min(%s, %s);\n", a, b); break;
+        case MAC_MAX: hwvp_cat(&p, &cap, &len, "  m = max(%s, %s);\n", a, b); break;
+        case MAC_SLT: hwvp_cat(&p, &cap, &len, "  m = f4(1.0) - step(%s, %s);\n", b, a); break;
+        case MAC_SGE: hwvp_cat(&p, &cap, &len, "  m = step(%s, %s);\n", b, a); break;
+        case MAC_ARL: hwvp_cat(&p, &cap, &len, "  a0 = floor((%s).x + 0.001);\n", a); break;
+        default: break;
+        }
+        switch (I->ilu) {
+        case ILU_MOV: hwvp_cat(&p, &cap, &len, "  l = %s;\n", c); break;
+        case ILU_RCP: hwvp_cat(&p, &cap, &len, "  l = f4(1.0 / (%s).x);\n", c); break;
+        case ILU_RCC: hwvp_cat(&p, &cap, &len, "  l = rcc((%s).x);\n", c); break;
+        case ILU_RSQ: hwvp_cat(&p, &cap, &len, "  l = f4(1.0 / sqrt(abs((%s).x)));\n", c); break;
+        case ILU_EXP: hwvp_cat(&p, &cap, &len, "  l = vexp((%s).x);\n", c); break;
+        case ILU_LOG: hwvp_cat(&p, &cap, &len, "  l = vlog((%s).x);\n", c); break;
+        case ILU_LIT: hwvp_cat(&p, &cap, &len, "  l = vlit(%s);\n", c); break;
+        default: break;
+        }
+        if (I->mac && I->mac != MAC_ARL && I->mac_mask && I->out_r < 16 && I->out_r != 12)
+            hwvp_cat(&p, &cap, &len, "  R%u%s = m%s;\n", I->out_r, hwvp_mask(I->mac_mask, mk), mk);
+        if (I->ilu && I->ilu_mask) {
+            uint32_t d = I->mac ? 1 : I->out_r;
+            if (d < 16 && d != 12) hwvp_cat(&p, &cap, &len, "  R%u%s = l%s;\n", d, hwvp_mask(I->ilu_mask, mk), mk);
+        }
+        if (I->o_mask && I->orb && I->oaddr < VP_OUTS)
+            hwvp_cat(&p, &cap, &len, "  o%u%s = %s%s;\n", I->oaddr, hwvp_mask(I->o_mask, mk), I->omux ? "l" : "m", mk);
+        if (I->final) break;
+    }
+    hwvp_cat(&p, &cap, &len,
+        "  float w = o0.w; if (w == 0.0) w = 1e-30;\n"
+        "  float4 P = float4(o0.xyz * w, w);\n"
+        "  gl_Position = float4(P.x * vp.x - P.w, (P.y * vp.y - P.w) * vp.w, 2.0 * P.z * vp.z - P.w, P.w);\n"
+        "  v_d0 = saturate(o3); v_d1 = saturate(o4); v_fog = float4(o5.x, 0.0, 0.0, 0.0);\n"
+        "  v_t0 = o9; v_t1 = o10; v_t2 = o11; v_t3 = o12;\n"
+        "}\n");
+    if (getenv("RECOMP_VGL_VPLOG")) {
+        static int n;
+        if (n++ < 3) fprintf(stderr, "  [VGL] vertex program shader:\n%s\n", p);
+    }
+    return p;
+}
+#endif
+
 static int hwvp_enabled(void)
 {
     if (g_hwvp_on < 0) {
@@ -2544,21 +2669,31 @@ static int hwvp_enabled(void)
     return g_hwvp_on;
 }
 
+#if defined(__vita__)
+static char *s_hwvp_fail_src;   /* (a copy of the source until it compiles: only while none has failed) */
+static int s_hwvp_fail_keep = 1;
+#endif
 static void hwvp_poll(HwVp *e)
 {
     if (e->state == 0 && e->vs) {
         int r = gpu_shader_done(&e->vs, "vertex program", e->hash);
         if (r > 0) { e->state = 1; g_hwvp_compiled++; }
         else if (r < 0) { e->state = 2; g_hwvp_failed++; }
+#if defined(__vita__)
+        if (r < 0 && s_hwvp_fail_src) {
+            /* (the first one that fails, written out whole) */
+            FILE *f = fopen("ux0:data/twotowers/hwvp_fail.txt", "w");
+            if (f) { fputs(s_hwvp_fail_src, f); fclose(f); }
+            fprintf(stderr, "  [HWVP] the failed shader is in ux0:data/twotowers/hwvp_fail.txt\n");
+        }
+        if (r && s_hwvp_fail_src) { free(s_hwvp_fail_src); s_hwvp_fail_src = NULL; s_hwvp_fail_keep = r > 0; }
+#endif
     }
 }
 
 /* The shader for the current program, or NULL to use the CPU path. */
 static HwVp *hwvp_lookup(void)
 {
-#if defined(__vita__)
-    return NULL;   /* (the CPU transforms: nv2a_gl_vita.inc has no vertex-program translator) */
-#endif
     uint32_t h, i;
     HwVp *e;
     if (!g_hwvp_user || !hwvp_enabled() || s_3d.mode != 2 || s_vp_slow || !s_vpd_len) return NULL;
@@ -2576,9 +2711,18 @@ static HwVp *hwvp_lookup(void)
     e->hash = h; e->len = s_vpd_len;
     memcpy(e->words, s_vpd_src, s_vpd_len * 16);
     {
+#if defined(__vita__)
+        char *src = hwvp_translate_cg(e);
+#else
         char *src = hwvp_translate(e);
+#endif
         if (!src) e->state = 2;
-        else { e->vs = gpu_shader_start(GL_VERTEX_SHADER, src); free(src); }
+        else {
+#if defined(__vita__)
+            if (s_hwvp_fail_keep && !s_hwvp_fail_src) s_hwvp_fail_src = strdup(src);
+#endif
+            e->vs = gpu_shader_start(GL_VERTEX_SHADER, src); free(src);
+        }
     }
     g_hwvp[g_hwvp_n++] = e;
     hwvp_poll(e);
@@ -2984,14 +3128,69 @@ static void gpu_use(GLuint prog)
 
 /* Draw the assembled batch with the program's GPU vertex shader; 0 when its
  * program is not linked yet (the caller draws it on the CPU path). */
+#if defined(__vita__)
+/* (the [VGLPERF] timers: vgl_perf_frame) */
+#include <psp2/kernel/processmgr.h>
+enum { VP_BATCH, VP_TARGETS, VP_XFORM, VP_STAGES, VP_DRAW, VP_PRESENT, VP_N };
+static uint64_t g_vp_us[VP_N];
+#define VP_T0(v) SceUInt64 v = sceKernelGetProcessTimeWide()
+#define VP_ADD(k, v) (g_vp_us[k] += sceKernelGetProcessTimeWide() - (v))
+#endif
 static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
 {
     uint32_t stride = 16 * hv->nin, vb_at = 0, ib_at;
     uint32_t k;
     GLuint prog;
+#if defined(__vita__)
+    { VP_T0(t); gpu_bind_stages(); VP_ADD(VP_STAGES, t); }
+#else
     gpu_bind_stages();
+#endif
     prog = gpu_program_for(hv->vs);
     if (!prog) return 0;
+#if defined(__vita__)
+    /* (PS Vita) the inputs unpacked on the CPU, drawn from client arrays;
+     * the constants through the uniform array c */
+    (void)vb_at; (void)ib_at;
+    {
+        VP_T0(t);
+        if (hv->nin) {
+            size_t need = (size_t)nverts * 4 * hv->nin;
+            if (need > g_xin_cap) {
+                float *n = (float *)realloc(g_xin, need * sizeof(float) * 2);
+                if (!n) return 1;
+                g_xin = n; g_xin_cap = (uint32_t)(need * 2);
+            }
+            hwvp_pack_range(hv, 0, nverts);
+        }
+        VP_ADD(VP_XFORM, t);
+    }
+    glBindVertexArray(g_vao_x);
+    g_sh.vao = 2;
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    for (k = 0; k < 16; k++) {
+        if (k < hv->nin) {
+            glEnableVertexAttribArray(k);
+            glVertexAttribPointer(k, 4, GL_FLOAT, GL_FALSE, (GLsizei)stride, g_xin + 4 * k);
+        } else glDisableVertexAttribArray(k);
+    }
+    if (!g_vpc_ok || memcmp(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow)) {
+        memcpy(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow);
+        g_vpc_ok = 1;
+        gpu_ub(UB_VPC, g_vpc_shadow, sizeof g_vpc_shadow);
+    }
+    gpu_set_blend(0);
+    gpu_set_depth(g_cur_ds != NULL);
+    gpu_use(prog);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
+    g_vp_hw++;
+    s_gpu.tris_drawn += g_nidx / 3;
+    s_gpu.drawn_offset = s_gpu.color_offset;
+    s_3d.verts += nverts;
+    g_hwvp_stat_hw++;
+    return 1;
+#endif
     if (hv->nin) {
         size_t need = (size_t)nverts * 4 * hv->nin;
         if (need > g_xin_cap) {
@@ -3036,11 +3235,6 @@ static int g_null3_draw;   /* (RECOMP_GPU_NULL=3) */
 #if defined(__vita__)
 /* (PS Vita) where the render thread's time goes: [VGLPERF] every 120
  * presented frames (gpu_present) */
-#include <psp2/kernel/processmgr.h>
-enum { VP_BATCH, VP_TARGETS, VP_XFORM, VP_STAGES, VP_DRAW, VP_PRESENT, VP_N };
-static uint64_t g_vp_us[VP_N];
-#define VP_T0(v) SceUInt64 v = sceKernelGetProcessTimeWide()
-#define VP_ADD(k, v) (g_vp_us[k] += sceKernelGetProcessTimeWide() - (v))
 static void vgl_perf_frame(void)
 {
     static unsigned n;
@@ -3058,11 +3252,12 @@ static void vgl_perf_frame(void)
                 (double)(g_vp_us[VP_BATCH] - (in < g_vp_us[VP_BATCH] ? in : g_vp_us[VP_BATCH])) / 1000.0 / f,
                 g_vp_us[VP_PRESENT] / 1000.0 / f,
                 ms - (g_vp_us[VP_BATCH] + g_vp_us[VP_PRESENT]) / 1000.0 / f);
-        fprintf(stderr, "  [VGLPERF] per frame: %.0f draws, %.0f vertices transformed, %.1f texture uploads (%.0f KB)\n",
-                g_vp_draws / f, g_vp_verts / f, g_vp_up / f, g_vp_upkb / f);
+        fprintf(stderr, "  [VGLPERF] per frame: %.0f draws (%.0f with the vertex program on the GPU), %.0f vertices transformed on the CPU, "
+                "%.1f texture uploads (%.0f KB); vertex programs compiled %u, failed %u\n",
+                g_vp_draws / f, g_vp_hw / f, g_vp_verts / f, g_vp_up / f, g_vp_upkb / f, g_hwvp_compiled, g_hwvp_failed);
     }
     memset(g_vp_us, 0, sizeof g_vp_us);
-    g_vp_draws = g_vp_verts = g_vp_up = g_vp_upkb = 0;
+    g_vp_draws = g_vp_verts = g_vp_up = g_vp_upkb = g_vp_hw = 0;
     n = 0; t0 = now;
 }
 static void gpu_batch_impl(void);
