@@ -1638,7 +1638,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v26) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v27) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -2564,7 +2564,7 @@ typedef struct {
     GLuint vs;
 #if defined(__vita__)
     char *src;                        /* (the Cg, kept for hwvp_dump) */
-    int dumped;
+    int dumped, probed;
 #endif
 } HwVp;
 
@@ -3431,8 +3431,8 @@ static void hwvp_probe(HwVp *hv, GLuint game_prog, uint32_t nverts)
         glShaderSource(g_pb_fs, 1, &src, NULL);
         glCompileShader(g_pb_fs);
     }
-    fprintf(stderr, "  [HWVP] probe %08X: %u vertices, %u indices, nin %u, depth test %d func %u, vp %g %g %g %g, c[96] %g %g %g %g\n",
-            hv->hash, nverts, g_nidx, hv->nin, (int)s_3d.depth_test, (unsigned)s_3d.depth_func,
+    fprintf(stderr, "  [HWVP] probe %08X: %u instructions, %u vertices, %u indices, nin %u, fog %d, depth test %d func %u, vp %g %g %g %g, c[96] %g %g %g %g\n",
+            hv->hash, hv->len, nverts, g_nidx, hv->nin, (int)s_3d.fog_enable, (int)s_3d.depth_test, (unsigned)s_3d.depth_func,
             g_vub[VB_VSC][0][0], g_vub[VB_VSC][0][1], g_vub[VB_VSC][0][2], g_vub[VB_VSC][0][3],
             g_vub[VB_VPC][96][0], g_vub[VB_VPC][96][1], g_vub[VB_VPC][96][2], g_vub[VB_VPC][96][3]);
     pr = gpu_pair(hv->vs, g_pb_fs);
@@ -3459,6 +3459,15 @@ static void hwvp_probe(HwVp *hv, GLuint game_prog, uint32_t nverts)
     glUseProgram(game_prog);
     vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx);
     hwvp_probe_count("elements, its own fragment program", hv);
+    {   /* what the CPU path makes of the same vertices: how many land inside the view */
+        uint32_t in = 0, bad = 0;
+        for (k = 0; k < nverts; k++) {
+            SwVert v;
+            if (!sw3d_transform(g_vidx[k], &v)) { bad++; continue; }
+            if (v.p[3] > 0 && v.p[0] / v.p[3] >= 0 && v.p[0] / v.p[3] <= 640 && v.p[1] / v.p[3] >= 0 && v.p[1] / v.p[3] <= 480) in++;
+        }
+        fprintf(stderr, "  [HWVP] probe %08X cpu: %u of %u vertices inside the 640x480 view, %u dropped\n", hv->hash, in, nverts, bad);
+    }
     /* (the frame's own state again) */
     gpu_sh_reset();
     gpu_bind_targets(s_3d.depth_test || s_3d.stencil_test);
@@ -3519,7 +3528,8 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
         gpu_ub(UB_VPC, g_vpc_shadow, sizeof g_vpc_shadow);
     }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    if (g_pb_n < 8 && hv->len > 3 && g_cur_rt && g_cur_rt->w >= 640 && g_nidx >= 30) {
+    if (!hv->probed && g_pb_n < 64 && hv->len > 3 && g_cur_rt && g_cur_rt->w >= 640 && g_nidx >= 6) {
+        hv->probed = 1;
         g_pb_n++;
         hwvp_probe(hv, prog, nverts);
         glBindVertexArray(g_vao_x);
