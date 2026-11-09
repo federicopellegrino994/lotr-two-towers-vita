@@ -256,3 +256,15 @@ sulla CPU (gpu_transform_all), come previsto.
   in memoria come prima (2684 accessi). Senza RECOMP_COMPACT_GUEST sono MEM32.
   Da verificare: `apu N periods` > 0 (circa 187 al secondo) e il caricamento
   che finisce.
+- v14: `apu 0 periods` invariato; nessun file del disco aperto. Il ciclo a
+  0x0E012B è l'attesa normale del frame (thread principale), non il blocco.
+  Il blocco vero: DirectSoundCreate resetta i canali AC'97 (RR, bit 1 del
+  byte 0xFEC0010B + canale), legge una volta e gira finché RR era alto. Sul
+  desktop una trappola in scrittura impedisce a RR di restare
+  (ac97_arm_write_trap); in modalità compatta no ("a channel reset will
+  spin" nel log). DirectSound non finisce mai, l'APU non parte, il
+  caricamento aspetta.
+- v15: seconda passata di postproc_apu_io.py: nelle funzioni DSOUND ogni
+  scrittura MEM8 a 0xFEC0010B(+canale) passa per XAC97_NORR (toglie RR);
+  4 scritture. Da verificare: `[APU] started by the title`, apu periods > 0,
+  file del disco aperti ([PATH] ... game_files) e il caricamento che finisce.

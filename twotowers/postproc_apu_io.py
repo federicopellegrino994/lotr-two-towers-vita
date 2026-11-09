@@ -16,6 +16,14 @@ every MEM32 access whose address is computed and not on the stack becomes
 which send APU addresses (0xFE800000-0xFE87FFFF) to the APU and anything
 else to memory as before. Without RECOMP_COMPACT_GUEST they are MEM32 itself
 (the trap still handles the APU there). Run after postproc_regs.py.
+
+Second pass, the AC'97 bus-master reset: DirectSoundCreate sets RR (bit 1)
+in a channel's control byte (0xFEC0010B + the channel's offset), reads it
+once and spins while the value it read had RR -- on hardware the reset is
+long over by then. The desktop runtime's write trap keeps RR from ever
+landing (xbox_memory_layout.c, ac97_arm_write_trap); here every byte store
+to such an address drops RR as it is made:
+    MEM8(eax + 0xFEC0010B) = v;  ->  MEM8(eax + 0xFEC0010B) = XAC97_NORR(v);
 """
 import re, sys, glob, os
 
@@ -116,6 +124,48 @@ def process(path):
     text = text[:eol] + DECL + text[eol:]
     open(path, 'w', newline='').write(text)
     return total
+
+MARK2 = '/* postproc_apu_io: ac97 */'
+DECL2 = MARK2 + '''
+#if defined(RECOMP_COMPACT_GUEST)
+#define XAC97_NORR(v) ((uint8_t)((v) & ~2u))   /* (the reset a write asks for is done at once) */
+#else
+#define XAC97_NORR(v) (v)
+#endif
+'''
+AC97_CTL = re.compile(r'^(\s*)MEM8\(([^;]*?(?:-20971253|0xFEC0010B)u?[^;]*?)\) = ([^;]+);', re.M)
+
+def process_ac97(path):
+    s = open(path, newline='').read()
+    if MARK2 in s:
+        return 0
+    defs = [(m.start(), int(m.group(1), 16)) for m in FDEF.finditer(s)]
+    pieces, last, total = [], 0, 0
+    for idx, (pos, va) in enumerate(defs):
+        if not (DSOUND_LO <= va < DSOUND_HI):
+            continue
+        end = defs[idx + 1][0] if idx + 1 < len(defs) else len(s)
+        body, k = AC97_CTL.subn(lambda m: '%sMEM8(%s) = XAC97_NORR(%s);' % (m.group(1), m.group(2), m.group(3)), s[pos:end])
+        pieces.append(s[last:pos]); pieces.append(body)
+        last = end
+        total += k
+    if not total:
+        return 0
+    pieces.append(s[last:])
+    text = ''.join(pieces)
+    at = text.rfind('#include')
+    eol = text.find('\n', at) + 1
+    text = text[:eol] + DECL2 + text[eol:]
+    open(path, 'w', newline='').write(text)
+    return total
+
+total = 0
+for f in sorted(glob.glob(os.path.join(sys.argv[1], 'recomp_*.c'))):
+    k = process_ac97(f)
+    if k:
+        print('%s: %d AC97 channel control stores' % (os.path.basename(f), k))
+    total += k
+print('AC97 channel resets completed on write:', total)
 
 total = 0
 for f in sorted(glob.glob(os.path.join(sys.argv[1], 'recomp_*.c'))):

@@ -409,8 +409,8 @@ static void ac97_arm_write_trap(void)
 #if defined(RECOMP_COMPACT_GUEST)
     /* Fault-driven, x86-64 decoder: not on a compact (non-x86) host. */
     (void)old;
-    fprintf(stderr, "  AC97: bus-master write trap not available in compact"
-                    " mode; a channel reset will spin\n");
+    fprintf(stderr, "  AC97: no bus-master write trap in compact mode; DirectSound's"
+                    " channel resets complete in its code (postproc_apu_io.py)\n");
     return;
 #endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
