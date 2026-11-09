@@ -236,3 +236,10 @@ sulla CPU (gpu_transform_all), come previsto.
   nell'ELF = indirizzo - (base - 0x81000000). Per ogni VPK c'è il suo ELF con
   i simboli (twotowers_recomp-vNN.elf nella cartella). Un dump che finisce in
   .tmp è stato copiato mentre la console lo scriveva: manca la memoria.
+- v12: niente crash, ma ~9 s per frame sulla schermata di caricamento. Causa:
+  la stessa ricerca dei suggerimenti (kb_txt_apply), ora corretta, scandiva
+  tutti i 64 MB della finestra a ogni secondo (nessun testo trovato), sul
+  thread di rendering. Più la traccia [VGLT] (una scrittura su scheda per riga).
+- v13: ricerca a pezzi (2 MB per chiamata sulla Vita, filtro sul primo
+  carattere), traccia spenta di default (RECOMP_VGL_TRACE=n per riaccenderla).
+  Riga di versione nel log: `[VGL] GPU renderer (v13) on ...`.
