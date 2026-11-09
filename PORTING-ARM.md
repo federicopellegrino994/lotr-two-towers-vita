@@ -293,3 +293,14 @@ sulla CPU (gpu_transform_all), come previsto.
   glFinish. Il report memoria conta le cancellazioni.
   Se crasha ancora: provare zeta della stessa dimensione per tutti i target
   o nessuna zeta sui target piccoli.
+- v17: crash identico; l'unica cancellazione era quella dell'autotest
+  (ipotesi delle cancellazioni scartata, la coda differita resta: innocua).
+  Analisi di vitaGL (disassemblato con le righe di debug): glRenderbufferStorage
+  registra solo il formato; render target e depth delle FBO nascono pigri in
+  scene_reset. Target 256x256 solo colore: clear ok. Stesso target + zeta
+  renderbuffer: BeginScene fallisce -> crash. A 640x480 colore+zeta funziona.
+- v18: niente depth sui target più piccoli dello schermo (< 640x480), log
+  `[VGL] target ... drawn without depth`. Riattivabile per prove:
+  `[Display] vita_smallzeta=1` (RECOMP_VGL_SMALLZETA=1). Da capire in vitaGL
+  (sorgente: vdeps/vitaGL, framebuffers.c / gxm.c scene_reset) perché la zeta
+  piccola fallisce; poi ridare la depth a quei passaggi.

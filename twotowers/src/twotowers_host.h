@@ -374,6 +374,13 @@ static void twotowers_setup_paths_and_log(void)
         GetPrivateProfileStringA("Display", "vita_flip", "auto", v, sizeof(v), g_ini_path);
         if (v[0] == '0' || v[0] == '1') { v[1] = 0; _putenv_s("RECOMP_VGL_FLIP", v); }
     }
+    if (!getenv("RECOMP_VGL_SMALLZETA")) {
+        /* (PS Vita) depth buffers on render targets smaller than the screen:
+         * 0 (default) without, 1 with (they crashed vitaGL: nv2a_gl.inc) */
+        char v[16] = "";
+        GetPrivateProfileStringA("Display", "vita_smallzeta", "0", v, sizeof(v), g_ini_path);
+        if (v[0] == '1') _putenv_s("RECOMP_VGL_SMALLZETA", "1");
+    }
 #endif
 
     /* D3D waits on the NV2A vertical-blank interrupt; xboxrecomp only

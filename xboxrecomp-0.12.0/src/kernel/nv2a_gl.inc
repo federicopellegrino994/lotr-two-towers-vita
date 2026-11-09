@@ -1623,7 +1623,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v17) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v18) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -1951,6 +1951,23 @@ static int gpu_bind_targets(int need_depth)
     g_cur_rt->wr = ++g_wr_clock;
     gsurf_sync_from_mem(g_cur_rt);
     g_cur_ds = NULL;
+#if defined(__vita__)
+    /* (PS Vita) a depth buffer only on targets of the screen's size: on a
+     * smaller one (the title's 256x256 render-to-texture passes) vitaGL's
+     * scene for colour + depth renderbuffer did not begin (sceGxmBeginScene
+     * unchecked in its scene_reset) and the next clear crashed; the same
+     * target without depth works. Those passes draw without depth for now.
+     * RECOMP_VGL_SMALLZETA=1 ([Display] vita_smallzeta=1): depth on them too. */
+    if (need_depth && (g_cur_rt->w < 640 || g_cur_rt->h < 480)) {
+        static int allow = -1;
+        if (allow < 0) { const char *e = getenv("RECOMP_VGL_SMALLZETA"); allow = e && e[0] == '1'; }
+        if (!allow) {
+            static unsigned said;
+            if (said < 8) { said++; fprintf(stderr, "  [VGL] target %08X %ux%u: drawn without depth (smaller than the screen)\n", base, g_cur_rt->w, g_cur_rt->h); }
+            need_depth = 0;
+        }
+    }
+#endif
     if (need_depth) {
         uint32_t zb = s_zeta_offset ? dma_resolve(s_zeta_offset) : (base | 1u);
         g_cur_ds = gsurf_get(zb, g_cur_rt->w, g_cur_rt->h, 1);
