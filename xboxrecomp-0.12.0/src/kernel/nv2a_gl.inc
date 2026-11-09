@@ -684,10 +684,69 @@ static int gsurf_near(uint32_t off)
 
 /* Depth and stencil of a whole zeta texture to a value: as D3D's
  * ClearDepthStencilView -- no scissor, every bit written. */
+#if defined(__vita__)
+/* (PS Vita) depth cleared by drawing: a full-screen quad at the depth asked
+ * for, depth test ALWAYS, colour writes off (stencil: REPLACE). vitaGL's
+ * glClear left the depth so that the level's GEQUAL draws all failed (the
+ * v31 captures: with the depth test off, the world is there). */
+static GLuint g_zc_prog;
+static int g_zc_mode = -1;   /* 1 quad (default), 0 vitaGL's glClear: RECOMP_VGL_ZCLEAR */
+static void vgl_zclear_prog(void)
+{
+    static const char vs_src[] = "void main(float4 vin0, float4 out gl_Position : POSITION) { gl_Position = vin0; }\n";
+    static const char fs_src[] = "float4 main() : COLOR { return float4(0.0, 0.0, 0.0, 0.0); }\n";
+    GLuint vs, fs;
+    const char *a = vs_src, *b = fs_src;
+    if (g_zc_prog) return;
+    vs = glCreateShader(GL_VERTEX_SHADER); glShaderSource(vs, 1, &a, NULL); glCompileShader(vs);
+    fs = glCreateShader(GL_FRAGMENT_SHADER); glShaderSource(fs, 1, &b, NULL); glCompileShader(fs);
+    g_zc_prog = glCreateProgram();
+    glAttachShader(g_zc_prog, vs); glAttachShader(g_zc_prog, fs);
+    glLinkProgram(g_zc_prog);
+}
+static void vgl_zclear_quad(int which, float z, int stencil)
+{
+    static float q[6][4];
+    static const float xy[6][2] = { {-1, -1}, {1, -1}, {1, 1}, {-1, -1}, {1, 1}, {-1, 1} };
+    float zn = 2.0f * z - 1.0f;
+    int i;
+    if (zn > 0.999999f) zn = 0.999999f;
+    if (zn < -0.999999f) zn = -0.999999f;
+    for (i = 0; i < 6; i++) { q[i][0] = xy[i][0]; q[i][1] = xy[i][1]; q[i][2] = zn; q[i][3] = 1.0f; }
+    vgl_zclear_prog();
+    glDisable(GL_BLEND); glDisable(GL_CULL_FACE);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    if (which & 1) { glEnable(GL_DEPTH_TEST); glDepthFunc(GL_ALWAYS); glDepthMask(GL_TRUE); }
+    else { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); }
+    if (which & 2) {
+        glEnable(GL_STENCIL_TEST);
+        glStencilFuncSeparate(GL_FRONT_AND_BACK, GL_ALWAYS, stencil, 0xFF);
+        glStencilOpSeparate(GL_FRONT_AND_BACK, GL_REPLACE, GL_REPLACE, GL_REPLACE);
+        glStencilMask(0xFF);
+    } else glDisable(GL_STENCIL_TEST);
+    glUseProgram(g_zc_prog);
+    glBindVertexArray(g_vao_x);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    for (i = 0; i < 16; i++) {
+        if (!i) { glEnableVertexAttribArray(0); glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, q); }
+        else glDisableVertexAttribArray(i);
+    }
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+}
+#endif
 static void gpu_clear_ds(GLuint fbo, int which, float z, int stencil)
 {
 #if defined(__vita__)
     vgl_trf("gpu_clear_ds fbo %u which %d", fbo, which);
+    if (g_zc_mode < 0) { const char *e = getenv("RECOMP_VGL_ZCLEAR"); g_zc_mode = !(e && e[0] == '0'); }
+    if (g_zc_mode) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glDisable(GL_SCISSOR_TEST);
+        vgl_zclear_quad(which, z, stencil);
+        gpu_sh_reset();
+        return;
+    }
 #endif
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glDisable(GL_SCISSOR_TEST);
@@ -1638,7 +1697,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v31) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v32) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -2796,7 +2855,7 @@ static char *hwvp_translate_cg(HwVp *e)
 
     hwvp_cat(&p, &cap, &len,
         "uniform float4 vp;\n");
-    hwvp_cat(&p, &cap, &len, "uniform float4 c[%d];\n", s_hwvp_cg_n);
+    hwvp_cat(&p, &cap, &len, "uniform float4 c[%d]; // c_lo %d\n", s_hwvp_cg_n, s_hwvp_cg_lo);
     hwvp_cat(&p, &cap, &len, "float4 kc(float i) { return (i >= 0.0 && i < %d.0) ? c[(int)i] : float4(0.0, 0.0, 0.0, 1.0); }\n", s_hwvp_cg_n);
     hwvp_cat(&p, &cap, &len,
         "float4 f4(float x) { return float4(x, x, x, x); }\n"
@@ -3568,10 +3627,6 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
         g_sh.vao = 2;
         glBindBuffer(GL_ARRAY_BUFFER, 0);
     }
-    {
-        VProg *ve = vprog_get(prog, 1);
-        if (ve && (ve->c_lo != hv->c_lo || ve->c_n != hv->c_n)) { ve->c_lo = hv->c_lo; ve->c_n = hv->c_n; ve->known = 0; }
-    }
     gpu_set_blend(0);
     gpu_set_depth(g_cur_ds != NULL);
     if (g_cap_on && g_cap_mode == 3) { GLuint rp; hwvp_red_fs(); rp = gpu_pair(hv->vs, g_pb_fs); if (rp) prog = rp; }
@@ -3755,7 +3810,7 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 15; if (e && !atoi(e)) g_cap_wait = -3; }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 0; if (g_cap_wait <= 0) g_cap_wait = -3; }
         if (g_cap_wait > 0 && s_3d.fog_enable && s_3d.mode == 2) g_cap_wait = -(g_cap_wait + 10);   /* (armed: counts down at the presents) */
         if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
@@ -4136,6 +4191,9 @@ static void gpu_apply_settings(void)
     }
     rs = xbox_GfxGet(GFX_SCALE);
     rsf = xbox_GfxScaleF();
+#if defined(__vita__)
+    rs = 1; rsf = 1.0f;   /* (PS Vita: 1x only -- a larger scale remade every surface and crashed) */
+#endif
     asp = xbox_GfxAspect();
     if (asp < 1.34f) asp = 4.0f / 3.0f;
     {

@@ -214,6 +214,10 @@ static void vgl_blit(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLin
 
 #define VGL_IDS 8192
 static uint8_t g_vgl_vin_sh[VGL_IDS], g_vgl_vin_pr[VGL_IDS];
+/* (vertex programs: the rows of c[] a shader declares, from its source --
+ * "uniform float4 c[N]; // c_lo L" -- and so its programs': never more sent
+ * than declared, which overran vitaGL's copy of the array) */
+static uint16_t g_vgl_sh_clo[VGL_IDS], g_vgl_sh_cn[VGL_IDS], g_vgl_pr_clo[VGL_IDS], g_vgl_pr_cn[VGL_IDS];
 static GLuint vgl_create_shader(GLenum t)
 {
     return glCreateShader(t == GL_VERTEX_SHADER ? GL_CG_VERTEX_SHADER_EXT
@@ -234,7 +238,17 @@ static void vgl_shader_source(GLuint s, GLsizei n, const GLchar *const *src, con
     }
     b[at] = 0;
     L = (GLint)at;
-    if (s < VGL_IDS) g_vgl_vin_sh[s] = strstr(b, "float4 vin0") != NULL || strstr(b, "uniform float4 c[192]") != NULL;
+    if (s < VGL_IDS) {
+        const char *q = strstr(b, "uniform float4 c[");
+        g_vgl_vin_sh[s] = strstr(b, "float4 vin0") != NULL || q != NULL;
+        g_vgl_sh_clo[s] = 0; g_vgl_sh_cn[s] = 0;
+        if (q) {
+            int n = atoi(q + 17), lo = 0;
+            const char *l = strstr(q, "// c_lo ");
+            if (l) lo = atoi(l + 8);
+            if (n > 0 && n <= 192 && lo >= 0 && lo + n <= 192) { g_vgl_sh_clo[s] = (uint16_t)lo; g_vgl_sh_cn[s] = (uint16_t)n; }
+        }
+    }
     {
         const GLchar *one = b;
         glShaderSource(s, 1, &one, &L);
@@ -246,9 +260,11 @@ static void vgl_shader_source(GLuint s, GLsizei n, const GLchar *const *src, con
 static void vgl_attach(GLuint p, GLuint s)
 {
     if (p < VGL_IDS && s < VGL_IDS && g_vgl_vin_sh[s]) g_vgl_vin_pr[p] = 1;
+    if (p < VGL_IDS && s < VGL_IDS && g_vgl_sh_cn[s]) { g_vgl_pr_clo[p] = g_vgl_sh_clo[s]; g_vgl_pr_cn[p] = g_vgl_sh_cn[s]; }
     glAttachShader(p, s);
 }
 static void vprog_forget(GLuint p);
+static void vprog_linked(GLuint p);
 /* every program gets its attribute locations before linking */
 static void vgl_link(GLuint p)
 {
@@ -262,7 +278,8 @@ static void vgl_link(GLuint p)
         for (i = 0; i < 8; i++) glBindAttribLocation(p, (GLuint)i, nm[i]);
     glLinkProgram(p);
     if (p < VGL_IDS) g_vgl_vin_pr[p] = 0;   /* (ids come back after a delete) */
-    vprog_forget(p);   /* (and so does the uniform cache's entry: its locations are the old program's) */
+    vprog_forget(p);
+    vprog_linked(p);   /* (and so does the uniform cache's entry: its locations are the old program's) */
 }
 
 /* ---- uniform blocks as plain uniforms ---- */
@@ -340,6 +357,12 @@ static VProg *vprog_get(GLuint p, int make)
         }
     }
     return NULL;
+}
+static void vprog_linked(GLuint p)
+{
+    VProg *e = vprog_get(p, 1);
+    if (e && p < VGL_IDS) { e->c_lo = g_vgl_pr_clo[p]; e->c_n = g_vgl_pr_cn[p]; }
+    if (p < VGL_IDS) { g_vgl_pr_clo[p] = 0; g_vgl_pr_cn[p] = 0; }
 }
 static void vprog_forget(GLuint p)
 {

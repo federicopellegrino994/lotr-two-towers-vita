@@ -350,3 +350,15 @@ sulla CPU (gpu_transform_all), come previsto.
   1500 draw non ci stanno. Ora ogni programma dichiara solo le righe di c[]
   che legge (tutte solo con indirizzamento relativo) e il ring buffer è 4 MB
   (RECOMP_VGL_VTXRING_MB). DA PROVARE.
+- v29–v31: cattura di un frame del livello in .tga (RECOMP_VGL_CAPTURE=n,
+  ora spenta di default). Il bersaglio 640x480 resta nero dopo i draw del
+  mondo; con il test di profondità spento (cattura m1) il mondo c'è. La
+  causa è la profondità, non i vertex program (probabilmente anche la v20 non
+  mostrava il mondo). Crash nella cattura m3: si mandavano 192 righe a un
+  array c[] dichiarato più piccolo.
+- v32: la profondità si azzera disegnando un quadrato a tutto schermo alla
+  profondità chiesta (test ALWAYS, colore spento; stencil REPLACE) invece del
+  glClear di vitaGL (RECOMP_VGL_ZCLEAR=0 torna al glClear). Le righe di c[]
+  di un programma vengono dal sorgente dello shader ("// c_lo"), mai più di
+  quelle dichiarate. Risoluzione bloccata a 1x sulla Vita (cambiarla dal menu
+  crashava). DA PROVARE.
