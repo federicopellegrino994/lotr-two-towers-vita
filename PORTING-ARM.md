@@ -324,3 +324,15 @@ sulla CPU (gpu_transform_all), come previsto.
   target, trasformazione vertici, texture, draw call, resto, present e fuori
   dai batch; draw, vertici trasformati, upload di texture per frame.
   1 thread di aiuto per la trasformazione dei vertici (RECOMP_VTX_THREADS).
+  Risultato sulla console: ~1400 ms di rendering per frame, di cui la
+  trasformazione dei vertici sulla CPU (vertex program interpretati,
+  ~7.7 µs per vertice) è la parte più grande; il codice del gioco ~380 ms.
+- v21: vertex program sulla GPU. hwvp_translate_cg (nv2a_gl.inc) traduce
+  ogni vertex program Xbox in Cg come hwvp_translate fa in GLSL sul PC:
+  ingressi vin<i> (array client, location i: vgl_link li lega solo nei
+  programmi con un vertex program attaccato), le 192 costanti come uniform
+  array `c` (VB_VPC, VB_ROWS 192, caricato solo quando cambia). Se un
+  programma non compila si torna alla CPU e il sorgente del primo che fallisce
+  va in ux0:data/twotowers/hwvp_fail.txt. [VGLPERF] dice quanti draw passano
+  dalla GPU e quanti programmi sono compilati/falliti. RECOMP_HW_VP=0 o
+  l'overlay lo spengono. DA PROVARE SULLA CONSOLE.
