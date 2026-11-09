@@ -1146,6 +1146,7 @@ extern void xbox_UnpinServiceThread(void);
  * this does not return to the SDL path. */
 #include <vitaGL.h>
 #include <psp2/io/stat.h>
+#include <psp2/kernel/sysmem.h>
 
 static const char s_vgl_vs[] =
     "void main(float2 aPos, float2 aUv,\n"
@@ -1176,9 +1177,29 @@ static void vgl_start(void)
     vglSetShaderCachePath(dir);
     fprintf(stderr, "  [VGL] starting vitaGL (shader cache %s)\n", dir); fflush(stderr);
     /* vglInitExtended's result is GL_TRUE only when it had to lower the
-     * resolution asked for -- not a success flag (GL_FALSE: all as asked) */
-    if (vglInitExtended(0, 960, 544, 0x100000, SCE_GXM_MULTISAMPLE_NONE))
-        fprintf(stderr, "  [VGL] display resolution lowered by vitaGL\n");
+     * resolution asked for -- not a success flag (GL_FALSE: all as asked).
+     *
+     * Its RAM threshold is what vitaGL leaves of the free RAM; it takes the
+     * rest for its pool. With 1 MB left, a thread the title made later found
+     * no memory for its stack (the Vita commits a stack when the thread is
+     * made): Bink's two decoder threads were never created and closing the
+     * first film waited on them for ever. 32 MB is kept back
+     * (RECOMP_VGL_KEEP_MB). */
+    {
+        SceKernelFreeMemorySizeInfo mi;
+        const char *k = getenv("RECOMP_VGL_KEEP_MB");
+        int keep = k && atoi(k) > 0 ? atoi(k) : 32;
+        mi.size = sizeof mi;
+        if (sceKernelGetFreeMemorySize(&mi) >= 0)
+            fprintf(stderr, "  [VGL] free memory before vitaGL: RAM %d MB, CDRAM %d MB, phycont %d MB; %d MB of RAM kept back\n",
+                    mi.size_user >> 20, mi.size_cdram >> 20, mi.size_phycont >> 20, keep);
+        if (vglInitExtended(0, 960, 544, keep << 20, SCE_GXM_MULTISAMPLE_NONE))
+            fprintf(stderr, "  [VGL] display resolution lowered by vitaGL\n");
+        mi.size = sizeof mi;
+        if (sceKernelGetFreeMemorySize(&mi) >= 0)
+            fprintf(stderr, "  [VGL] free memory after vitaGL: RAM %d MB, CDRAM %d MB, phycont %d MB\n",
+                    mi.size_user >> 20, mi.size_cdram >> 20, mi.size_phycont >> 20);
+    }
     vglWaitVblankStart(GL_FALSE);
     InterlockedExchange(&s_vgl_up, 1);
 }

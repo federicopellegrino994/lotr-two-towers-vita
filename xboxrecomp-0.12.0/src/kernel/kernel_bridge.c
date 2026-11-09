@@ -642,6 +642,10 @@ static void bridge_PsCreateSystemThreadEx(void)
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top);
+                    if (!th)
+                        fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: the host thread for 0x%08X could "
+                                "NOT be made (error %lu): the title will wait on it\n",
+                                start_routine, (unsigned long)GetLastError());
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -7918,6 +7922,10 @@ static void bridge_PsCreateSystemThread(void)
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top);
+                    if (!th)
+                        fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: the host thread for 0x%08X could "
+                                "NOT be made (error %lu): the title will wait on it\n",
+                                start_routine, (unsigned long)GetLastError());
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }

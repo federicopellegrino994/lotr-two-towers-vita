@@ -304,3 +304,15 @@ sulla CPU (gpu_transform_all), come previsto.
   `[Display] vita_smallzeta=1` (RECOMP_VGL_SMALLZETA=1). Da capire in vitaGL
   (sorgente: vdeps/vitaGL, framebuffers.c / gxm.c scene_reset) perché la zeta
   piccola fallisce; poi ridare la depth a quei passaggi.
+- v18: si entra nel menu, New Game, difficoltà; al primo filmato (mont.bik)
+  blocco senza crash. Bink crea due thread decoder: CreateThread fallisce
+  (ResumeThread error 8, handle finto 0xBEEF0001), il filmato va a ~8 fps sul
+  solo thread principale e alla chiusura (Start) Bink aspetta per sempre i
+  due thread mai creati. Causa: vglInitExtended con ram_threshold 1 MB
+  lasciava al sistema 1 MB: niente memoria per gli stack dei thread creati
+  dopo (sulla Vita lo stack si impegna alla creazione).
+- v19: ram_threshold 32 MB (RECOMP_VGL_KEEP_MB); log della memoria libera
+  di sistema prima/dopo vitaGL e nel report periodico; un thread guest che
+  non si può creare ora lo dice nel log.
+  Da fare: Bink su ARM è lento (129 ms di codice del gioco per frame del
+  filmato): valutare un decoder nativo o saltare i filmati.

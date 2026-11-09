@@ -928,6 +928,13 @@ static void vgl_mem_report(const char *why)
 {
     int i, n = 0;
     for (i = 0; i < GTEX_MAX; i++) if (g_tex[i].tex) n++;
+    {
+        SceKernelFreeMemorySizeInfo mi;
+        mi.size = sizeof mi;
+        if (sceKernelGetFreeMemorySize(&mi) >= 0)
+            fprintf(stderr, "  [VGL] system free memory: RAM %d MB (thread stacks come from here), CDRAM %d MB\n",
+                    mi.size_user >> 20, mi.size_cdram >> 20);
+    }
     fprintf(stderr, "  [VGL] memory (%s): free VRAM %u MB, RAM %u MB, phycont %u MB; textures %d (%u MB), %u let go; deleted (after 3 frames) %u framebuffers %u textures %u renderbuffers\n", why,
             (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 20), (unsigned)(vglMemFree(VGL_MEM_RAM) >> 20),
             (unsigned)(vglMemFree(VGL_MEM_PHYCONT) >> 20), n, (unsigned)(g_vtex_bytes >> 20), g_vtex_evicted,
@@ -1623,7 +1630,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v18) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v19) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif

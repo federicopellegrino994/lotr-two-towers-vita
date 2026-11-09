@@ -30,6 +30,7 @@
  */
 #include <vitaGL.h>
 #include <psp2/gxm.h>
+#include <psp2/kernel/sysmem.h>
 
 #ifndef GL_DEPTH_CLAMP
 #define GL_DEPTH_CLAMP 0x864F
