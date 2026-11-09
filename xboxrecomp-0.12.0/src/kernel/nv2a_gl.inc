@@ -787,6 +787,9 @@ static GSurf *gsurf_get(uint32_t base, uint32_t w, uint32_t h, int depth)
     else { s = victim; gsurf_free(s); }
 
     tw = RSX_(w, w, h); th = RSY_(h, w, h);
+#if defined(__vita__)
+    vgl_make_room((uint64_t)tw * th * 4);   /* (render targets come before cached textures) */
+#endif
     s->tex = gpu_tex2d(tw, th, depth);
     if (!s->tex) { memset(s, 0, sizeof *s); return NULL; }
     if (depth) {
@@ -827,7 +830,14 @@ static GSurf *gsurf_get(uint32_t base, uint32_t w, uint32_t h, int depth)
 #endif
     s->base = base; s->w = w; s->h = h; s->is_depth = (uint32_t)depth; s->used = ++g_clock;
 #if defined(__vita__)
-    vgl_trf("surface %08X %ux%u (%ux%u) %s tex %u", base, w, h, s->pw, s->ph, depth ? "zeta" : "colour", s->tex);
+    {
+        static unsigned n;
+        if (n < 80 || n % 50 == 0) {
+            fprintf(stderr, "  [VGL] surface %08X %ux%u (%ux%u) %s\n", base, w, h, s->pw, s->ph, depth ? "zeta" : "colour");
+            vgl_mem_report("new surface");
+        }
+        n++;
+    }
 #endif
     s->pw = tw; s->ph = th;
     if (g_msaa > 1) gsurf_ms_make(s);
@@ -898,6 +908,62 @@ int xbox_FrameUsedTexture(uint32_t hash)
 }
 #define GTEX_MAX 512
 static GTex g_tex[GTEX_MAX];
+
+#if defined(__vita__)
+/* (PS Vita) vitaGL's memory: CDRAM (128 MB) and what the game's heap leaves
+ * of the RAM. Textures are decoded to 32-bit RGBA -- the title's compressed
+ * ones take 4 to 8 times their size -- and a level fills both: an allocation
+ * then fails and the next clear or draw on that target crashed in vitaGL
+ * (the uniform buffer of a scene that never began). The texture cache keeps
+ * to a budget (RECOMP_VGL_TEXMB, default 64 MB) and to a margin of free
+ * memory (RECOMP_VGL_FREEMB, default 12 MB), the least recently used
+ * textures going first (read again from guest memory when they come back). */
+static uint64_t g_vtex_bytes;
+static unsigned g_vtex_evicted;
+static uint32_t vgl_free_mb(void)
+{
+    return (uint32_t)((vglMemFree(VGL_MEM_VRAM) + vglMemFree(VGL_MEM_RAM) + vglMemFree(VGL_MEM_PHYCONT)) >> 20);
+}
+static void vgl_mem_report(const char *why)
+{
+    int i, n = 0;
+    for (i = 0; i < GTEX_MAX; i++) if (g_tex[i].tex) n++;
+    fprintf(stderr, "  [VGL] memory (%s): free VRAM %u MB, RAM %u MB, phycont %u MB; textures %d (%u MB), %u let go\n", why,
+            (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 20), (unsigned)(vglMemFree(VGL_MEM_RAM) >> 20),
+            (unsigned)(vglMemFree(VGL_MEM_PHYCONT) >> 20), n, (unsigned)(g_vtex_bytes >> 20), g_vtex_evicted);
+}
+static uint64_t gtex_bytes(const GTex *e)
+{
+    uint64_t b = (uint64_t)e->w * e->h * 4;
+    return e->levels > 1 ? b + b / 3 : b;
+}
+static void gtex_drop(GTex *e)
+{
+    if (e->tex) { glDeleteTextures(1, &e->tex); g_vtex_bytes -= gtex_bytes(e); g_vtex_evicted++; }
+    memset(e, 0, sizeof *e);
+}
+/* room for `need` bytes more: the oldest textures go (not `keep`) */
+static void gtex_make_room(uint64_t need, const GTex *keep)
+{
+    static uint64_t budget;
+    static uint32_t margin;
+    int guard = GTEX_MAX;
+    if (!budget) {
+        const char *e = getenv("RECOMP_VGL_TEXMB"), *f = getenv("RECOMP_VGL_FREEMB");
+        budget = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 64) << 20;
+        margin = f && atoi(f) > 0 ? (uint32_t)atoi(f) : 12;
+    }
+    while (guard-- > 0 && (g_vtex_bytes + need > budget || vgl_free_mb() < margin + (uint32_t)(need >> 20))) {
+        GTex *old = NULL;
+        int i;
+        for (i = 0; i < GTEX_MAX; i++)
+            if (g_tex[i].tex && &g_tex[i] != keep && (!old || g_tex[i].used < old->used)) old = &g_tex[i];
+        if (!old) break;
+        gtex_drop(old);
+    }
+}
+static void vgl_make_room(uint64_t need) { gtex_make_room(need, NULL); }
+#endif
 
 /* Ultra textures (nv2a_ultra.inc): the pack's pictures as BC7 (BPTC)
  * textures, all their levels -- where the driver has BPTC (GL 4.2, or
@@ -975,8 +1041,14 @@ static GLuint gtex_get(const Texture *t)
     if (!e) {
         int lv = 1;
         e = victim;
+#if defined(__vita__)
+        if (e->tex) { gtex_drop(e); g_vtex_evicted--; }   /* (a slot reused, not memory let go) */
+        else memset(e, 0, sizeof *e);
+        gtex_make_room((uint64_t)t->width * t->height * 4, NULL);
+#else
         if (e->tex) glDeleteTextures(1, &e->tex);
         memset(e, 0, sizeof *e);
+#endif
         gpu_filter_opts();
         /* A full mip chain the GPU builds from the top level (the title's
          * own mip levels are not decoded), for stages that filter with
@@ -995,6 +1067,9 @@ static GLuint gtex_get(const Texture *t)
                      GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
         e->levels = lv;
         e->off = t->offset; e->color = t->color; e->w = t->width; e->h = t->height; e->pitch = t->pitch;
+#if defined(__vita__)
+        g_vtex_bytes += gtex_bytes(e);
+#endif
         e->ver = ver - 1;
         g_sh.tex_ok = 0;
     }
@@ -1547,7 +1622,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v15) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v16) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3572,6 +3647,7 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         static unsigned shown;
         if (shown < 3 || (shown % 1800) == 0)
             fprintf(stderr, "  [VGL] frame %u presented (surface %ux%u)\n", shown, s->w, s->h);
+        if (shown % 300 == 0) vgl_mem_report("every 300 frames");
         shown++;
     }
 #else

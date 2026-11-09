@@ -268,3 +268,14 @@ sulla CPU (gpu_transform_all), come previsto.
   scrittura MEM8 a 0xFEC0010B(+canale) passa per XAC97_NORR (toglie RR);
   4 scritture. Da verificare: `[APU] started by the title`, apu periods > 0,
   file del disco aperti ([PATH] ... game_files) e il caricamento che finisce.
+- v15: DirectSound parte (`[APU] started by the title`, ~188 periods/s),
+  audio ok, si arriva al menu (~25 fps). Premendo Start: crash in vitaGL,
+  glClear -> vgl_fast_uniform_copy (nessuna scena GXM attiva: buffer degli
+  uniform nullo), dal clear differito della zeta in gpu_bind_targets.
+  Ipotesi: memoria di vitaGL esaurita al caricamento del livello (texture
+  decodificate in RGBA 32 bit, fino a 512 in cache).
+- v16: budget delle texture (RECOMP_VGL_TEXMB, 64 MB) e margine di memoria
+  libera (RECOMP_VGL_FREEMB, 12 MB): si liberano le meno usate di recente,
+  anche prima di creare una superficie. Log: `[VGL] surface ...` e
+  `[VGL] memory (...)` (VRAM/RAM/phycont liberi, texture, quante liberate),
+  ogni 300 frame.

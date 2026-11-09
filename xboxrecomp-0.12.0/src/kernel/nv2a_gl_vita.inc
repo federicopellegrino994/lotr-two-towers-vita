@@ -552,3 +552,6 @@ static void vgl_del_fbs(GLsizei n, const GLuint *f)
 #define vglSwapBuffers(x) (VGLT("vglSwapBuffers"), vglSwapBuffers(x))
 
 static void (*p_glMaxShaderCompilerThreadsKHR)(GLuint);   /* (desktop only: KHR_parallel_shader_compile) */
+/* (nv2a_gl.inc, after its texture cache) */
+static void vgl_mem_report(const char *why);
+static void vgl_make_room(uint64_t need);
