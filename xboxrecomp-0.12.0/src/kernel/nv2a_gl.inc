@@ -1638,7 +1638,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v30) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v31) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3409,6 +3409,16 @@ static void hwvp_dump(HwVp *hv, uint32_t nverts)
  * program -- how many pixels each covers ([HWVP] probe). */
 static GLuint g_pb_tex, g_pb_fbo, g_pb_fs;
 static int g_pb_n;
+static void hwvp_red_fs(void)
+{
+    static const char red_fs[] = "float4 main(float4 v_d0 : TEXCOORD4) : COLOR { return float4(1.0, 0.0, v_d0.x * 0.0, 1.0); }\n";
+    if (!g_pb_fs) {
+        const char *src = red_fs;
+        g_pb_fs = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(g_pb_fs, 1, &src, NULL);
+        glCompileShader(g_pb_fs);
+    }
+}
 static void hwvp_probe_count(const char *what, HwVp *hv)
 {
     const uint8_t *px;
@@ -3445,14 +3455,12 @@ static void hwvp_probe(HwVp *hv, GLuint game_prog, uint32_t nverts)
     GLuint pr;
     uint32_t k, i;
     float *ex;
+    (void)red_fs;
     if (!g_pb_tex) {
-        const char *src = red_fs;
         g_pb_tex = gpu_tex2d(64, 64, 0);
         g_pb_fbo = gpu_fbo(g_pb_tex, 0);
-        g_pb_fs = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(g_pb_fs, 1, &src, NULL);
-        glCompileShader(g_pb_fs);
     }
+    hwvp_red_fs();
     fprintf(stderr, "  [HWVP] probe %08X: %u instructions, %u vertices, %u indices, nin %u, fog %d, depth test %d func %u, vp %g %g %g %g, c[96] %g %g %g %g\n",
             hv->hash, hv->len, nverts, g_nidx, hv->nin, (int)s_3d.fog_enable, (int)s_3d.depth_test, (unsigned)s_3d.depth_func,
             g_vub[VB_VSC][0][0], g_vub[VB_VSC][0][1], g_vub[VB_VSC][0][2], g_vub[VB_VSC][0][3],
@@ -3566,9 +3574,13 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     }
     gpu_set_blend(0);
     gpu_set_depth(g_cur_ds != NULL);
+    if (g_cap_on && g_cap_mode == 3) { GLuint rp; hwvp_red_fs(); rp = gpu_pair(hv->vs, g_pb_fs); if (rp) prog = rp; }
     gpu_use(prog);
+    if (g_cap_on && g_cap_mode == 1) { glDisable(GL_DEPTH_TEST); g_sh.ds_ok = 0; }
+    if (g_cap_on && g_cap_mode == 2) { glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); g_sh.rs_ok = 0; g_sh.sc_ok = 0; }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
+    if (g_cap_on && g_cap_mode == 2) glEnable(GL_SCISSOR_TEST);
     if (!hv->dumped) hwvp_dump(hv, nverts);
     g_vp_hw++; g_cap_hw++;
     s_gpu.tris_drawn += g_nidx / 3;
@@ -3623,7 +3635,6 @@ static int g_null3_draw;   /* (RECOMP_GPU_NULL=3) */
  * target each time the game leaves it, then every surface at the present --
  * ux0:data/twotowers/cap/<n>_<what>_<base>_<w>x<h>.tga. It starts 15 frames
  * after the first draw with fog (RECOMP_VGL_CAPTURE=0 off, =n after n frames). */
-static int g_cap_wait = -2, g_cap_on, g_cap_n;
 static void cap_save(const GSurf *sf, const char *what)
 {
     char path[128];
@@ -3632,7 +3643,7 @@ static void cap_save(const GSurf *sf, const char *what)
     uint8_t hd[18];
     uint32_t i, n;
     uint8_t *row;
-    if (!sf || !sf->tex || g_cap_n >= 40) return;
+    if (!sf || !sf->tex || g_cap_n >= 80) return;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     gpu_sh_reset();
     glFinish();
@@ -3641,7 +3652,7 @@ static void cap_save(const GSurf *sf, const char *what)
     px = (const uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
     if (!px) return;
     if (g_cap_n == 0) sceIoMkdir("ux0:data/twotowers/cap", 0777);
-    snprintf(path, sizeof path, "ux0:data/twotowers/cap/%02d_%s_%08X_%ux%u%s.tga", g_cap_n++, what, sf->base, sf->pw, sf->ph,
+    snprintf(path, sizeof path, "ux0:data/twotowers/cap/%02d_m%d_%s_%08X_%ux%u%s.tga", g_cap_n++, g_cap_mode, what, sf->base, sf->pw, sf->ph,
              sf->is_depth ? "_zeta" : "");
     f = fopen(path, "wb");
     if (!f) return;
@@ -3746,7 +3757,7 @@ static void gpu_batch(void)
         int ok = gpu_bind_targets(need_depth);
         if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 15; if (e && !atoi(e)) g_cap_wait = -3; }
         if (g_cap_wait > 0 && s_3d.fog_enable && s_3d.mode == 2) g_cap_wait = -(g_cap_wait + 10);   /* (armed: counts down at the presents) */
-        if (g_cap_on && was && was != g_cur_rt) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
+        if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
         if (!ok) return;
     }
@@ -4276,9 +4287,10 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         int i;
         GSurf *pr = gsurf_find(base, 0);
         cap_save(pr, "present");
-        for (i = 0; i < GSURF_MAX; i++) if (g_surf[i].tex && &g_surf[i] != pr) cap_save(&g_surf[i], "atpresent");
+        if (!g_cap_mode)
+            for (i = 0; i < GSURF_MAX; i++) if (g_surf[i].tex && &g_surf[i] != pr && !g_surf[i].is_depth) cap_save(&g_surf[i], "atpresent");
         g_cap_on = 0;
-        g_cap_wait = -3;
+        if (g_cap_mode < 3) { g_cap_mode++; g_cap_wait = -(3 + 10); } else g_cap_wait = -3;
         gpu_sh_reset();
     }
     if (g_cap_wait < -10) { if (++g_cap_wait == -10) { g_cap_on = 1; g_cap_hw = g_cap_cpu = 0; fprintf(stderr, "  [CAP] capturing this frame\n"); } }

@@ -645,3 +645,4 @@ static void vgl_mem_report(const char *why);
 static void vgl_make_room(uint64_t need);
 static unsigned g_vp_draws, g_vp_verts, g_vp_up, g_vp_upkb, g_vp_hw;   /* ([VGLPERF] counters: nv2a_gl.inc) */
 static int g_cap_hw, g_cap_cpu;   /* (nv2a_gl.inc cap_save) */
+static int g_cap_wait = -2, g_cap_on, g_cap_n, g_cap_mode;   /* (mode: what the GPU draws leave out -- 0 nothing, 1 depth test, 2 culling and scissor, 3 their fragment program: red) */
