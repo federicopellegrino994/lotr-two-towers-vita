@@ -1638,7 +1638,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v28) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v29) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3570,7 +3570,7 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
     if (!hv->dumped) hwvp_dump(hv, nverts);
-    g_vp_hw++;
+    g_vp_hw++; g_cap_hw++;
     s_gpu.tris_drawn += g_nidx / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
     s_3d.verts += nverts;
@@ -3618,6 +3618,54 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
 }
 
 static int g_null3_draw;   /* (RECOMP_GPU_NULL=3) */
+#if defined(__vita__)
+/* (diagnostics) one frame of the level written out as pictures: a render
+ * target each time the game leaves it, then every surface at the present --
+ * ux0:data/twotowers/cap/<n>_<what>_<base>_<w>x<h>.tga. It starts 200 frames
+ * after the first draw with fog (RECOMP_VGL_CAPTURE=0 off, =n after n frames). */
+static int g_cap_wait = -2, g_cap_on, g_cap_n;
+static void cap_save(const GSurf *sf, const char *what)
+{
+    char path[128];
+    FILE *f;
+    const uint8_t *px;
+    uint8_t hd[18];
+    uint32_t i, n;
+    uint8_t *row;
+    if (!sf || !sf->tex || g_cap_n >= 40) return;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    gpu_sh_reset();
+    glFinish();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sf->tex);
+    px = (const uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+    if (!px) return;
+    if (g_cap_n == 0) sceIoMkdir("ux0:data/twotowers/cap", 0777);
+    snprintf(path, sizeof path, "ux0:data/twotowers/cap/%02d_%s_%08X_%ux%u%s.tga", g_cap_n++, what, sf->base, sf->pw, sf->ph,
+             sf->is_depth ? "_zeta" : "");
+    f = fopen(path, "wb");
+    if (!f) return;
+    memset(hd, 0, sizeof hd);
+    hd[2] = 2; hd[12] = sf->pw & 0xFF; hd[13] = sf->pw >> 8; hd[14] = sf->ph & 0xFF; hd[15] = sf->ph >> 8; hd[16] = 32; hd[17] = 8;
+    fwrite(hd, 1, 18, f);
+    n = sf->pw * sf->ph;
+    row = (uint8_t *)malloc(sf->pw * 4);
+    if (row) {
+        uint32_t y, x;
+        for (y = 0; y < sf->ph; y++) {
+            const uint8_t *src = px + (size_t)y * sf->pw * 4;
+            for (x = 0; x < sf->pw; x++) { row[4*x] = src[4*x+2]; row[4*x+1] = src[4*x+1]; row[4*x+2] = src[4*x]; row[4*x+3] = src[4*x+3]; }
+            fwrite(row, 1, sf->pw * 4, f);
+        }
+        free(row);
+    }
+    (void)i; (void)n;
+    fclose(f);
+    fprintf(stderr, "  [CAP] %s (gpu draws so far %d, cpu draws %d)\n", path, g_cap_hw, g_cap_cpu);
+    fflush(stderr);
+}
+#endif
+
 #if defined(__vita__)
 /* (PS Vita) where the render thread's time goes: [VGLPERF] every 120
  * presented frames (gpu_present) */
@@ -3694,7 +3742,11 @@ static void gpu_batch(void)
 #if defined(__vita__)
     {
         VP_T0(t);
+        GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 200; if (e && !atoi(e)) g_cap_wait = -3; }
+        if (g_cap_wait > 0 && s_3d.fog_enable && s_3d.mode == 2) g_cap_wait = -(g_cap_wait + 10);   /* (armed: counts down at the presents) */
+        if (g_cap_on && was && was != g_cur_rt) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
         if (!ok) return;
     }
@@ -3806,7 +3858,7 @@ cpu_verts_ready:
         prog = gpu_program_for(g_vs_main);
         gpu_use(prog);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-        { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
+        { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; g_cap_cpu++; }
         if (0)
 #endif
         {
@@ -4219,6 +4271,18 @@ static void gpu_present(uint32_t base, uint32_t pitch)
     vgl_trf("gpu_present %08X", base);
 #endif
     hud_frame_end();   /* this frame's HUD pieces, grouped (hud_wide_x) */
+#if defined(__vita__)
+    if (g_cap_on) {
+        int i;
+        GSurf *pr = gsurf_find(base, 0);
+        cap_save(pr, "present");
+        for (i = 0; i < GSURF_MAX; i++) if (g_surf[i].tex && &g_surf[i] != pr) cap_save(&g_surf[i], "atpresent");
+        g_cap_on = 0;
+        g_cap_wait = -3;
+        gpu_sh_reset();
+    }
+    if (g_cap_wait < -10) { if (++g_cap_wait == -10) { g_cap_on = 1; g_cap_hw = g_cap_cpu = 0; fprintf(stderr, "  [CAP] capturing this frame\n"); } }
+#endif
     GSurf *s = gsurf_find(base, 0);
     int wide;
     {   /* testing: RECOMP_GPU_NULL=2 -- nothing shown either (the game's own speed, unpaced by the window) */

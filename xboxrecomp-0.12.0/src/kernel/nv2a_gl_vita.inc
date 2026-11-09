@@ -644,3 +644,4 @@ static void (*p_glMaxShaderCompilerThreadsKHR)(GLuint);   /* (desktop only: KHR_
 static void vgl_mem_report(const char *why);
 static void vgl_make_room(uint64_t need);
 static unsigned g_vp_draws, g_vp_verts, g_vp_up, g_vp_upkb, g_vp_hw;   /* ([VGLPERF] counters: nv2a_gl.inc) */
+static int g_cap_hw, g_cap_cpu;   /* (nv2a_gl.inc cap_save) */
