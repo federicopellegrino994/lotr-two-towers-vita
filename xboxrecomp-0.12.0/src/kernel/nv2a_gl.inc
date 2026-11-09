@@ -928,9 +928,10 @@ static void vgl_mem_report(const char *why)
 {
     int i, n = 0;
     for (i = 0; i < GTEX_MAX; i++) if (g_tex[i].tex) n++;
-    fprintf(stderr, "  [VGL] memory (%s): free VRAM %u MB, RAM %u MB, phycont %u MB; textures %d (%u MB), %u let go\n", why,
+    fprintf(stderr, "  [VGL] memory (%s): free VRAM %u MB, RAM %u MB, phycont %u MB; textures %d (%u MB), %u let go; deleted (after 3 frames) %u framebuffers %u textures %u renderbuffers\n", why,
             (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 20), (unsigned)(vglMemFree(VGL_MEM_RAM) >> 20),
-            (unsigned)(vglMemFree(VGL_MEM_PHYCONT) >> 20), n, (unsigned)(g_vtex_bytes >> 20), g_vtex_evicted);
+            (unsigned)(vglMemFree(VGL_MEM_PHYCONT) >> 20), n, (unsigned)(g_vtex_bytes >> 20), g_vtex_evicted,
+            g_vdel_total[0], g_vdel_total[1], g_vdel_total[2]);
 }
 static uint64_t gtex_bytes(const GTex *e)
 {
@@ -1622,7 +1623,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v16) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v17) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3643,6 +3644,7 @@ static void gpu_present(uint32_t base, uint32_t pitch)
     }
     frame_limit();
     vglSwapBuffers(GL_FALSE);
+    vgl_frame_done();   /* (deletions three frames old: nv2a_gl_vita.inc) */
     {   /* (the first frames: say it works) */
         static unsigned shown;
         if (shown < 3 || (shown % 1800) == 0)

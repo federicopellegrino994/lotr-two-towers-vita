@@ -279,3 +279,17 @@ sulla CPU (gpu_transform_all), come previsto.
   anche prima di creare una superficie. Log: `[VGL] surface ...` e
   `[VGL] memory (...)` (VRAM/RAM/phycont liberi, texture, quante liberate),
   ogni 300 frame.
+- v16: memoria non è la causa (72 MB di VRAM liberi al crash). Crash
+  identico: in vitaGL scene_reset chiama sceGxmBeginScene senza controllarne
+  l'esito, poi glViewport -> update_scissor_test -> vgl_fast_uniform_copy su
+  un buffer di una scena mai iniziata. Avviene subito dopo la creazione di
+  un target 256x256 + zeta 256x256 (render-to-texture del livello).
+  Ipotesi: framebuffer cancellati (glDeleteFramebuffers distrugge subito il
+  render target GXM) mentre scene già accodate li usano ancora. Coerente con
+  v10 (crash dopo l'autotest che cancella il suo framebuffer) e v11 (stessa
+  build rallentata dalla traccia: nessun crash).
+- v17: cancellazioni differite (nv2a_gl_vita.inc, vgl_defer): framebuffer,
+  texture e renderbuffer cancellati 3 frame presentati dopo; coda piena ->
+  glFinish. Il report memoria conta le cancellazioni.
+  Se crasha ancora: provare zeta della stessa dimensione per tutti i target
+  o nessuna zeta sui target piccoli.

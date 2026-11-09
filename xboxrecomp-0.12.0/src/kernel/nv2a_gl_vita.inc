@@ -496,6 +496,51 @@ static const char *cg_dnorm(int m, const char *c, char *b, size_t n)
     return b;
 }
 
+/* Deletions wait for the GPU. vitaGL destroys a framebuffer's render target
+ * at once, and scenes still queued on the GPU may be using it: the next
+ * sceGxmBeginScene then failed (unchecked in vitaGL's scene_reset) and the
+ * first clear or draw after it crashed. Seen right after start-up (the
+ * self-test's framebuffer) and when the title made new targets -- timing
+ * dependent: the slow traced build never crashed. Framebuffers, textures and
+ * renderbuffers go into a queue and are deleted VGL_DEL_FRAMES presented
+ * frames later; a full queue waits for the GPU (glFinish) and empties. */
+#define VGL_DEL_FRAMES 3u
+#define VDEL_N 1024
+enum { VDEL_FBO, VDEL_TEX, VDEL_RB };
+static struct { GLuint name; uint8_t kind; uint32_t frame; } g_vdel[VDEL_N];
+static int g_vdel_n;
+static uint32_t g_vgl_frame;
+static unsigned g_vdel_total[3];   /* (framebuffers, textures, renderbuffers deleted: the memory report) */
+static void vdel_now(int i)
+{
+    GLuint n = g_vdel[i].name;
+    if (g_vdel[i].kind == VDEL_FBO) glDeleteFramebuffers(1, &n);
+    else if (g_vdel[i].kind == VDEL_TEX) glDeleteTextures(1, &n);
+    else glDeleteRenderbuffers(1, &n);
+}
+static void vgl_del_pending(int all)
+{
+    int i, j = 0;
+    for (i = 0; i < g_vdel_n; i++) {
+        if (all || g_vdel[i].frame + VGL_DEL_FRAMES <= g_vgl_frame) vdel_now(i);
+        else g_vdel[j++] = g_vdel[i];
+    }
+    g_vdel_n = j;
+}
+static void vgl_defer(int kind, GLuint name)
+{
+    if (!name) return;
+    if (g_vdel_n == VDEL_N) { glFinish(); vgl_del_pending(1); }
+    g_vdel[g_vdel_n].name = name; g_vdel[g_vdel_n].kind = (uint8_t)kind; g_vdel[g_vdel_n].frame = g_vgl_frame;
+    g_vdel_total[kind]++;
+    g_vdel_n++;
+}
+/* after each presented frame (gpu_present) */
+static void vgl_frame_done(void)
+{
+    g_vgl_frame++;
+    vgl_del_pending(0);
+}
 static void vgl_del_fbs(GLsizei n, const GLuint *f)
 {
     GLsizei i;
@@ -503,13 +548,25 @@ static void vgl_del_fbs(GLsizei n, const GLuint *f)
         vfb_forget(f[i]);
         if (g_vgl_dfb == f[i]) g_vgl_dfb = 0;
         if (g_vgl_rfb == f[i]) g_vgl_rfb = 0;
+        vgl_defer(VDEL_FBO, f[i]);
     }
-    glDeleteFramebuffers(n, f);
+}
+static void vgl_del_texs(GLsizei n, const GLuint *t)
+{
+    GLsizei i;
+    for (i = 0; i < n; i++) vgl_defer(VDEL_TEX, t[i]);
+}
+static void vgl_del_rbs(GLsizei n, const GLuint *r)
+{
+    GLsizei i;
+    for (i = 0; i < n; i++) vgl_defer(VDEL_RB, r[i]);
 }
 
 /* From here on nv2a_gl.inc's GL calls go through the above (and the trace). */
 #define glBindFramebuffer(t, f) (VGLT("glBindFramebuffer"), vgl_bind_fb(t, f))
 #define glDeleteFramebuffers(n, f) (VGLT("glDeleteFramebuffers"), vgl_del_fbs(n, f))
+#define glDeleteTextures(n, t) vgl_del_texs(n, t)
+#define glDeleteRenderbuffers(n, r) vgl_del_rbs(n, r)
 #define glScissor(x, y, w, h) vgl_scissor(x, y, w, h)
 #define glViewport(x, y, w, h) vgl_viewport(x, y, w, h)
 #define glBlitFramebuffer(a, b, c, d, e, f, g, h, m, fl) (VGLT("glBlitFramebuffer"), vgl_blit(a, b, c, d, e, f, g, h, m, fl))
