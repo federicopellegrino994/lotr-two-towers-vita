@@ -583,7 +583,7 @@ static void kb_txt_apply(int keys)   /* 0 the game's words, 1 the keys', 2 the c
     }
     if ((!s_kb_txt_n || ok < s_kb_txt_n) && keys && GetTickCount() - scanned > 1000u) {
         /* find them: the game's memory, for each one's words */
-        const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset();
+        const uint8_t *m = TT_GBIAS(0x80000000u);   /* (the window: see tt_guest.h) */
         uint32_t a;
         scanned = GetTickCount();
         s_kb_txt_n = 0;

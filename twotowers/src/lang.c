@@ -49,7 +49,8 @@
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 static char *dupstr(const char *t) { size_t n = strlen(t) + 1; char *d = (char *)malloc(n); if (d) memcpy(d, t, n); return d; }
-#define G16(a) (*(volatile uint16_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
+#include "tt_guest.h"   /* (guest addresses in either memory layout) */
+#define G16(a) (*(volatile uint16_t *)TT_GP(a))
 extern void tt_dbg(const char *fmt, ...);
 extern const char *(*xbox_path_redirect)(const char *xbox_path);
 

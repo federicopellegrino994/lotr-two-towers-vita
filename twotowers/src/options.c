@@ -22,9 +22,10 @@
 #include <math.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
-#define G8(a)  (*(volatile uint8_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define G16(a) (*(volatile uint16_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define G32(a) (*(volatile uint32_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
+#include "tt_guest.h"   /* (guest addresses in either memory layout) */
+#define G8(a)  (*(volatile uint8_t *)TT_GP(a))
+#define G16(a) (*(volatile uint16_t *)TT_GP(a))
+#define G32(a) (*(volatile uint32_t *)TT_GP(a))
 extern void tt_dbg(const char *fmt, ...);
 extern uint32_t tt_gcall(uint32_t va, uint32_t thisptr, int n, const uint32_t *args);
 extern uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);

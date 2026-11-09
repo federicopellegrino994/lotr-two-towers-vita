@@ -1541,7 +1541,7 @@ static int gpu_init(void)
 #if defined(__vita__)
     (void)maj; (void)mnr;
     vgl_tr_init();
-    vgl_trf("gpu_init (build v11, start-up trace): asking for vitaGL");
+    vgl_trf("gpu_init (build v12, start-up trace): asking for vitaGL");
     if (!xbox_VitaGLAcquire()) {
         fprintf(stderr, "  [VGL] vitaGL belongs to the picture thread: software renderer\n");
         return 0;

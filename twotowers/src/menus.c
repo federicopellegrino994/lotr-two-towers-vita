@@ -27,10 +27,11 @@
 #include <math.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
-#define G8(a)  (*(volatile uint8_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define G16(a) (*(volatile uint16_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define G32(a) (*(volatile uint32_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define GF(a)  (*(volatile float *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
+#include "tt_guest.h"   /* (guest addresses in either memory layout) */
+#define G8(a)  (*(volatile uint8_t *)TT_GP(a))
+#define G16(a) (*(volatile uint16_t *)TT_GP(a))
+#define G32(a) (*(volatile uint32_t *)TT_GP(a))
+#define GF(a)  (*(volatile float *)TT_GP(a))
 extern void tt_dbg(const char *fmt, ...);
 extern uint32_t tt_gcall(uint32_t va, uint32_t thisptr, int n, const uint32_t *args);
 
@@ -823,12 +824,12 @@ static int rmb_own(void)
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 static uint32_t bink_find(void)
 {
-    const uint8_t *m = (const uint8_t *)(uintptr_t)xbox_GetMemoryOffset();
+    const uint8_t *m = TT_GBIAS(0x10000u);
     uint32_t a;
     for (a = 0x10000u; a < 0x84000000u - 0x40u; a += 4) {   /* (found low: 0x011AECE0 for the logos) */
         const uint32_t *q;
         uint32_t w, h, fr, fn, rate, div;
-        if (a == 0x04000000u) a = 0x80010000u;
+        if (a == 0x04000000u) { a = 0x80010000u; m = TT_GBIAS(0x80000000u); }
         q = (const uint32_t *)(m + a);
         w = q[0];
         if (w < 320 || w > 1280) continue;
@@ -844,11 +845,11 @@ static uint32_t bink_find(void)
 }
 static void bink_dump(void)   /* testing: TT_FILMCLICK -- where 640, 480 and a frame count sit together */
 {
-    const uint8_t *m = (const uint8_t *)(uintptr_t)xbox_GetMemoryOffset();
+    const uint8_t *m = TT_GBIAS(0x10000u);
     uint32_t a; int n = 0;
     for (a = 0x10000u; a < 0x84000000u - 0x40u && n < 20; a += 4) {
         const uint32_t *q;
-        if (a == 0x04000000u) a = 0x80000000u;
+        if (a == 0x04000000u) { a = 0x80000000u; m = TT_GBIAS(0x80000000u); }
         q = (const uint32_t *)(m + a);
         if (q[0] == 640 && q[1] == 480 && q[2] >= 100 && q[2] < 20000) {
             tt_dbg("[BINK] %08X: %u %u %u %u %u %u %u %u %u %u\n", a, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9]);

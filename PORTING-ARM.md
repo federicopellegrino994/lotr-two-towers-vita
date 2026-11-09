@@ -217,3 +217,22 @@ sulla CPU (gpu_transform_all), come previsto.
 - Prossimi passi: provare il VPK; se il quadro è capovolto forzare vita_flip;
   poi profilare (s_3d batches, tempo per frame) e, se serve, vertex program
   su GPU in Cg (hwvp_translate) e meno upload.
+
+### Tappa 2, prove sulla console (9 novembre 2026)
+- v10: il renderer GPU parte (`surface test ... as OpenGL`: nessuna
+  compensazione), poi crash al primo frame. Dump troncato (.tmp).
+- v11: traccia d'avvio `[VGLT] <n> <riga di nv2a_gl.inc> <chiamata>`, scritta
+  subito sulla scheda per le prime 1500 chiamate (RECOMP_VGL_TRACE=n, 0 = off).
+  Mostrava superfici, zeta, clear e presentazione regolari; il crash era nel
+  gioco: `kb_txt_apply` (prompts_kb.inc, chiamato dall'overlay E3 HUD a ogni
+  frame presentato) scandiva 0x80010000..0x83FFFF00 con
+  `xbox_GetMemoryOffset() + a`, fuori da ogni blocco in modalità compatta.
+- v12: `twotowers/src/tt_guest.h` (TT_GP, TT_GBIAS su xbox_HostPtr); tutte le
+  macro G8/G16/G32/GF/A8/A32/TT_MEM32 dei file del gioco e le scansioni di
+  memoria (heroes.c, menus.c, prompts_kb.inc) ora traducono gli indirizzi
+  anche nella finestra 0x80000000. Sul desktop è la stessa somma di prima.
+- Leggere un dump: il testo del modulo cambia base a ogni avvio (MODULE_INFO,
+  segmento 1 di "twotowers_recomp": 0x81008000, 0x8101d000, ...); indirizzo
+  nell'ELF = indirizzo - (base - 0x81000000). Per ogni VPK c'è il suo ELF con
+  i simboli (twotowers_recomp-vNN.elf nella cartella). Un dump che finisce in
+  .tmp è stato copiato mentre la console lo scriveva: manca la memoria.

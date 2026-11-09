@@ -45,10 +45,11 @@ extern void *xbox_HostPtr(uint32_t va);
 extern void tt_dbg(const char *fmt, ...);
 extern uint32_t tt_gcall(uint32_t va, uint32_t thisptr, int n, const uint32_t *args);
 extern uint32_t tt_guest_esp(void);
-#define G8(a)  (*(volatile uint8_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define G16(a) (*(volatile uint16_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define G32(a) (*(volatile uint32_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define GF(a)  (*(volatile float *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
+#include "tt_guest.h"   /* (guest addresses in either memory layout) */
+#define G8(a)  (*(volatile uint8_t *)TT_GP(a))
+#define G16(a) (*(volatile uint16_t *)TT_GP(a))
+#define G32(a) (*(volatile uint32_t *)TT_GP(a))
+#define GF(a)  (*(volatile float *)TT_GP(a))
 
 static int log_on(void)
 {
@@ -3072,7 +3073,7 @@ static void hero_size_bind(uint32_t base,int g)
 {
     if(g!=s_size_guest||!s_size_plan.count||base<0x80000000u||s_size_len>0x84000000u-base)return;
     if(G32(base)!=9||G32(base+4)!=s_size_tab)return;
-    unsigned char *d=(unsigned char *)(xbox_GetMemoryOffset()+base);
+    unsigned char *d=TT_GP(base);
     if(!ts_apply(&s_size_plan,d,s_size_len,1.0f,1.0f)){
         tt_dbg("[SIZE] datos residentes distintos: desactivado sin escribir\n");return;
     }
@@ -4962,9 +4963,9 @@ static void name_find(void)
     s_nname = 0;
     /* after "Gimli": "Isildur" (the hero lists) or "Play as Isildur" (the
      * level map's line for Isildur's level) -- only the name is changed */
-    const volatile uint16_t *m = (const volatile uint16_t *)xbox_GetMemoryOffset();
+    const volatile uint16_t *m = (const volatile uint16_t *)TT_GBIAS(0x10000u);
     for (va = 0x10000u; va < 0x84000000u - 64 && s_nname < 8; va += 2) {
-        if (va == 0x03FF0000u) va = 0x80000000u;
+        if (va == 0x03FF0000u) { va = 0x80000000u; m = (const volatile uint16_t *)TT_GBIAS(0x80000000u); }
         if (m[va / 2] != 'G' || m[va / 2 + 1] != 'i' || !u16_is(va, "Gimli", 1)) continue;
         if (u16_is(va + 12, "Isildur", 1) || u16_is(va + 12, s_name_cur, 1)) s_name_at[s_nname++] = va + 12;
         else if (u16_is(va + 12, "Play as ", 0) && (u16_is(va + 28, "Isildur", 1) || u16_is(va + 28, s_name_cur, 1))) s_name_at[s_nname++] = va + 28;
@@ -5027,14 +5028,14 @@ static void upn_find(void)
                                   "Strength of Isildur", "Strength of Elendil", "Strength of the Argonath", "Wilderness Rage",
                                   "Master Swordsman", "Wrath of Numenor", "Sword Parry", "Bane of Saruman",
                                   "Fire with the A button" };   /* (the last: the first such in each copy only -- Aragorn's; Legolas's follows) */
-    const volatile uint16_t *m = (const volatile uint16_t *)xbox_GetMemoryOffset();
+    const volatile uint16_t *m = (const volatile uint16_t *)TT_GBIAS(0x10000u);
     uint32_t va;
     int i0;
     for (i0 = 0; i0 < UPN_MAX; i0++) { free(s_upn_orig[i0]); free(s_upn_now[i0]); s_upn_orig[i0] = s_upn_now[i0] = NULL; }
     s_upn_n = 0;
     for (va = 0x10000u; va < 0x84000000u - 64 && s_upn_n < UPN_MAX; va += 2) {
         uint32_t s0, e, k;
-        if (va == 0x03FF0000u) va = 0x80000000u;
+        if (va == 0x03FF0000u) { va = 0x80000000u; m = (const volatile uint16_t *)TT_GBIAS(0x80000000u); }
         if (m[va / 2] != 'T' || !u16_is(va, "Triple Strike", 1) || !u16_is(va + 28, "Double Hack", 1) || !u16_is(va + 52, "Dunedain Bow", 1)) continue;
         /* this copy's strings: back to 0x3000 bytes of descriptions, on to the set's end ("Nothing") */
         int fire_seen = 0;
@@ -5097,7 +5098,7 @@ static int hl_retain(void)
 }
 static void hl_find(void)
 {
-    const volatile uint16_t *m = (const volatile uint16_t *)xbox_GetMemoryOffset();
+    const volatile uint16_t *m = (const volatile uint16_t *)TT_GBIAS(0x10000u);
     uint32_t froms[HL_N], va;
     const uint16_t *fu[HL_N];
     int fn[HL_N], nf = 0, i, j;
@@ -5111,7 +5112,7 @@ static void hl_find(void)
     s_hla_scan = GetTickCount();
     for (va = 0x10002u; va < 0x84000000u - 600 && s_hla_n < UPN_MAX; va += 2) {
         uint16_t c;
-        if (va == 0x03FF0000u) va = 0x80000002u;
+        if (va == 0x03FF0000u) { va = 0x80000002u; m = (const volatile uint16_t *)TT_GBIAS(0x80000000u); }
         c = m[va / 2];
         if (c == 0 || m[va / 2 - 1] != 0) continue;
         for (j = 0; j < nf; j++)
@@ -7060,7 +7061,7 @@ void tt_framelog(void)
         if(enabled&&dir){
             float next=s_size_scale+(dir>0?0.25f:-0.25f);
             if(next<0.5f)next=0.5f;if(next>1.0f)next=1.0f;
-            unsigned char *d=(unsigned char *)(xbox_GetMemoryOffset()+s_size_base);
+            unsigned char *d=TT_GP(s_size_base);
             if(G32(s_size_base)==9 &&G32(s_size_base+4)==s_size_tab
                 &&ts_apply(&s_size_plan,d,s_size_len,s_size_scale,next)){
                 s_size_scale=next;tt_dbg("[SIZE] %s: %.0f%% (colision original)\n",s_skins[s_guest].name,100.0f*next);

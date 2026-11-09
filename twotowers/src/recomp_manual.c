@@ -24,7 +24,8 @@
 extern __thread uint32_t g_esp, g_ecx, g_esi, g_edi, g_ebx;
 static uint32_t g_ebx_dbg(void) { return g_ebx; }
 extern ptrdiff_t xbox_GetMemoryOffset(void);
-#define TT_MEM32(a) (*(volatile uint32_t *)((char *)xbox_GetMemoryOffset() + (uint32_t)(a)))
+#include "tt_guest.h"   /* (guest addresses in either memory layout) */
+#define TT_MEM32(a) (*(volatile uint32_t *)TT_GP(a))
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 

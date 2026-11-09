@@ -69,9 +69,10 @@ static int e3_id(int which)
 }
 #define GFX_E3HUD     e3_id(0)
 #define GFX_E3PICKUPS e3_id(1)
-#define G8(a)  (*(volatile uint8_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define G16(a) (*(volatile uint16_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define G32(a) (*(volatile uint32_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
+#include "tt_guest.h"   /* (guest addresses in either memory layout) */
+#define G8(a)  (*(volatile uint8_t *)TT_GP(a))
+#define G16(a) (*(volatile uint16_t *)TT_GP(a))
+#define G32(a) (*(volatile uint32_t *)TT_GP(a))
 
 #include "e3hud_layout.h"
 

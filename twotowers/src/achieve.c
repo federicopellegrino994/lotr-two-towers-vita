@@ -24,8 +24,9 @@ extern unsigned long GetTickCount(void);
 
 extern void tt_dbg(const char *fmt, ...);
 extern ptrdiff_t xbox_GetMemoryOffset(void);
-#define A8(a)  (*(volatile uint8_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
-#define A32(a) (*(volatile uint32_t *)(xbox_GetMemoryOffset() + (uint32_t)(a)))
+#include "tt_guest.h"   /* (guest addresses in either memory layout) */
+#define A8(a)  (*(volatile uint8_t *)TT_GP(a))
+#define A32(a) (*(volatile uint32_t *)TT_GP(a))
 
 typedef struct { const char *id, *name, *desc; } Ach;
 /* the levels, by the game's index (0x1BB2A4), the world file's code and their names */
