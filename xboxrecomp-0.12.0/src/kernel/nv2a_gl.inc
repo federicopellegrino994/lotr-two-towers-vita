@@ -1638,7 +1638,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v25) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v26) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3379,6 +3379,94 @@ static void hwvp_dump(HwVp *hv, uint32_t nverts)
     fprintf(stderr, "  [HWVP] program %08X written to %s\n", hv->hash, path);
 }
 #endif
+
+#if defined(__vita__)
+/* (diagnostics) the first world draws drawn again into a 64x64 texture,
+ * depth, blending and culling off: with a plain red fragment shader through
+ * glDrawElements and through glDrawArrays, then with the draw's own fragment
+ * program -- how many pixels each covers ([HWVP] probe). */
+static GLuint g_pb_tex, g_pb_fbo, g_pb_fs;
+static int g_pb_n;
+static void hwvp_probe_count(const char *what, HwVp *hv)
+{
+    const uint8_t *px;
+    int i, red = 0, other = 0;
+    unsigned sr = 0, sg = 0, sb = 0;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glFinish();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_pb_tex);
+    px = (const uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+    if (!px) return;
+    for (i = 0; i < 64 * 64; i++) {
+        const uint8_t *c = px + 4 * i;
+        if (c[0] == 0 && c[1] == 0xFF && c[2] == 0xFF) continue;   /* (cleared: cyan) */
+        if (c[0] > 0xF0 && c[1] < 0x10 && c[2] < 0x10) red++;
+        else { other++; sr += c[0]; sg += c[1]; sb += c[2]; }
+    }
+    fprintf(stderr, "  [HWVP] probe %08X %s: %d red, %d other pixels (mean %u %u %u) of 4096\n", hv->hash, what, red, other,
+            other ? sr / other : 0, other ? sg / other : 0, other ? sb / other : 0);
+}
+static void hwvp_probe_begin(void)
+{
+    glBindFramebuffer(GL_FRAMEBUFFER, g_pb_fbo);
+    glViewport(0, 0, 64, 64);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClearColor(0, 1, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+}
+static void hwvp_probe(HwVp *hv, GLuint game_prog, uint32_t nverts)
+{
+    static const char red_fs[] = "float4 main(float4 v_d0 : TEXCOORD4) : COLOR { return float4(1.0, 0.0, v_d0.x * 0.0, 1.0); }\n";
+    GLuint pr;
+    uint32_t k, i;
+    float *ex;
+    if (!g_pb_tex) {
+        const char *src = red_fs;
+        g_pb_tex = gpu_tex2d(64, 64, 0);
+        g_pb_fbo = gpu_fbo(g_pb_tex, 0);
+        g_pb_fs = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(g_pb_fs, 1, &src, NULL);
+        glCompileShader(g_pb_fs);
+    }
+    fprintf(stderr, "  [HWVP] probe %08X: %u vertices, %u indices, nin %u, depth test %d func %u, vp %g %g %g %g, c[96] %g %g %g %g\n",
+            hv->hash, nverts, g_nidx, hv->nin, (int)s_3d.depth_test, (unsigned)s_3d.depth_func,
+            g_vub[VB_VSC][0][0], g_vub[VB_VSC][0][1], g_vub[VB_VSC][0][2], g_vub[VB_VSC][0][3],
+            g_vub[VB_VPC][96][0], g_vub[VB_VPC][96][1], g_vub[VB_VPC][96][2], g_vub[VB_VPC][96][3]);
+    pr = gpu_pair(hv->vs, g_pb_fs);
+    if (!pr) { fprintf(stderr, "  [HWVP] probe: no program\n"); return; }
+    /* 1: as drawn, red */
+    hwvp_probe_begin();
+    glUseProgram(pr);
+    vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx);
+    hwvp_probe_count("elements, red", hv);
+    /* 2: the vertices in index order, glDrawArrays */
+    ex = (float *)malloc((size_t)g_nidx * 16 * hv->nin + 16);
+    if (ex && hv->nin) {
+        for (k = 0; k < g_nidx; k++) memcpy(ex + (size_t)k * 4 * hv->nin, g_xin + (size_t)g_idx[k] * 4 * hv->nin, 16 * hv->nin);
+        for (i = 0; i < hv->nin; i++) glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, (GLsizei)(16 * hv->nin), ex + 4 * i);
+        hwvp_probe_begin();
+        glUseProgram(pr);
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)g_nidx);
+        hwvp_probe_count("arrays, red", hv);
+        for (i = 0; i < hv->nin; i++) glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, (GLsizei)(16 * hv->nin), g_xin + 4 * i);
+    }
+    free(ex);
+    /* 3: with its own fragment program */
+    hwvp_probe_begin();
+    glUseProgram(game_prog);
+    vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx);
+    hwvp_probe_count("elements, its own fragment program", hv);
+    /* (the frame's own state again) */
+    gpu_sh_reset();
+    gpu_bind_targets(s_3d.depth_test || s_3d.stencil_test);
+    gpu_set_raster();
+    gpu_bind_stages();
+    fflush(stderr);
+}
+#endif
 #if defined(__vita__)
 /* (the [VGLPERF] timers: vgl_perf_frame) */
 #include <psp2/kernel/processmgr.h>
@@ -3429,6 +3517,14 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
         memcpy(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow);
         g_vpc_ok = 1;
         gpu_ub(UB_VPC, g_vpc_shadow, sizeof g_vpc_shadow);
+    }
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    if (g_pb_n < 8 && hv->len > 3 && g_cur_rt && g_cur_rt->w >= 640 && g_nidx >= 30) {
+        g_pb_n++;
+        hwvp_probe(hv, prog, nverts);
+        glBindVertexArray(g_vao_x);
+        g_sh.vao = 2;
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
     }
     gpu_set_blend(0);
     gpu_set_depth(g_cur_ds != NULL);
