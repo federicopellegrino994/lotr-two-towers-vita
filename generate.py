@@ -75,6 +75,9 @@ def main():
     run([py, os.path.join(GAME, "postproc_apu.py"), gen], quiet_filter=["rewritten"])
     run([py, os.path.join(GAME, "postproc_x87.py"), gen], quiet_filter=["x87"])
     run([py, os.path.join(GAME, "postproc_regs.py"), gen], quiet_filter=["registers"])
+    # (PS Vita) DirectSound's APU accesses with computed addresses: direct
+    # calls (no page-fault trap in the compact guest layout)
+    run([py, os.path.join(GAME, "postproc_apu_io.py"), gen], quiet_filter=["rewritten"])
     n = len([f for f in os.listdir(gen) if f.endswith(".c")])
     print("Done: %d source files in twotowers/src/recomp/gen. Now build with CMake (README.md)." % n)
 

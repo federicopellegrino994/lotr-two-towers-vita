@@ -243,3 +243,16 @@ sulla CPU (gpu_transform_all), come previsto.
 - v13: ricerca a pezzi (2 MB per chiamata sulla Vita, filtro sul primo
   carattere), traccia spenta di default (RECOMP_VGL_TRACE=n per riaccenderla).
   Riga di versione nel log: `[VGL] GPU renderer (v13) on ...`.
+- v13: caricamento a 60 fps, ma non finisce mai. Il gioco gira a vuoto
+  (migliaia di Sleep(0) dallo stesso punto, 0F8F3C <- 0E012B <- 1085E8) e
+  `apu 0 periods`: l'APU non parte. In modalità compatta i registri APU sono
+  memoria semplice; gli accessi a indirizzo costante passavano già per
+  xbox_apu_r32/w32 (postproc_apu.py), quelli calcolati di DirectSound
+  (this->device->regs + offset) no.
+- v14: `twotowers/postproc_apu_io.py` (lanciato da generate.py dopo
+  postproc_regs.py): nelle funzioni della sezione DSOUND
+  (0x128B60..0x134A34) ogni MEM32 a indirizzo calcolato, fuori dallo stack,
+  diventa xio_r32/xio_w32: indirizzi 0xFE800000..0xFE87FFFF all'APU, il resto
+  in memoria come prima (2684 accessi). Senza RECOMP_COMPACT_GUEST sono MEM32.
+  Da verificare: `apu N periods` > 0 (circa 187 al secondo) e il caricamento
+  che finisce.
