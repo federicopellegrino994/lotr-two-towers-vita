@@ -1638,7 +1638,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v24) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v25) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -1829,6 +1829,66 @@ static void vgl_surface_test(void)
 
 
 #if defined(__vita__)
+#include "nv2a_gl_vtest.inc"
+/* (diagnostics) a real translated program (269174D4, from a v23 dump) with
+ * its own constants and first vertex: red if the GPU computes the clip
+ * position the CPU path does, yellow if only w matches, blue if not */
+static void vgl_real_vp_test(GLuint f, GLuint t, GLuint fs)
+{
+    static float rows[192][4], v[6][16];
+    static const float q[6][2] = { {-1, -1}, {1, -1}, {1, 1}, {-1, -1}, {1, 1}, {-1, 1} };
+    float vpv[4] = { 0.003125f, 0.00416667f, 5.96047e-08f, 1.0f };
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER), p;
+    const char *src = s_t_real_vs;
+    const uint8_t *px;
+    GLint ok = 0;
+    int i, k;
+    memset(rows, 0, sizeof rows);
+    for (i = 0; i < (int)(sizeof s_t_real_c / sizeof s_t_real_c[0]); i++) memcpy(rows[s_t_real_c[i].i], s_t_real_c[i].v, 16);
+    for (i = 0; i < 6; i++) {
+        memcpy(v[i], s_t_real_in, 48);
+        v[i][12] = q[i][0]; v[i][13] = q[i][1]; v[i][14] = 0; v[i][15] = 1;
+    }
+    glShaderSource(vs, 1, &src, NULL);
+    glCompileShader(vs);
+    glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
+    if (!ok) { fprintf(stderr, "  [VGL] real program test: did not compile\n"); glDeleteShader(vs); return; }
+    p = glCreateProgram();
+    glAttachShader(p, vs); glAttachShader(p, fs);
+    glLinkProgram(p);
+    glBindFramebuffer(GL_FRAMEBUFFER, f);
+    glViewport(0, 0, 64, 64);
+    glClearColor(0, 1, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    gpu_ub(UB_VSC, vpv, 16);
+    gpu_ub(UB_VPC, rows, sizeof rows);
+    glUseProgram(p);
+    glBindVertexArray(g_vao_x);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    for (k = 0; k < 16; k++) {
+        if (k < 4) { glEnableVertexAttribArray(k); glVertexAttribPointer(k, 4, GL_FLOAT, GL_FALSE, sizeof v[0], &v[0][4 * k]); }
+        else glDisableVertexAttribArray(k);
+    }
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glFinish();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, t);
+    px = (const uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+    if (px) {
+        const uint8_t *c = px + (32 * 64 + 32) * 4;
+        fprintf(stderr, "  [VGL] real program test (269174D4): centre %02X %02X %02X %02X -> %s\n", c[0], c[1], c[2], c[3],
+                c[0] > 0x80 && c[1] < 0x80 && c[2] < 0x80 ? "RIGHT (red)" :
+                c[0] > 0x80 && c[1] > 0x80 && c[2] < 0x80 ? "only w right (yellow)" :
+                c[2] > 0x80 && c[0] < 0x80 ? "wrong (blue)" :
+                c[1] > 0x80 && c[0] < 0x80 ? "not drawn (green)" : !c[0] && !c[1] && !c[2] ? "zero (black)" : "other");
+    }
+    glUseProgram(0);
+    glDeleteProgram(p);
+    glDeleteShader(vs);
+    g_sh.prog = 0;
+}
+
 /* (diagnostics) how a vertex shader's uniform array reaches the GPU: small
  * programs that take a full-screen quad's colour from constants, drawn into a
  * 64x64 texture, the centre pixel read. Red = right. [VGL] uniform test */
@@ -1940,6 +2000,7 @@ static void vgl_uniform_test(void)
         glDeleteShader(vs);
         g_sh.prog = 0;
     }
+    vgl_real_vp_test(f, t, fs);
     glDeleteShader(fs);
     gpu_fbo_forget(t);
     glDeleteTextures(1, &t);

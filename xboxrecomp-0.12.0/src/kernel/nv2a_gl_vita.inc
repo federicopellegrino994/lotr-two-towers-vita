@@ -248,6 +248,7 @@ static void vgl_attach(GLuint p, GLuint s)
     if (p < VGL_IDS && s < VGL_IDS && g_vgl_vin_sh[s]) g_vgl_vin_pr[p] = 1;
     glAttachShader(p, s);
 }
+static void vprog_forget(GLuint p);
 /* every program gets its attribute locations before linking */
 static void vgl_link(GLuint p)
 {
@@ -261,6 +262,7 @@ static void vgl_link(GLuint p)
         for (i = 0; i < 8; i++) glBindAttribLocation(p, (GLuint)i, nm[i]);
     glLinkProgram(p);
     if (p < VGL_IDS) g_vgl_vin_pr[p] = 0;   /* (ids come back after a delete) */
+    vprog_forget(p);   /* (and so does the uniform cache's entry: its locations are the old program's) */
 }
 
 /* ---- uniform blocks as plain uniforms ---- */
@@ -337,6 +339,11 @@ static VProg *vprog_get(GLuint p, int make)
         }
     }
     return NULL;
+}
+static void vprog_forget(GLuint p)
+{
+    VProg *e = vprog_get(p, 0);
+    if (e) { e->known = 0; e->tri = 0; }
 }
 static void vprog_locs(VProg *e)
 {
