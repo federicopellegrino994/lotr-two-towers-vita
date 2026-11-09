@@ -1633,7 +1633,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v21) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v22) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -2373,6 +2373,10 @@ typedef struct {
     uint32_t nin;
     uint8_t  inreg[16];
     GLuint vs;
+#if defined(__vita__)
+    char *src;                        /* (the Cg, kept for hwvp_dump) */
+    int dumped;
+#endif
 } HwVp;
 
 #define HWVP_MAX 512
@@ -2720,6 +2724,7 @@ static HwVp *hwvp_lookup(void)
         else {
 #if defined(__vita__)
             if (s_hwvp_fail_keep && !s_hwvp_fail_src) s_hwvp_fail_src = strdup(src);
+            e->src = strdup(src);
 #endif
             e->vs = gpu_shader_start(GL_VERTEX_SHADER, src); free(src);
         }
@@ -3128,6 +3133,58 @@ static void gpu_use(GLuint prog)
 
 /* Draw the assembled batch with the program's GPU vertex shader; 0 when its
  * program is not linked yet (the caller draws it on the CPU path). */
+
+#if defined(__vita__)
+/* (diagnostics) the first draw of each vertex program written out: its Cg,
+ * the state, the inputs of the first vertices and what the CPU path makes of
+ * them, and the constants -- ux0:data/twotowers/hwvp/<hash>.txt */
+static void hwvp_dump(HwVp *hv, uint32_t nverts)
+{
+    static int n, made;
+    char path[96];
+    FILE *f;
+    uint32_t k, i;
+    const float *vp = g_vub[VB_VSC][0];
+    if (hv->dumped || n >= 64) return;
+    hv->dumped = 1; n++;
+    if (!made) { sceIoMkdir("ux0:data/twotowers/hwvp", 0777); made = 1; }
+    snprintf(path, sizeof path, "ux0:data/twotowers/hwvp/%08X.txt", hv->hash);
+    f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "program %08X: %u instructions, %u inputs:", hv->hash, hv->len, hv->nin);
+    for (i = 0; i < hv->nin; i++) fprintf(f, " v%u", hv->inreg[i]);
+    fprintf(f, "\nvp %g %g %g %g; depth test %d mask %d func %u; cull %d; target %ux%u, zeta %d; %u vertices %u indices; fog %d\n",
+            vp[0], vp[1], vp[2], vp[3], (int)s_3d.depth_test, (int)s_3d.depth_mask, (unsigned)s_3d.depth_func,
+            (int)s_3d.cull_enable, g_cur_rt ? g_cur_rt->w : 0, g_cur_rt ? g_cur_rt->h : 0, g_cur_ds != NULL,
+            nverts, g_nidx, (int)s_3d.fog_enable);
+    for (k = 0; k < nverts && k < 4; k++) {
+        SwVert v;
+        int ok;
+        fprintf(f, "vertex %u (index %u):\n", k, g_vidx[k]);
+        for (i = 0; i < hv->nin; i++) {
+            const float *x = g_xin + (size_t)k * 4 * hv->nin + 4 * i;
+            fprintf(f, "  in v%u = %.9g %.9g %.9g %.9g\n", hv->inreg[i], x[0], x[1], x[2], x[3]);
+        }
+        ok = sw3d_transform(g_vidx[k], &v);
+        fprintf(f, "  cpu: ok %d p %.9g %.9g %.9g %.9g; clip %.9g %.9g %.9g %.9g\n", ok, v.p[0], v.p[1], v.p[2], v.p[3],
+                v.p[0] * vp[0] - v.p[3], (v.p[1] * vp[1] - v.p[3]) * vp[3], 2.0f * v.p[2] * vp[2] - v.p[3], v.p[3]);
+        fprintf(f, "  cpu: d0 %.4g %.4g %.4g %.4g fog %.6g t0 %.6g %.6g %.6g %.6g\n", v.a[SA_D0], v.a[SA_D0 + 1], v.a[SA_D0 + 2],
+                v.a[SA_D0 + 3], v.a[SA_FOG], v.a[SA_T0], v.a[SA_T0 + 1], v.a[SA_T0 + 2], v.a[SA_T0 + 3]);
+    }
+    fprintf(f, "constants (non-zero):\n");
+    for (i = 0; i < VP_CONSTS; i++) {
+        const float *c = s_3d.c[i];
+        if (c[0] || c[1] || c[2] || c[3]) fprintf(f, "  c[%u] = %.9g %.9g %.9g %.9g\n", i, c[0], c[1], c[2], c[3]);
+    }
+    fprintf(f, "uniform c[] as uploaded (rows 0, 58, 59): %g %g %g %g | %g %g %g %g | %g %g %g %g\n",
+            g_vub[VB_VPC][0][0], g_vub[VB_VPC][0][1], g_vub[VB_VPC][0][2], g_vub[VB_VPC][0][3],
+            g_vub[VB_VPC][58][0], g_vub[VB_VPC][58][1], g_vub[VB_VPC][58][2], g_vub[VB_VPC][58][3],
+            g_vub[VB_VPC][59][0], g_vub[VB_VPC][59][1], g_vub[VB_VPC][59][2], g_vub[VB_VPC][59][3]);
+    fprintf(f, "Cg:\n%s\n", hv->src ? hv->src : "(none)");
+    fclose(f);
+    fprintf(stderr, "  [HWVP] program %08X written to %s\n", hv->hash, path);
+}
+#endif
 #if defined(__vita__)
 /* (the [VGLPERF] timers: vgl_perf_frame) */
 #include <psp2/kernel/processmgr.h>
@@ -3184,6 +3241,7 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     gpu_use(prog);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
+    if (!hv->dumped) hwvp_dump(hv, nverts);
     g_vp_hw++;
     s_gpu.tris_drawn += g_nidx / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
