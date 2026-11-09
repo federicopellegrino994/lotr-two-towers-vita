@@ -1697,7 +1697,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v32) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v33) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3602,6 +3602,14 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
         }
         VP_ADD(VP_XFORM, t);
     }
+    if (g_cap_on && g_cap_mode == 3 && g_cur_ds && s_3d.depth_test) {
+        /* (capture m3) the depth cleared to 0 again just before the draw, in its own scene */
+        vgl_zclear_quad(1, 0.0f, 0);
+        gpu_sh_reset();
+        gpu_bind_targets(1);
+        gpu_set_raster();
+        gpu_bind_stages();
+    }
     glBindVertexArray(g_vao_x);
     g_sh.vao = 2;
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -3629,13 +3637,11 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     }
     gpu_set_blend(0);
     gpu_set_depth(g_cur_ds != NULL);
-    if (g_cap_on && g_cap_mode == 3) { GLuint rp; hwvp_red_fs(); rp = gpu_pair(hv->vs, g_pb_fs); if (rp) prog = rp; }
     gpu_use(prog);
-    if (g_cap_on && g_cap_mode == 1) { glDisable(GL_DEPTH_TEST); g_sh.ds_ok = 0; }
-    if (g_cap_on && g_cap_mode == 2) { glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); g_sh.rs_ok = 0; g_sh.sc_ok = 0; }
+    if (g_cap_on && g_cap_mode == 1 && s_3d.depth_test) { glDepthFunc(GL_ALWAYS); g_sh.ds_ok = 0; }
+    if (g_cap_on && g_cap_mode == 2 && s_3d.depth_test) { glDepthFunc(GL_LEQUAL); g_sh.ds_ok = 0; }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
-    if (g_cap_on && g_cap_mode == 2) glEnable(GL_SCISSOR_TEST);
     if (!hv->dumped) hwvp_dump(hv, nverts);
     g_vp_hw++; g_cap_hw++;
     s_gpu.tris_drawn += g_nidx / 3;
@@ -3810,7 +3816,7 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 0; if (g_cap_wait <= 0) g_cap_wait = -3; }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 15; if (g_cap_wait <= 0) g_cap_wait = -3; }
         if (g_cap_wait > 0 && s_3d.fog_enable && s_3d.mode == 2) g_cap_wait = -(g_cap_wait + 10);   /* (armed: counts down at the presents) */
         if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
