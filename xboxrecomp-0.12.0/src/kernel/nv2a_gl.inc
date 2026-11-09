@@ -1086,6 +1086,9 @@ static GLuint gtex_get(const Texture *t)
         glBindTexture(GL_TEXTURE_2D, e->tex);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+#if defined(__vita__)
+        g_vp_up++; g_vp_upkb += (t->width * t->height * 4) >> 10;
+#endif
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)t->width, (GLsizei)t->height, GL_BGRA,
                         GL_UNSIGNED_INT_8_8_8_8_REV, argb);
         if (e->levels > 1) glGenerateMipmap(GL_TEXTURE_2D);
@@ -1630,7 +1633,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v19) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v20) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -2287,6 +2290,9 @@ static void gpu_vx_init(void)
         for (i = 1; i < (int)(8 * sizeof(DWORD_PTR)); i++) if (pm & ((DWORD_PTR)1 << i)) cpus++;
     g_vx_n = cpus > 4 ? 4 : cpus;
     if (cpus >= 2 && g_vx_n > cpus - 1) g_vx_n = cpus - 1;
+#if defined(__vita__)
+    g_vx_n = 1;   /* (three cores for a title: the game's thread, this one, a helper) */
+#endif
     if (e) { g_vx_n = atoi(e); if (g_vx_n < 0) g_vx_n = 0; if (g_vx_n > VX_MAX) g_vx_n = VX_MAX; }
     for (i = 0; i < g_vx_n; i++) {
         HANDLE h;
@@ -3027,7 +3033,49 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
 }
 
 static int g_null3_draw;   /* (RECOMP_GPU_NULL=3) */
+#if defined(__vita__)
+/* (PS Vita) where the render thread's time goes: [VGLPERF] every 120
+ * presented frames (gpu_present) */
+#include <psp2/kernel/processmgr.h>
+enum { VP_BATCH, VP_TARGETS, VP_XFORM, VP_STAGES, VP_DRAW, VP_PRESENT, VP_N };
+static uint64_t g_vp_us[VP_N];
+#define VP_T0(v) SceUInt64 v = sceKernelGetProcessTimeWide()
+#define VP_ADD(k, v) (g_vp_us[k] += sceKernelGetProcessTimeWide() - (v))
+static void vgl_perf_frame(void)
+{
+    static unsigned n;
+    static SceUInt64 t0;
+    SceUInt64 now = sceKernelGetProcessTimeWide();
+    if (!t0) t0 = now;
+    if (++n < 120) return;
+    {
+        double f = (double)n, ms = (double)(now - t0) / 1000.0 / f;
+        uint64_t in = g_vp_us[VP_TARGETS] + g_vp_us[VP_XFORM] + g_vp_us[VP_STAGES] + g_vp_us[VP_DRAW];
+        fprintf(stderr, "  [VGLPERF] per frame (%u frames): %.1f ms in all; batches %.1f ms = targets %.1f, vertex transform %.1f, "
+                "textures %.1f, draw calls %.1f, rest %.1f; present %.1f; outside batches %.1f\n", n, ms,
+                g_vp_us[VP_BATCH] / 1000.0 / f, g_vp_us[VP_TARGETS] / 1000.0 / f, g_vp_us[VP_XFORM] / 1000.0 / f,
+                g_vp_us[VP_STAGES] / 1000.0 / f, g_vp_us[VP_DRAW] / 1000.0 / f,
+                (double)(g_vp_us[VP_BATCH] - (in < g_vp_us[VP_BATCH] ? in : g_vp_us[VP_BATCH])) / 1000.0 / f,
+                g_vp_us[VP_PRESENT] / 1000.0 / f,
+                ms - (g_vp_us[VP_BATCH] + g_vp_us[VP_PRESENT]) / 1000.0 / f);
+        fprintf(stderr, "  [VGLPERF] per frame: %.0f draws, %.0f vertices transformed, %.1f texture uploads (%.0f KB)\n",
+                g_vp_draws / f, g_vp_verts / f, g_vp_up / f, g_vp_upkb / f);
+    }
+    memset(g_vp_us, 0, sizeof g_vp_us);
+    g_vp_draws = g_vp_verts = g_vp_up = g_vp_upkb = 0;
+    n = 0; t0 = now;
+}
+static void gpu_batch_impl(void);
 static void gpu_batch(void)
+{
+    VP_T0(t);
+    gpu_batch_impl();
+    VP_ADD(VP_BATCH, t);
+}
+static void gpu_batch_impl(void)
+#else
+static void gpu_batch(void)
+#endif
 {
 #if defined(__vita__)
     vgl_trf("gpu_batch mode %u", (unsigned)s_3d.mode);
@@ -3062,7 +3110,16 @@ static void gpu_batch(void)
         nb++;
     }
 #endif
+#if defined(__vita__)
+    {
+        VP_T0(t);
+        int ok = gpu_bind_targets(need_depth);
+        VP_ADD(VP_TARGETS, t);
+        if (!ok) return;
+    }
+#else
     if (!gpu_bind_targets(need_depth)) return;
+#endif
     if (!gpu_set_raster()) return;
     g_gen++; if (!g_gen) g_gen = 1;
     g_nidx = 0;
@@ -3105,7 +3162,11 @@ static void gpu_batch(void)
              * nv2a_d3d11.inc) */
             uint32_t k; float mnx = 1e9f, mxx = -1e9f, mny = 1e9f, mxy = -1e9f, kk = g_aspect / (4.0f / 3.0f);
             int samples_frame = 0, st;
+#if defined(__vita__)
+            { VP_T0(t); gpu_transform_all(nverts); VP_ADD(VP_XFORM, t); g_vp_verts += nverts; }
+#else
             gpu_transform_all(nverts);
+#endif
             gpu_drop_bad_tris(nverts);
             if (!g_nidx) return;
             for (k = 0; k < nverts; k++) if (g_vok[k]) {
@@ -3138,7 +3199,11 @@ static void gpu_batch(void)
         }
         if (s_3d.mode == 2) g_hwvp_stat_cpu++;
     }
+#if defined(__vita__)
+    { VP_T0(t); gpu_transform_all(nverts); VP_ADD(VP_XFORM, t); g_vp_verts += nverts; }
+#else
     gpu_transform_all(nverts);
+#endif
     gpu_drop_bad_tris(nverts);
     if (!g_nidx) return;
 cpu_verts_ready:
@@ -3147,7 +3212,7 @@ cpu_verts_ready:
 #if defined(__vita__)
         /* vitaGL copies client arrays at the draw */
         (void)vb_at; (void)ib_at;
-        gpu_bind_stages();
+        { VP_T0(t); gpu_bind_stages(); VP_ADD(VP_STAGES, t); }
         gpu_set_blend(0);
         gpu_set_depth(g_cur_ds != NULL);
         glBindVertexArray(g_vao);
@@ -3160,7 +3225,7 @@ cpu_verts_ready:
         prog = gpu_program_for(g_vs_main);
         gpu_use(prog);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-        vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx);
+        { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
         if (0)
 #endif
         {
@@ -3555,7 +3620,19 @@ static void gpu_dump_window(const char *nm)
 }
 
 /* The flip: the finished surface onto the window. */
+#if defined(__vita__)
+static void gpu_present_impl(uint32_t base, uint32_t pitch);
 static void gpu_present(uint32_t base, uint32_t pitch)
+{
+    VP_T0(t);
+    gpu_present_impl(base, pitch);
+    VP_ADD(VP_PRESENT, t);
+    vgl_perf_frame();
+}
+static void gpu_present_impl(uint32_t base, uint32_t pitch)
+#else
+static void gpu_present(uint32_t base, uint32_t pitch)
+#endif
 {
 #if defined(__vita__)
     vgl_trf("gpu_present %08X", base);

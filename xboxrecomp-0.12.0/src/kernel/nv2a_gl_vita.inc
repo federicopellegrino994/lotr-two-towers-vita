@@ -613,3 +613,4 @@ static void (*p_glMaxShaderCompilerThreadsKHR)(GLuint);   /* (desktop only: KHR_
 /* (nv2a_gl.inc, after its texture cache) */
 static void vgl_mem_report(const char *why);
 static void vgl_make_room(uint64_t need);
+static unsigned g_vp_draws, g_vp_verts, g_vp_up, g_vp_upkb;   /* ([VGLPERF] counters: nv2a_gl.inc) */

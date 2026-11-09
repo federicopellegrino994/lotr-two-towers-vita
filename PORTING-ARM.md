@@ -316,3 +316,11 @@ sulla CPU (gpu_transform_all), come previsto.
   non si può creare ora lo dice nel log.
   Da fare: Bink su ARM è lento (129 ms di codice del gioco per frame del
   filmato): valutare un decoder nativo o saltare i filmati.
+- v19: filmato lento (Bink in x86 ricompilato), saltato con Start; il primo
+  livello parte con l'audio. Ma ~2 s per frame: 1650 draw per frame, il
+  thread di rendering ~2000 ms, il codice del gioco 372 ms (da solo < 3 fps:
+  il limite della CPU con il codice ricompilato, vedi "Prestazioni CPU").
+- v20: [VGLPERF] ogni 120 frame: tempo del thread di rendering diviso in
+  target, trasformazione vertici, texture, draw call, resto, present e fuori
+  dai batch; draw, vertici trasformati, upload di texture per frame.
+  1 thread di aiuto per la trasformazione dei vertici (RECOMP_VTX_THREADS).
