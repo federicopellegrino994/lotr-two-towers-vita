@@ -99,6 +99,37 @@ extern void xbox_VitaGLRelease(void);
 
 static int g_vgl_flip;                 /* see the top of this file */
 
+/* Start-up trace: the first GL calls after the renderer starts, each written
+ * to the log at once (the log is otherwise flushed twice a second, and a
+ * crash loses the last half second). [VGLT] <line in nv2a_gl.inc> <call>.
+ * RECOMP_VGL_TRACE=<n> calls (default 1500; 0 = off). */
+#include <stdarg.h>
+static int g_vgl_tr = -1;
+static unsigned g_vgl_tr_n;
+static void vgl_tr_init(void)
+{
+    const char *e = getenv("RECOMP_VGL_TRACE");
+    g_vgl_tr = e && *e ? atoi(e) : 1500;
+}
+static void vgl_tr(const char *fn, int line)
+{
+    if (g_vgl_tr <= 0) return;
+    g_vgl_tr--;
+    fprintf(stderr, "  [VGLT] %u %d %s\n", g_vgl_tr_n++, line, fn);
+    fflush(stderr);
+    if (!g_vgl_tr) { fprintf(stderr, "  [VGLT] trace over\n"); fflush(stderr); }
+}
+static void vgl_trf(const char *fmt, ...)
+{
+    va_list ap;
+    if (g_vgl_tr <= 0) return;
+    fprintf(stderr, "  [VGLT] %u ", g_vgl_tr_n++);
+    va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+#define VGLT(fn) vgl_tr(fn, __LINE__)
+
 /* ---- framebuffer objects: what is bound, and how tall ---- */
 
 #define VFB_N 256
@@ -333,6 +364,7 @@ static void vgl_draw_arrays(GLenum m, GLint f, GLsizei c)
 }
 static void vgl_draw_elements(GLenum m, GLsizei c, GLenum t, const void *idx)
 {
+    vgl_trf("glDrawElements %d indices", (int)c);
     vgl_ub_flush();
     glDrawElements(m, c, t, idx);
 }
@@ -475,21 +507,48 @@ static void vgl_del_fbs(GLsizei n, const GLuint *f)
     glDeleteFramebuffers(n, f);
 }
 
-/* From here on nv2a_gl.inc's GL calls go through the above. */
-#define glBindFramebuffer(t, f) vgl_bind_fb(t, f)
-#define glDeleteFramebuffers(n, f) vgl_del_fbs(n, f)
+/* From here on nv2a_gl.inc's GL calls go through the above (and the trace). */
+#define glBindFramebuffer(t, f) (VGLT("glBindFramebuffer"), vgl_bind_fb(t, f))
+#define glDeleteFramebuffers(n, f) (VGLT("glDeleteFramebuffers"), vgl_del_fbs(n, f))
 #define glScissor(x, y, w, h) vgl_scissor(x, y, w, h)
 #define glViewport(x, y, w, h) vgl_viewport(x, y, w, h)
-#define glBlitFramebuffer(a, b, c, d, e, f, g, h, m, fl) vgl_blit(a, b, c, d, e, f, g, h, m, fl)
-#define glCreateShader(t) vgl_create_shader(t)
+#define glBlitFramebuffer(a, b, c, d, e, f, g, h, m, fl) (VGLT("glBlitFramebuffer"), vgl_blit(a, b, c, d, e, f, g, h, m, fl))
+#define glCreateShader(t) (VGLT("glCreateShader"), vgl_create_shader(t))
 #define glShaderSource(s, n, src, len) vgl_shader_source(s, n, src, len)
-#define glLinkProgram(p) vgl_link(p)
-#define glUseProgram(p) vgl_use(p)
-#define glDrawArrays(m, f, c) vgl_draw_arrays(m, f, c)
+#define glCompileShader(s) (VGLT("glCompileShader"), glCompileShader(s))
+#define glLinkProgram(p) (VGLT("glLinkProgram"), vgl_link(p))
+#define glUseProgram(p) (VGLT("glUseProgram"), vgl_use(p))
+#define glDrawArrays(m, f, c) (VGLT("glDrawArrays"), vgl_draw_arrays(m, f, c))
 #define glUniform1f(l, v) vgl_uniform1f(l, v)
-#define glBlendFuncSeparate(a, b, c, d) vgl_blend_func(a, b, c, d)
+#define glBlendFuncSeparate(a, b, c, d) (VGLT("glBlendFuncSeparate"), vgl_blend_func(a, b, c, d))
 #define glBlendColor(r, g, b, a) ((void)0)
 #define glDrawBuffer(b) ((void)0)
 #define glRenderbufferStorageMultisample(t, n, f, w, h) ((void)0)
 #define glUniformBlockBinding(p, i, b) ((void)0)
+#define VGLT_WRAP(fn) (VGLT(#fn), fn)
+#define glClear(m) (VGLT("glClear"), glClear(m))
+#define glStencilMask(m) (VGLT("glStencilMask"), glStencilMask(m))
+#define glStencilFuncSeparate(a, b, c, d) (VGLT("glStencilFuncSeparate"), glStencilFuncSeparate(a, b, c, d))
+#define glStencilOpSeparate(a, b, c, d) (VGLT("glStencilOpSeparate"), glStencilOpSeparate(a, b, c, d))
+#define glDepthMask(m) (VGLT("glDepthMask"), glDepthMask(m))
+#define glDepthFunc(m) (VGLT("glDepthFunc"), glDepthFunc(m))
+#define glColorMask(a, b, c, d) (VGLT("glColorMask"), glColorMask(a, b, c, d))
+#define glEnable(c) (VGLT("glEnable"), glEnable(c))
+#define glDisable(c) (VGLT("glDisable"), glDisable(c))
+#define glTexImage2D(a, b, c, d, e, f, g, h, i) (VGLT("glTexImage2D"), glTexImage2D(a, b, c, d, e, f, g, h, i))
+#define glTexSubImage2D(a, b, c, d, e, f, g, h, i) (VGLT("glTexSubImage2D"), glTexSubImage2D(a, b, c, d, e, f, g, h, i))
+#define glFramebufferTexture2D(a, b, c, d, e) (VGLT("glFramebufferTexture2D"), glFramebufferTexture2D(a, b, c, d, e))
+#define glFramebufferRenderbuffer(a, b, c, d) (VGLT("glFramebufferRenderbuffer"), glFramebufferRenderbuffer(a, b, c, d))
+#define glRenderbufferStorage(a, b, c, d) (VGLT("glRenderbufferStorage"), glRenderbufferStorage(a, b, c, d))
+#define glCheckFramebufferStatus(t) (VGLT("glCheckFramebufferStatus"), glCheckFramebufferStatus(t))
+#define glGenerateMipmap(t) (VGLT("glGenerateMipmap"), glGenerateMipmap(t))
+#define glBindTexture(t, x) (VGLT("glBindTexture"), glBindTexture(t, x))
+#define glBindSampler(u, x) (VGLT("glBindSampler"), glBindSampler(u, x))
+#define glBindVertexArray(v) (VGLT("glBindVertexArray"), glBindVertexArray(v))
+#define glPixelStorei(a, b) (VGLT("glPixelStorei"), glPixelStorei(a, b))
+#define glFinish() (VGLT("glFinish"), glFinish())
+#define glClearDepth(z) (VGLT("glClearDepth"), glClearDepth(z))
+#define glClearStencil(z) (VGLT("glClearStencil"), glClearStencil(z))
+#define vglSwapBuffers(x) (VGLT("vglSwapBuffers"), vglSwapBuffers(x))
+
 static void (*p_glMaxShaderCompilerThreadsKHR)(GLuint);   /* (desktop only: KHR_parallel_shader_compile) */

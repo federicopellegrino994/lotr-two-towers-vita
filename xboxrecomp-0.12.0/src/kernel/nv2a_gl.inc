@@ -686,6 +686,9 @@ static int gsurf_near(uint32_t off)
  * ClearDepthStencilView -- no scissor, every bit written. */
 static void gpu_clear_ds(GLuint fbo, int which, float z, int stencil)
 {
+#if defined(__vita__)
+    vgl_trf("gpu_clear_ds fbo %u which %d", fbo, which);
+#endif
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glDisable(GL_SCISSOR_TEST);
     glDepthMask(GL_TRUE);
@@ -823,6 +826,9 @@ static GSurf *gsurf_get(uint32_t base, uint32_t w, uint32_t h, int depth)
     if (!depth) s->ss_new = 0;
 #endif
     s->base = base; s->w = w; s->h = h; s->is_depth = (uint32_t)depth; s->used = ++g_clock;
+#if defined(__vita__)
+    vgl_trf("surface %08X %ux%u (%ux%u) %s tex %u", base, w, h, s->pw, s->ph, depth ? "zeta" : "colour", s->tex);
+#endif
     s->pw = tw; s->ph = th;
     if (g_msaa > 1) gsurf_ms_make(s);
     if (getenv("RECOMP_SURF_LOG")) {
@@ -1534,6 +1540,8 @@ static int gpu_init(void)
     if (e && !strcasecmp(e, "software")) return 0;
 #if defined(__vita__)
     (void)maj; (void)mnr;
+    vgl_tr_init();
+    vgl_trf("gpu_init (build v11, start-up trace): asking for vitaGL");
     if (!xbox_VitaGLAcquire()) {
         fprintf(stderr, "  [VGL] vitaGL belongs to the picture thread: software renderer\n");
         return 0;
@@ -2921,6 +2929,9 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
 static int g_null3_draw;   /* (RECOMP_GPU_NULL=3) */
 static void gpu_batch(void)
 {
+#if defined(__vita__)
+    vgl_trf("gpu_batch mode %u", (unsigned)s_3d.mode);
+#endif
     {   static int nul = -1;   /* testing: RECOMP_GPU_NULL=1 -- no drawing (CPU profiles of the game); =3: only the frames a picture is asked of */
         if (nul < 0) { const char *e = getenv("RECOMP_GPU_NULL"); nul = !e ? 0 : *e == '3' ? 3 : 1; }
         if (nul == 1 || (nul == 3 && !g_null3_draw)) return;
@@ -3446,6 +3457,9 @@ static void gpu_dump_window(const char *nm)
 /* The flip: the finished surface onto the window. */
 static void gpu_present(uint32_t base, uint32_t pitch)
 {
+#if defined(__vita__)
+    vgl_trf("gpu_present %08X", base);
+#endif
     hud_frame_end();   /* this frame's HUD pieces, grouped (hud_wide_x) */
     GSurf *s = gsurf_find(base, 0);
     int wide;
