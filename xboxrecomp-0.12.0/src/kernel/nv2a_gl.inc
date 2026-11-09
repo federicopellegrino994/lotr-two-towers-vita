@@ -1622,6 +1622,7 @@ static int gpu_init_fail(void)
 }
 #if defined(__vita__)
 static void vgl_surface_test(void);
+static void vgl_uniform_test(void);
 #endif
 static int gpu_init(void)
 {
@@ -1637,7 +1638,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v23) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v24) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -1753,6 +1754,8 @@ static int gpu_init(void)
 #if defined(__vita__)
     vgl_surface_test();
     gpu_sh_reset();
+    vgl_uniform_test();
+    gpu_sh_reset();
 #endif
     fprintf(stderr, "  [GL] renderer up\n");
     fflush(stderr);
@@ -1820,6 +1823,127 @@ static void vgl_surface_test(void)
     }
     gpu_fbo_forget(t);
     glDeleteTextures(1, &t);
+    fflush(stderr);
+}
+#endif
+
+
+#if defined(__vita__)
+/* (diagnostics) how a vertex shader's uniform array reaches the GPU: small
+ * programs that take a full-screen quad's colour from constants, drawn into a
+ * 64x64 texture, the centre pixel read. Red = right. [VGL] uniform test */
+static void vgl_uniform_test(void)
+{
+    static const struct { const char *name, *vs; int how; } T[] = {
+        { "c[192], c[100] static, real upload path", "uniform float4 c[192];\n"
+          "void main(float4 vin0, float4 vin1, float4 out gl_Position : POSITION, float4 out v_d0 : TEXCOORD4) {\n"
+          "  gl_Position = vin0; v_d0 = c[100]; }\n", 0 },
+        { "c[192], c[0] static", "uniform float4 c[192];\n"
+          "void main(float4 vin0, float4 vin1, float4 out gl_Position : POSITION, float4 out v_d0 : TEXCOORD4) {\n"
+          "  gl_Position = vin0; v_d0 = c[0]; }\n", 0 },
+        { "c[192], c[191] static", "uniform float4 c[192];\n"
+          "void main(float4 vin0, float4 vin1, float4 out gl_Position : POSITION, float4 out v_d0 : TEXCOORD4) {\n"
+          "  gl_Position = vin0; v_d0 = c[191]; }\n", 0 },
+        { "c[192], c[(int)vin1.x] dynamic (100)", "uniform float4 c[192];\n"
+          "void main(float4 vin0, float4 vin1, float4 out gl_Position : POSITION, float4 out v_d0 : TEXCOORD4) {\n"
+          "  gl_Position = vin0; v_d0 = c[(int)vin1.x]; }\n", 0 },
+        { "c[192] + vp, c[100] static", "uniform float4 vp;\nuniform float4 c[192];\n"
+          "void main(float4 vin0, float4 vin1, float4 out gl_Position : POSITION, float4 out v_d0 : TEXCOORD4) {\n"
+          "  gl_Position = vin0 * vp.w; v_d0 = c[100]; }\n", 0 },
+        { "c[192] + vp, position from c[96]", "uniform float4 vp;\nuniform float4 c[192];\n"
+          "void main(float4 vin0, float4 vin1, float4 out gl_Position : POSITION, float4 out v_d0 : TEXCOORD4) {\n"
+          "  gl_Position = float4(dot(vin0, c[96]), dot(vin0, c[97]), 0.0, 1.0); v_d0 = c[100]; }\n", 0 },
+        { "q[192] glUniform4fv(192) direct", "uniform float4 q[192];\n"
+          "void main(float4 vin0, float4 vin1, float4 out gl_Position : POSITION, float4 out v_d0 : TEXCOORD4) {\n"
+          "  gl_Position = vin0; v_d0 = q[100]; }\n", 1 },
+        { "q[192] glUniform4fv(\"q[100]\", 1)", "uniform float4 q[192];\n"
+          "void main(float4 vin0, float4 vin1, float4 out gl_Position : POSITION, float4 out v_d0 : TEXCOORD4) {\n"
+          "  gl_Position = vin0; v_d0 = q[100]; }\n", 2 },
+        { "q[8] glUniform4fv(8), q[5]", "uniform float4 q[8];\n"
+          "void main(float4 vin0, float4 vin1, float4 out gl_Position : POSITION, float4 out v_d0 : TEXCOORD4) {\n"
+          "  gl_Position = vin0; v_d0 = q[5]; }\n", 3 },
+        { "k100 single uniform", "uniform float4 k100;\n"
+          "void main(float4 vin0, float4 vin1, float4 out gl_Position : POSITION, float4 out v_d0 : TEXCOORD4) {\n"
+          "  gl_Position = vin0; v_d0 = k100; }\n", 4 },
+    };
+    static float rows[192][4];
+    static const float q[6][8] = {
+        { -1, -1, 0, 1, 100, 0, 0, 0 }, { 1, -1, 0, 1, 100, 0, 0, 0 }, { 1, 1, 0, 1, 100, 0, 0, 0 },
+        { -1, -1, 0, 1, 100, 0, 0, 0 }, { 1, 1, 0, 1, 100, 0, 0, 0 }, { -1, 1, 0, 1, 100, 0, 0, 0 } };
+    float vpv[4] = { 1, 1, 1, 1 };
+    GLuint t, f, fs;
+    int i, k;
+    for (i = 0; i < 192; i++) { rows[i][0] = 0; rows[i][1] = 0; rows[i][2] = 1; rows[i][3] = 1; }   /* blue */
+    rows[0][0] = rows[100][0] = rows[191][0] = 1; rows[0][2] = rows[100][2] = rows[191][2] = 0;     /* red */
+    rows[5][0] = 1; rows[5][2] = 0;
+    rows[96][0] = 1; rows[96][1] = 0; rows[96][2] = 0; rows[96][3] = 0;
+    rows[97][0] = 0; rows[97][1] = 1; rows[97][2] = 0; rows[97][3] = 0;
+    t = gpu_tex2d(64, 64, 0);
+    f = gpu_fbo(t, 0);
+    fs = glCreateShader(GL_FRAGMENT_SHADER);
+    { const char *src = s_cg_ps_main; glShaderSource(fs, 1, &src, NULL); glCompileShader(fs); }
+    for (i = 0; i < (int)(sizeof T / sizeof T[0]); i++) {
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER), p;
+        GLint ok = 0, loc;
+        const uint8_t *px;
+        const char *src = T[i].vs;
+        glShaderSource(vs, 1, &src, NULL);
+        glCompileShader(vs);
+        glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
+        if (!ok) { fprintf(stderr, "  [VGL] uniform test %d (%s): did not compile\n", i, T[i].name); glDeleteShader(vs); continue; }
+        p = glCreateProgram();
+        glAttachShader(p, vs); glAttachShader(p, fs);
+        glLinkProgram(p);
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        if (!ok) { fprintf(stderr, "  [VGL] uniform test %d (%s): did not link\n", i, T[i].name); glDeleteProgram(p); glDeleteShader(vs); continue; }
+        glBindFramebuffer(GL_FRAMEBUFFER, f);
+        glViewport(0, 0, 64, 64);
+        glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0, 1, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        gpu_ub(UB_VSC, vpv, 16);
+        gpu_ub(UB_VPC, rows, sizeof rows);
+        glUseProgram(p);
+        loc = -1;
+        switch (T[i].how) {
+        case 1: loc = glGetUniformLocation(p, "q"); glUniform4fv(loc, 192, rows[0]); break;
+        case 2: loc = glGetUniformLocation(p, "q[100]"); glUniform4fv(loc, 1, rows[100]); break;
+        case 3: loc = glGetUniformLocation(p, "q"); glUniform4fv(loc, 8, rows[0]); break;
+        case 4: loc = glGetUniformLocation(p, "k100"); glUniform4fv(loc, 1, rows[100]); break;
+        default: loc = glGetUniformLocation(p, "c"); break;
+        }
+        glBindVertexArray(g_vao_x);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        for (k = 0; k < 16; k++) {
+            if (k < 2) { glEnableVertexAttribArray(k); glVertexAttribPointer(k, 4, GL_FLOAT, GL_FALSE, sizeof q[0], &q[0][4 * k]); }
+            else glDisableVertexAttribArray(k);
+        }
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glFinish();
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, t);
+        px = (const uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+        if (px) {
+            const uint8_t *c = px + (32 * 64 + 32) * 4;
+            fprintf(stderr, "  [VGL] uniform test %d (%s): loc %d, centre %02X %02X %02X %02X -> %s\n", i, T[i].name, (int)loc,
+                    c[0], c[1], c[2], c[3],
+                    c[0] > 0x80 && c[1] < 0x80 && c[2] < 0x80 ? "RIGHT (red)" :
+                    c[2] > 0x80 && c[0] < 0x80 ? "wrong row (blue)" :
+                    c[1] > 0x80 && c[0] < 0x80 ? "not drawn (green)" :
+                    !c[0] && !c[1] && !c[2] ? "zero (black)" : "other");
+        }
+        glUseProgram(0);
+        glDeleteProgram(p);
+        glDeleteShader(vs);
+        g_sh.prog = 0;
+    }
+    glDeleteShader(fs);
+    gpu_fbo_forget(t);
+    glDeleteTextures(1, &t);
+    { GLenum err = glGetError(); if (err != GL_NO_ERROR) fprintf(stderr, "  [VGL] GL error 0x%04X in the uniform test\n", err); }
     fflush(stderr);
 }
 #endif
