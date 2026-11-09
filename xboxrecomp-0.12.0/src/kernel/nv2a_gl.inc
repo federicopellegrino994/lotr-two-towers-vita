@@ -1638,7 +1638,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v29) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v30) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3621,7 +3621,7 @@ static int g_null3_draw;   /* (RECOMP_GPU_NULL=3) */
 #if defined(__vita__)
 /* (diagnostics) one frame of the level written out as pictures: a render
  * target each time the game leaves it, then every surface at the present --
- * ux0:data/twotowers/cap/<n>_<what>_<base>_<w>x<h>.tga. It starts 200 frames
+ * ux0:data/twotowers/cap/<n>_<what>_<base>_<w>x<h>.tga. It starts 15 frames
  * after the first draw with fog (RECOMP_VGL_CAPTURE=0 off, =n after n frames). */
 static int g_cap_wait = -2, g_cap_on, g_cap_n;
 static void cap_save(const GSurf *sf, const char *what)
@@ -3744,7 +3744,7 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 200; if (e && !atoi(e)) g_cap_wait = -3; }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 15; if (e && !atoi(e)) g_cap_wait = -3; }
         if (g_cap_wait > 0 && s_3d.fog_enable && s_3d.mode == 2) g_cap_wait = -(g_cap_wait + 10);   /* (armed: counts down at the presents) */
         if (g_cap_on && was && was != g_cur_rt) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
