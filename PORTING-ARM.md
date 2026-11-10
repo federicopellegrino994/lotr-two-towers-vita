@@ -415,3 +415,10 @@ sulla CPU (gpu_transform_all), come previsto.
   sola (RECOMP_CTX_DECL -> _rctx, messo da postproc_prof.py in testa a ogni
   funzione); MEM8/16/32 come puntatori volatile semplici (prima packed
   volatile: accessi byte per byte), MEMF/MEMD/SMEM64 packed non volatile.
+- v49–v51: cattura di un frame della battaglia (al 40° frame con più di
+  1000 draw, lista dei draw in cap/draws.txt, schermo ogni 150 draw): il
+  terreno (Monte Fato, lava, cielo) viene disegnato, poi due quadrati a tutto
+  schermo con blending a colore costante lo coprono: vitaGL non ha il
+  blending a colore costante e li disegnava ONE/ZERO (opachi).
+- v52: blending a colore costante fatto nello shader dei combiner
+  (vgl_blend_const: bsrc/bmisc, righe PSC 72/73). Cattura di nuovo spenta.

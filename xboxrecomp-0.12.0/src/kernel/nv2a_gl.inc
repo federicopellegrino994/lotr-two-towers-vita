@@ -1773,7 +1773,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v51) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v52) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -2182,11 +2182,19 @@ static void gpu_set_blend(int write_mask_only_clear)
         if (!sok) sf = GL_ONE;
         if (!dok) df = GL_ONE;
         if (eq != 0x800A && eq != 0x800B && eq != 0x8007 && eq != 0x8008) eq = GL_FUNC_ADD;
+#if defined(__vita__)
+        { GLenum s2 = sf, d2 = df; vgl_blend_const(&s2, &d2, bf); sf = s2; df = d2; }
+#endif
         glEnable(GL_BLEND);
         glBlendFuncSeparate(sf, df, sf, df);
         glBlendEquationSeparate(eq, eq);
         glBlendColor(bf[0], bf[1], bf[2], bf[3]);
-    } else glDisable(GL_BLEND);
+    } else {
+        glDisable(GL_BLEND);
+#if defined(__vita__)
+        { GLenum s2 = GL_ONE, d2 = GL_ZERO; vgl_blend_const(&s2, &d2, bf); }
+#endif
+    }
     g_sh.blend = k; memcpy(g_sh.bf, bf, sizeof bf); g_sh.bs_ok = 1;
 }
 
@@ -3392,6 +3400,11 @@ static char *hwps_translate_cg(const PsKey *K)
             hwvp_cat(&p, &cap, &len, "  { float a8 = floor(saturate(o.a) * 255.0 + 0.5), r = atest.z;\n"
                                      "    if (!(%s)) discard; }\n", cmp[f]);
     }
+#if defined(__vita__)
+    hwvp_cat(&p, &cap, &len, "  o.rgb *= (bmisc.z > 1.5) ? f3(1.0 - o.a) : ((bmisc.z > 0.5) ? f3(o.a) : f3(1.0));\n"
+                             "  o.rgb *= bsrc.rgb;\n"
+                             "  if (bmisc.x > 0.5) o.a = bmisc.y;\n");
+#endif
     hwvp_cat(&p, &cap, &len, "  return o;\n}\n");
     if (getenv("RECOMP_VGL_PSLOG")) {
         static int n;
@@ -4096,7 +4109,7 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 40; if (g_cap_wait <= 0) g_cap_wait = -3; }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 0; if (g_cap_wait <= 0) g_cap_wait = -3; }
 
         if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);

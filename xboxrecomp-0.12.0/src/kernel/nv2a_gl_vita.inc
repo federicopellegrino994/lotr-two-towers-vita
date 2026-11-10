@@ -349,6 +349,7 @@ static void vgl_ub_set(int binding, const void *data, uint32_t bytes)
 /* the uniforms a program may have, and where their values come from */
 typedef struct { const char *name; uint8_t block, row; uint16_t n; } VUni;   /* (n: rows, 0 = 1) */
 static const VUni g_vuni[] = {
+    { "bsrc", VB_PSC, 72 }, { "bmisc", VB_PSC, 73 },
     { "vp", VB_VSC, 0 }, { "vsw", VB_VSC, 4, 4 }, { "clear_color", VB_CLC, 0 }, { "clc_f", VB_CLC, 0 }, { "post", VB_POST, 0 },
     { "c0_0", VB_PSC, 5 }, { "c0_1", VB_PSC, 12 }, { "c0_2", VB_PSC, 19 }, { "c0_3", VB_PSC, 26 },
     { "c0_4", VB_PSC, 33 }, { "c0_5", VB_PSC, 40 }, { "c0_6", VB_PSC, 47 }, { "c0_7", VB_PSC, 54 },
@@ -465,10 +466,47 @@ static GLenum vgl_bf(GLenum f)
 {
     static int said;
     if (f >= 0x8001 && f <= 0x8004) {
-        if (!said++) fprintf(stderr, "  [VGL] constant-colour blending is not available: drawn as ONE/ZERO\n");
+        if (!said++) fprintf(stderr, "  [VGL] constant-colour blending left after vgl_blend_const: drawn as ONE/ZERO\n");
         return (f == 0x8001 || f == 0x8003) ? GL_ONE : GL_ZERO;
     }
     return f;
+}
+/* (PS Vita) vitaGL has no constant-colour blending (and the level's
+ * full-screen overlays use it: drawn as ONE/ZERO they covered the whole
+ * scene). Done in the fragment shader instead: the source term is computed
+ * there (o.rgb *= its factor, the GL factor becomes ONE) and a constant-alpha
+ * destination factor becomes SRC_ALPHA / ONE_MINUS_SRC_ALPHA with the
+ * shader's alpha set to the constant. A constant-colour destination factor
+ * takes the constant's mean. bsrc (PSC row 72): the source's multiplier;
+ * bmisc (row 73): x 1 = replace alpha with y, z 1/2 = multiply by alpha / 1 - alpha. */
+static void vgl_blend_const(GLenum *sf, GLenum *df, const float bc[4])
+{
+    float bs[4] = { 1, 1, 1, 1 }, bm[4] = { 0, 0, 0, 0 };
+    GLenum s = *sf, d = *df;
+    int dconst = d >= 0x8001 && d <= 0x8004, sconst = s >= 0x8001 && s <= 0x8004;
+    if (sconst || dconst) {
+        float ca = bc[3];
+        if (dconst) {
+            float k = (d == 0x8001 || d == 0x8002) ? (bc[0] + bc[1] + bc[2]) / 3.0f : ca;
+            bm[0] = 1.0f; bm[1] = k;
+            /* the source's own alpha factor, done before the alpha is replaced */
+            if (s == GL_SRC_ALPHA) { bm[2] = 1.0f; s = GL_ONE; }
+            else if (s == GL_ONE_MINUS_SRC_ALPHA) { bm[2] = 2.0f; s = GL_ONE; }
+            d = (d == 0x8001 || d == 0x8003) ? GL_SRC_ALPHA : GL_ONE_MINUS_SRC_ALPHA;
+        }
+        switch (s) {
+        case 0x8001: bs[0] = bc[0]; bs[1] = bc[1]; bs[2] = bc[2]; s = GL_ONE; break;
+        case 0x8002: bs[0] = 1 - bc[0]; bs[1] = 1 - bc[1]; bs[2] = 1 - bc[2]; s = GL_ONE; break;
+        case 0x8003: bs[0] = bs[1] = bs[2] = ca; s = GL_ONE; break;
+        case 0x8004: bs[0] = bs[1] = bs[2] = 1 - ca; s = GL_ONE; break;
+        default: break;
+        }
+    }
+    if (memcmp(g_vub[VB_PSC][72], bs, 16) || memcmp(g_vub[VB_PSC][73], bm, 16)) {
+        memcpy(g_vub[VB_PSC][72], bs, 16); memcpy(g_vub[VB_PSC][73], bm, 16);
+        g_vub_gen[VB_PSC]++;
+    }
+    *sf = s; *df = d;
 }
 static void vgl_blend_func(GLenum s, GLenum d, GLenum sa, GLenum da)
 {
@@ -526,6 +564,7 @@ static const char s_cg_ps_head[] =
 "uniform float4 c0_0, c0_1, c0_2, c0_3, c0_4, c0_5, c0_6, c0_7;\n"
 "uniform float4 c1_0, c1_1, c1_2, c1_3, c1_4, c1_5, c1_6, c1_7;\n"
 "uniform float4 ff0, ff1, fogc, fogp, ss0, ss1, ss2, ss3, atest;\n"
+"uniform float4 bsrc, bmisc;\n"   /* (constant-colour blending done in the shader: gpu_set_blend) */
 "float3 f3(float x) { return float3(x, x, x); }\n"
 "float3 dnorm3(float4 c) { float3 b = floor(c.rgb * 255.0 + 0.5); return (b - 256.0 * step(float3(127.5, 127.5, 127.5), b)) / 127.0; }\n";
 
