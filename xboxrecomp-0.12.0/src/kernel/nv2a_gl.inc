@@ -1755,7 +1755,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v35) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v36) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3423,15 +3423,35 @@ static GLuint hwps_lookup(const PsKey *k)
         char *src = hwps_translate(k);
 #endif
         if (!src) e->state = 2;
-        else { e->fs = gpu_shader_start(GL_FRAGMENT_SHADER, src); free(src); }
-    }
+        else {
+            e->fs = gpu_shader_start(GL_FRAGMENT_SHADER, src);
 #if defined(__vita__)
-    {
-        GLint ok = 0;
-        if (e->fs) glGetShaderiv(e->fs, GL_COMPILE_STATUS, &ok);
-        if (n < 8 || !ok) { fprintf(stderr, "  [VGL] combiner shader %u (%08X): %s\n", n, h, ok ? "compiled" : "FAILED"); fflush(stderr); }
-    }
+            {
+                GLint ok = 0;
+                if (e->fs) glGetShaderiv(e->fs, GL_COMPILE_STATUS, &ok);
+                if (n < 8 || !ok) { fprintf(stderr, "  [VGL] combiner shader %u (%08X): %s\n", n, h, ok ? "compiled" : "FAILED"); fflush(stderr); }
+                if (!ok) {
+                    /* (the failed ones written out, with vitaGL's log and the free memory) */
+                    static int nf;
+                    char path[96], log[1024];
+                    GLsizei ll = 0;
+                    FILE *f;
+                    log[0] = 0;
+                    if (e->fs) glGetShaderInfoLog(e->fs, sizeof log - 1, &ll, log);
+                    if (ll > 0 && ll < (GLsizei)sizeof log) log[ll] = 0;
+                    fprintf(stderr, "  [VGL]   log: %s\n", log[0] ? log : "(empty)");
+                    vgl_mem_report("combiner shader failed");
+                    if (nf++ < 12) {
+                        if (nf == 1) sceIoMkdir("ux0:data/twotowers/hwps_fail", 0777);
+                        snprintf(path, sizeof path, "ux0:data/twotowers/hwps_fail/%08X.txt", h);
+                        if ((f = fopen(path, "w")) != NULL) { fprintf(f, "log: %s\n\n%s", log, src); fclose(f); }
+                    }
+                }
+            }
 #endif
+            free(src);
+        }
+    }
     g_hwps[n] = e;
     g_hwps_n = (LONG)(n + 1);
     last = e;
@@ -3875,7 +3895,7 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 0; if (g_cap_wait <= 0) g_cap_wait = -3; }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 15; if (g_cap_wait <= 0) g_cap_wait = -3; }
         if (g_cap_wait > 0 && s_3d.fog_enable && s_3d.mode == 2) g_cap_wait = -(g_cap_wait + 10);   /* (armed: counts down at the presents) */
         if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
@@ -4414,7 +4434,7 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         if (!g_cap_mode)
             for (i = 0; i < GSURF_MAX; i++) if (g_surf[i].tex && &g_surf[i] != pr && !g_surf[i].is_depth) cap_save(&g_surf[i], "atpresent");
         g_cap_on = 0;
-        if (g_cap_mode < 3) { g_cap_mode++; g_cap_wait = -(3 + 10); } else g_cap_wait = -3;
+        g_cap_wait = -3;   /* (one capture, as drawn) */
         gpu_sh_reset();
     }
     if (g_cap_wait < -10) { if (++g_cap_wait == -10) { g_cap_on = 1; g_cap_hw = g_cap_cpu = 0; fprintf(stderr, "  [CAP] capturing this frame\n"); } }
