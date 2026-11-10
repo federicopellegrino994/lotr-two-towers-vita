@@ -1531,4 +1531,43 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
 void recomp_unimpl(const char *text, uint32_t va);
 #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
 
+#if defined(__vita__) && defined(RECOMP_FAST_REGS)
+/* (PS Vita) the register file without emutls: recomp_fastregs.h */
+#include "recomp_fastregs.h"
+#undef XBOX_FS_BASE
+#define g_eax  (recomp_ctx()->r_eax)
+#define g_ecx  (recomp_ctx()->r_ecx)
+#define g_edx  (recomp_ctx()->r_edx)
+#define g_esp  (recomp_ctx()->r_esp)
+#define g_ebx  (recomp_ctx()->r_ebx)
+#define g_esi  (recomp_ctx()->r_esi)
+#define g_edi  (recomp_ctx()->r_edi)
+#define g_ebp  (recomp_ctx()->r_ebp)
+#define g_seh_ebp (recomp_ctx()->r_seh_ebp)
+#define g_fs_base (recomp_ctx()->r_fs_base)
+#define XBOX_FS_BASE g_fs_base
+#define g_df   (recomp_ctx()->r_df)
+#define g_fp_top (recomp_ctx()->r_fp_top)
+#define g_fp_cmp (recomp_ctx()->r_fp_cmp)
+#define g_fp_control_word (recomp_ctx()->r_fp_control_word)
+#define g_fp_cc (recomp_ctx()->r_fp_cc)
+#define g_fp_stack (recomp_ctx()->r_fp_stack)
+#define g_xmm0 (*(RecompXmm *)recomp_ctx()->r_xmm[0])
+#define g_xmm1 (*(RecompXmm *)recomp_ctx()->r_xmm[1])
+#define g_xmm2 (*(RecompXmm *)recomp_ctx()->r_xmm[2])
+#define g_xmm3 (*(RecompXmm *)recomp_ctx()->r_xmm[3])
+#define g_xmm4 (*(RecompXmm *)recomp_ctx()->r_xmm[4])
+#define g_xmm5 (*(RecompXmm *)recomp_ctx()->r_xmm[5])
+#define g_xmm6 (*(RecompXmm *)recomp_ctx()->r_xmm[6])
+#define g_xmm7 (*(RecompXmm *)recomp_ctx()->r_xmm[7])
+#define g_mm0 (*(RecompMmx *)&recomp_ctx()->r_mm[0])
+#define g_mm1 (*(RecompMmx *)&recomp_ctx()->r_mm[1])
+#define g_mm2 (*(RecompMmx *)&recomp_ctx()->r_mm[2])
+#define g_mm3 (*(RecompMmx *)&recomp_ctx()->r_mm[3])
+#define g_mm4 (*(RecompMmx *)&recomp_ctx()->r_mm[4])
+#define g_mm5 (*(RecompMmx *)&recomp_ctx()->r_mm[5])
+#define g_mm6 (*(RecompMmx *)&recomp_ctx()->r_mm[6])
+#define g_mm7 (*(RecompMmx *)&recomp_ctx()->r_mm[7])
+#endif
+
 #endif /* RECOMP_TYPES_H */

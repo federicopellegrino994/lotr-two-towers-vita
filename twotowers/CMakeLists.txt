@@ -164,7 +164,7 @@ elseif(VITA)
         -Wno-int-conversion -Wno-format)
     set(TT_GUEST_RENAMES "close=tt_guest_close;write=tt_guest_write;lseek=tt_guest_lseek;isatty=tt_guest_isatty")
     set_source_files_properties(${RECOMP_GEN_SOURCES}
-        PROPERTIES COMPILE_DEFINITIONS "${TT_GUEST_RENAMES};RECOMP_PROFILE")
+        PROPERTIES COMPILE_DEFINITIONS "${TT_GUEST_RENAMES};RECOMP_PROFILE;RECOMP_FAST_REGS")
     set_source_files_properties(src/twotowers_manual.c src/recomp_manual.c
         PROPERTIES COMPILE_DEFINITIONS "${TT_GUEST_RENAMES}")
     # (sampling profiler: postproc_prof.py's hooks, src/prof_vita.c)

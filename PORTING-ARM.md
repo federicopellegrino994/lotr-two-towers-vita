@@ -396,3 +396,12 @@ sulla CPU (gpu_transform_all), come previsto.
   chiamante all'uscita con una variabile cleanup); twotowers/src/prof_vita.c
   campiona ogni ms e ogni 10 s scrive le 25 funzioni più presenti ([PROF]).
   RECOMP_PROF=0 lo spegne. Il generatore (generate.py) lo esegue per ultimo.
+- v41: profilo del solo thread principale nel livello: piatto (le 25
+  funzioni in testa ~55%: NtReadFile ~8%, matrici SSE ~4% l'una...). Il costo
+  è generale.
+- v42: RECOMP_FAST_REGS (solo sorgenti generati): i registri guest (g_eax ...
+  g_xmm7, g_mm*, x87) sono campi di una struct per thread (RecompRegs,
+  xboxrecomp-0.12.0/src/platform/recomp_fastregs.h) trovata inline da
+  TPIDRURO + g_recomp_ctx_off (slot TLS 0x8C/0x8D). Il codice host continua a
+  usare le vere variabili thread-local: vita_emutls.c mette la loro memoria
+  dentro la stessa struct (xr_ctx_field), quindi vedono gli stessi registri.
