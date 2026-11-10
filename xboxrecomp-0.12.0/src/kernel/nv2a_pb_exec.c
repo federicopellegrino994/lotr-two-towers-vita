@@ -1815,6 +1815,9 @@ volatile long long xbox_perf_wait_ticks;   /* (1.9.3) the title's time waiting o
  * old estimate (sleeps close together counted as one wait) took the game's
  * whole frame for a wait at high frame rates. */
 volatile DWORD xbox_perf_game_tid;
+#if defined(__vita__)
+static void g_prof_fn_reset(void) { extern volatile uint32_t g_prof_fn __attribute__((weak)); if (&g_prof_fn) g_prof_fn = 0; }
+#endif
 void xbox_PerfWaitNote(int inwait)
 {
     if (inwait) {   /* (the thread that waits for frames now: the loading screen's is another) */
@@ -1822,6 +1825,14 @@ void xbox_PerfWaitNote(int inwait)
         if (t != xbox_perf_game_tid) {
             static int n;
             xbox_perf_game_tid = t;
+#if defined(__vita__)
+            {   /* (the sampling profiler records this thread only: twotowers/src/prof_vita.c) */
+                extern volatile uint32_t g_prof_tp __attribute__((weak));
+                uint32_t tp;
+                __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(tp));
+                if (&g_prof_tp) { g_prof_tp = tp; g_prof_fn_reset(); }
+            }
+#endif
             if (n++ < 8) fprintf(stderr, "  [PERF] the game's frame thread: %lu\n", (unsigned long)t);
         }
     }

@@ -16,6 +16,7 @@
 #include <string.h>
 
 volatile uint32_t g_prof_fn;
+volatile uint32_t g_prof_tp = 1;   /* (the game's frame thread's TPIDRURO: nv2a_pb_exec.c xbox_PerfWaitNote) */
 
 /* (the report is written by the renderer's thread, prof_take_report: this
  * thread's stderr is not the one the log captures) */
@@ -103,4 +104,10 @@ const char *prof_start2(void)
     return msg;
 }
 void prof_start(void) { }
+#endif
+#if defined(__vita__)
+/* (vita-elf-create needs ~4 KB after the text segment for its own data; when
+ * the text happens to end just short of a page the data segment overlaps it.
+ * This pads the text out by two pages -- change its size if it happens again) */
+__attribute__((used)) const char g_vita_text_pad[8192] = { 1 };
 #endif
