@@ -1773,7 +1773,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v44) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v45) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3679,7 +3679,7 @@ static void hwvp_probe(HwVp *hv, GLuint game_prog, uint32_t nverts)
 #if defined(__vita__)
 /* (the [VGLPERF] timers: vgl_perf_frame) */
 #include <psp2/kernel/processmgr.h>
-enum { VP_BATCH, VP_TARGETS, VP_XFORM, VP_STAGES, VP_DRAW, VP_PRESENT, VP_N };
+enum { VP_BATCH, VP_TARGETS, VP_XFORM, VP_STAGES, VP_DRAW, VP_PRESENT, VP_IDX, VP_LOOKUP, VP_PROG, VP_STATE, VP_N };
 static uint64_t g_vp_us[VP_N];
 #define VP_T0(v) SceUInt64 v = sceKernelGetProcessTimeWide()
 #define VP_ADD(k, v) (g_vp_us[k] += sceKernelGetProcessTimeWide() - (v))
@@ -3691,10 +3691,11 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     GLuint prog;
 #if defined(__vita__)
     { VP_T0(t); gpu_bind_stages(); VP_ADD(VP_STAGES, t); }
+    { VP_T0(t); prog = gpu_program_for(hv->vs); VP_ADD(VP_PROG, t); }
 #else
     gpu_bind_stages();
-#endif
     prog = gpu_program_for(hv->vs);
+#endif
     if (!prog) return 0;
 #if defined(__vita__)
     /* (PS Vita) the inputs unpacked on the CPU, drawn from client arrays;
@@ -3746,9 +3747,11 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
         g_sh.vao = 2;
         glBindBuffer(GL_ARRAY_BUFFER, 0);
     }
+    VP_T0(t_st);
     gpu_set_blend(0);
     gpu_set_depth(g_cur_ds != NULL);
     gpu_use(prog);
+    VP_ADD(VP_STATE, t_st);
     if (g_cap_on && g_cap_mode == 1 && s_3d.depth_test) { glDepthFunc(GL_ALWAYS); g_sh.ds_ok = 0; }
     if (g_cap_on && g_cap_mode == 2 && s_3d.depth_test) { glDepthFunc(GL_LEQUAL); g_sh.ds_ok = 0; }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -3880,6 +3883,8 @@ static void vgl_perf_frame(void)
             if (r) fputs(r, stderr);
             else if (prof_alive && !prof_alive()) fprintf(stderr, "  [PROF] the sampler has not run\n");
         }
+        fprintf(stderr, "  [VGLPERF] more per frame: indices %.1f ms, program lookup %.1f ms, GL program %.1f ms, GL state %.1f ms\n",
+                g_vp_us[VP_IDX] / 1000.0 / f, g_vp_us[VP_LOOKUP] / 1000.0 / f, g_vp_us[VP_PROG] / 1000.0 / f, g_vp_us[VP_STATE] / 1000.0 / f);
         fprintf(stderr, "  [VGLPERF] textures per frame: %.0f binds; surfaces %.1f ms, GL textures %.1f ms of which decode cache %.1f ms "
                 "(checksums %.1f ms, %.0f of them)\n", g_tx_binds / f, g_tx_us[0] / 1000.0 / f, g_tx_us[4] / 1000.0 / f,
                 g_tx_us[1] / 1000.0 / f, g_tx_us[2] / 1000.0 / f, g_tx_sums / f);
@@ -3954,6 +3959,9 @@ static void gpu_batch(void)
     if (!gpu_set_raster()) return;
     g_gen++; if (!g_gen) g_gen = 1;
     g_nidx = 0;
+#if defined(__vita__)
+    VP_T0(t_idx);
+#endif
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3) gpu_tri(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2], &nverts);
@@ -3983,6 +3991,9 @@ static void gpu_batch(void)
     default:
         return;
     }
+#if defined(__vita__)
+    VP_ADD(VP_IDX, t_idx);
+#endif
     if (!g_nidx) return;
     if (s_3d.mode == 2 && s_vpd_len > 3) g_frame_3d = 1;
     if (g_wide_prev && s_3d.mode == 2 && s_vpd_len <= 3 && g_aspect > 1.34f) {
@@ -4024,7 +4035,13 @@ static void gpu_batch(void)
         }
     }
     {
+#if defined(__vita__)
+        VP_T0(t_lk);
         HwVp *hv = hwvp_lookup();
+        VP_ADD(VP_LOOKUP, t_lk);
+#else
+        HwVp *hv = hwvp_lookup();
+#endif
         if (hv) {
             if (gpu_batch_hw(hv, nverts)) return;
         }

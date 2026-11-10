@@ -805,7 +805,13 @@ static uint32_t texc_epoch(const Texture *t)
     if (!(tex_size_from_format(t->color) && s_texc_frame && !per_kick)) return g_pb_runs;
 #endif
     if (s_tex_dyn[(t->offset >> 12) & 16383u]) return s_texc_frame | 0x80000000u;   /* (one the CPU has rewritten: every tick) */
+#if defined(__vita__)
+    /* (PS Vita: every 16th frame, in turns by address -- each check of a
+     * swizzled texture is ~0.6 ms of cache misses here) */
+    return ((s_texc_frame + ((t->offset >> 12) & 15u)) >> 4) | 0x40000000u;
+#else
     return ((s_texc_frame + ((t->offset >> 12) & 3u)) >> 2) | 0x40000000u;
+#endif
 }
 
 static uint32_t texc_sum(const Texture *t)
@@ -826,7 +832,11 @@ static uint32_t texc_sum(const Texture *t)
          * for the one before (a multiply each), and this was the largest single
          * part of the render thread's own time in a busy scene */
         uint32_t step = (t->pitch && !tex_size_from_format(t->color)) ? 64   /* (1.9.3: by the format -- see texc_epoch) */
+#if defined(__vita__)
+                      : bytes > 4096 ? (bytes / 1024) & ~3u : 4;   /* (1024 points: see texc_epoch) */
+#else
                       : bytes > 16384 ? (bytes / 4096) & ~3u : 4;
+#endif
         uint32_t h1 = 0x01000193u, h2 = 0x9E3779B9u, h3 = 0x85EBCA6Bu, s4 = step * 4;
 #if defined(RECOMP_COMPACT_GUEST)
         if ((t->offset >> 24) == ((t->offset + bytes - 1) >> 24)) {
