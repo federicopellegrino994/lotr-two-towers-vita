@@ -264,6 +264,32 @@ static void vgl_attach(GLuint p, GLuint s)
     glAttachShader(p, s);
 }
 static void vprog_forget(GLuint p);
+
+/* (PS Vita) the zeta buffer kept between scenes. vitaGL ends a GXM scene at
+ * every change of render target, and a depth/stencil surface is neither
+ * stored at the end of a scene nor loaded at the start of the next unless
+ * told to: the game clears its zeta on one colour target, draws the world on
+ * the other, and the world met the background depth (1.0) under its GEQUAL
+ * test -- nothing drew (the v33 captures: cleared right before each draw,
+ * the world is there). Force load and store on the surface of the
+ * framebuffer just set up (vitaGL's own vglTexImageDepthBuffer reads the
+ * same field: the framebuffer's depth surface pointer at +76).
+ * RECOMP_VGL_ZKEEP=0 turns it off. */
+#include <psp2/gxm.h>
+extern void *active_write_fb;
+static int g_zkeep = -1;
+static unsigned g_zkeep_n;
+static void vgl_depth_keep(void)
+{
+    SceGxmDepthStencilSurface *ds;
+    if (g_zkeep < 0) { const char *e = getenv("RECOMP_VGL_ZKEEP"); g_zkeep = !(e && e[0] == '0'); }
+    if (!g_zkeep || !active_write_fb) return;
+    ds = *(SceGxmDepthStencilSurface **)((uint8_t *)active_write_fb + 76);
+    if (!ds) { if (g_zkeep_n++ < 3) fprintf(stderr, "  [VGL] zeta keep: no depth surface yet\n"); return; }
+    sceGxmDepthStencilSurfaceSetForceLoadMode(ds, SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED);
+    sceGxmDepthStencilSurfaceSetForceStoreMode(ds, SCE_GXM_DEPTH_STENCIL_FORCE_STORE_ENABLED);
+    if (g_zkeep_n++ < 3) fprintf(stderr, "  [VGL] zeta keep: depth surface %p load/store forced\n", (void *)ds);
+}
 static void vprog_linked(GLuint p);
 /* every program gets its attribute locations before linking */
 static void vgl_link(GLuint p)

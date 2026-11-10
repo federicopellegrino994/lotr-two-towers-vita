@@ -362,3 +362,13 @@ sulla CPU (gpu_transform_all), come previsto.
   di un programma vengono dal sorgente dello shader ("// c_lo"), mai più di
   quelle dichiarate. Risoluzione bloccata a 1x sulla Vita (cambiarla dal menu
   crashava). DA PROVARE.
+- v33 (catture sulla profondità): con il confronto ALWAYS, con GEQUAL→LEQUAL
+  e con la profondità azzerata subito prima di ogni draw il personaggio c'è.
+  Quindi l'azzeramento a inizio frame si perde: vitaGL chiude una scena GXM a
+  ogni cambio di bersaglio, e la superficie di profondità non viene salvata
+  né ricaricata tra una scena e l'altra (il gioco azzera la zeta su un
+  bersaglio colore e disegna il mondo sull'altro: nuova scena, profondità di
+  sfondo 1.0, GEQUAL fallisce).
+- v34: vgl_depth_keep() forza load/store sulla superficie di profondità di
+  ogni framebuffer con zeta (puntatore a active_write_fb+76, come
+  vglTexImageDepthBuffer). RECOMP_VGL_ZKEEP=0 lo spegne. Catture spente.
