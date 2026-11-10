@@ -1773,7 +1773,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v53) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v54) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -2171,6 +2171,26 @@ static void gpu_set_blend(int write_mask_only_clear)
     bf[2] = (c & 0xFF) / 255.0f; bf[3] = (c >> 24) / 255.0f;
     if (g_sh.bs_ok && g_sh.blend == k && !memcmp(g_sh.bf, bf, sizeof bf)) return;
     glColorMask(wr, wg, wb, wa);
+#if defined(__vita__)
+    /* (PS Vita) a draw that writes alpha only: the level's shadows go into
+     * the alpha channel (ONE/ONE, MAX) and a full-screen pass then darkens by
+     * it. vitaGL's colour mask did not hold them back: the colour went too
+     * and the scene under them was wiped (the v53 capture). The colour is
+     * kept by the blend itself as well: ZERO/ONE, ADD for RGB. */
+    if (!wr && !wg && !wb && wa) {
+        uint32_t sf = s_gpu.blend_sfactor & 0xFFFF, df = s_gpu.blend_dfactor & 0xFFFF, eq = s_3d.blend_eq & 0xFFFF;
+        if (!en) { sf = GL_ONE; df = GL_ZERO; eq = GL_FUNC_ADD; }
+        if (sf >= 0x8001 && sf <= 0x8004) sf = GL_ONE;
+        if (df >= 0x8001 && df <= 0x8004) df = GL_ZERO;
+        if (eq != 0x800A && eq != 0x800B && eq != 0x8007 && eq != 0x8008) eq = GL_FUNC_ADD;
+        glEnable(GL_BLEND);
+        glBlendFuncSeparate(GL_ZERO, GL_ONE, sf, df);
+        glBlendEquationSeparate(GL_FUNC_ADD, eq);
+        { GLenum s2 = GL_ONE, d2 = GL_ZERO; vgl_blend_const(&s2, &d2, bf); }
+        g_sh.blend = k; memcpy(g_sh.bf, bf, sizeof bf); g_sh.bs_ok = 1;
+        return;
+    }
+#endif
     if (en) {
         /* the NV2A's factors and equations are GL's own enums */
         static const uint32_t ok_f[] = { 0x0000, 0x0001, 0x0300, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305, 0x0306,
@@ -4118,7 +4138,7 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 40; if (g_cap_wait <= 0) g_cap_wait = -3; }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 0; if (g_cap_wait <= 0) g_cap_wait = -3; }
 
         if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);

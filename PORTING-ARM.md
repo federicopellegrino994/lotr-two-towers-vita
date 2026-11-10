@@ -422,3 +422,9 @@ sulla CPU (gpu_transform_all), come previsto.
   blending a colore costante e li disegnava ONE/ZERO (opachi).
 - v52: blending a colore costante fatto nello shader dei combiner
   (vgl_blend_const: bsrc/bmisc, righe PSC 72/73). Cattura di nuovo spenta.
+- v53: la lista dei draw della battaglia: le ombre (programma 2395CB3B)
+  scrivono solo l'alpha (maschera colore 0x01000000, ONE/ONE, MAX), poi due
+  quadrati a tutto schermo scuriscono il colore secondo l'alpha. Dopo le
+  ombre lo schermo è tutto 0 (anche l'alpha): la maschera colore di vitaGL
+  non le ferma. v54: per una scrittura solo-alpha il colore è tenuto anche dal
+  blending (RGB ZERO/ONE ADD, alpha con i fattori del gioco).
