@@ -1773,7 +1773,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v54) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v55) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3969,7 +3969,8 @@ static void cap_note_draw(const char *path, uint32_t hash, uint32_t nidx)
         fprintf(g_cap_list, "\n");
     }
     g_cap_ndraw++;
-    if (g_cur_rt && g_cur_rt->w >= 640 && g_cap_ndraw % 150 == 0) {
+    if (g_cur_rt && g_cur_rt->w >= 640 && (g_cap_ndraw % 150 == 0 || (nidx <= 6 && s_gpu.blend_enable && g_cap_n < 90)
+                                         || (s_3d.color_mask == 0x01000000u && g_cap_ndraw % 20 == 0))) {
         char w[24];
         snprintf(w, sizeof w, "mid%04u", g_cap_ndraw);
         cap_save(g_cur_rt, w);
@@ -4138,7 +4139,7 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 0; if (g_cap_wait <= 0) g_cap_wait = -3; }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 40; if (g_cap_wait <= 0) g_cap_wait = -3; }
 
         if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
