@@ -382,3 +382,11 @@ sulla CPU (gpu_transform_all), come previsto.
   generazione) e zseen/sseen per framebuffer; gpu_set_fbo porta il clear
   mancante al framebuffer appena legato (quadrato, zrec_bound). Il
   load/store forzato si fa dopo il primo draw (vgl_depth_keep).
+- v35: il mondo si vede (personaggi texturati; alcuni bianchi quando un
+  combiner non compila: v36 scrive i falliti in ux0:data/twotowers/hwps_fail/).
+- v37: velocità del codice del gioco. Ogni accesso ai registri guest
+  (RECOMP_TLS) passava da __emutls_get_address -> pthread_getspecific ->
+  pte_osTlsGetValue -> __getreent_for_thread -> sceKernelGetTLSAddr + giro di
+  una lista. Ora l'array TLS di ogni thread sta anche negli slot TLS 0x8A/0x8B
+  e il percorso veloce è: lettura di TPIDRURO, due load, due confronti
+  (vita_emutls.c). Cattura spenta.

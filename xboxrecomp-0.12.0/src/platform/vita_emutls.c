@@ -36,6 +36,7 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t   s_key;
 static volatile int    s_key_ok;
 static uintptr_t       s_count;
+void *__emutls_get_address_slow(struct __emutls_object *obj);
 
 static void xr_tls_destroy(void *p)
 {
@@ -80,7 +81,49 @@ static void *xr_tls_alloc(const struct __emutls_object *obj)
     return p;
 }
 
+/* The fast path. pthread_getspecific is a long way round here (pte ->
+ * newlib's reent -> sceKernelGetTLSAddr -> a list walk) and the recompiled
+ * code reads and writes its guest registers through this on every call, so
+ * each thread's array is also kept in two of the thread's own TLS words
+ * (slots 0x8A, 0x8B: the SDK's libraries use 0x89 only): [0] the array,
+ * [1] the thread pointer (TPIDRURO) it belongs to. When those words sit at a
+ * fixed distance from TPIDRURO -- checked on every thread's first slow call
+ * -- a lookup is a coprocessor read, two loads and two compares. */
+#include <psp2/kernel/threadmgr.h>
+#define XR_SLOT 0x8A
+static int s_fast = -1;          /* -1 not known yet, 1 slots at TPIDRURO + s_off, 0 no */
+static uintptr_t s_off;
+static inline uintptr_t xr_tp(void)
+{
+    uintptr_t v;
+    __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(v));
+    return v;
+}
+static void xr_slot_set(xr_tls_array *a)
+{
+    void **sl = (void **)sceKernelGetTLSAddr(XR_SLOT);
+    uintptr_t t = xr_tp();
+    if (!sl) { s_fast = 0; return; }
+    sl[0] = a; sl[1] = (void *)t;
+    if (s_fast < 0) { s_off = (uintptr_t)sl - t; s_fast = s_off < 0x1000 ? 1 : 0; }
+    else if (s_fast && (uintptr_t)sl != t + s_off) s_fast = 0;
+}
+
 void *__emutls_get_address(struct __emutls_object *obj)
+{
+    uintptr_t idx = __atomic_load_n(&obj->loc.offset, __ATOMIC_RELAXED);
+    if (idx && s_fast > 0) {
+        uintptr_t t = xr_tp();
+        void **sl = (void **)(t + s_off);
+        if (sl[1] == (void *)t) {
+            xr_tls_array *fa = (xr_tls_array *)sl[0];
+            if (fa && idx <= fa->n && fa->data[idx - 1]) return fa->data[idx - 1];
+        }
+    }
+    return __emutls_get_address_slow(obj);
+}
+
+void *__emutls_get_address_slow(struct __emutls_object *obj)
 {
     uintptr_t idx = xr_tls_index(obj);
     xr_tls_array *a = (xr_tls_array *)pthread_getspecific(s_key);
@@ -99,6 +142,7 @@ void *__emutls_get_address(struct __emutls_object *obj)
         p = xr_tls_alloc(obj);
         a->data[idx - 1] = p;
     }
+    xr_slot_set(a);
     return p;
 }
 
