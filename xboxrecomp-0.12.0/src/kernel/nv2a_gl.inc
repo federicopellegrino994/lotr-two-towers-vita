@@ -1773,7 +1773,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v48) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v49) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3768,6 +3768,7 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     if (g_cur_ds) vgl_depth_keep();
     if (!hv->dumped) hwvp_dump(hv, nverts);
     g_vp_hw++; g_cap_hw++;
+    if (g_cap_on) cap_note_draw("hw", hv->hash, g_nidx);
     s_gpu.tris_drawn += g_nidx / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
     s_3d.verts += nverts;
@@ -3820,6 +3821,7 @@ static int g_null3_draw;   /* (RECOMP_GPU_NULL=3) */
  * target each time the game leaves it, then every surface at the present --
  * ux0:data/twotowers/cap/<n>_<what>_<base>_<w>x<h>.tga. It starts 15 frames
  * after the first draw with fog (RECOMP_VGL_CAPTURE=0 off, =n after n frames). */
+
 static void cap_save(const GSurf *sf, const char *what)
 {
     char path[128];
@@ -3828,7 +3830,7 @@ static void cap_save(const GSurf *sf, const char *what)
     uint8_t hd[18];
     uint32_t i, n;
     uint8_t *row;
-    if (!sf || !sf->tex || g_cap_n >= 80) return;
+    if (!sf || !sf->tex || g_cap_n >= 99) return;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     gpu_sh_reset();
     glFinish();
@@ -3907,6 +3909,29 @@ static void vgl_perf_frame(void)
     n = 0; t0 = now;
 }
 
+
+#if defined(__vita__)
+/* (diagnostics, the capture frame) every draw listed in cap/draws.txt, and
+ * the screen-sized target written out every 150 of its draws */
+static FILE *g_cap_list;
+static unsigned g_cap_ndraw;
+static void cap_note_draw(const char *path, uint32_t hash, uint32_t nidx)
+{
+    if (!g_cap_on) return;
+    if (!g_cap_list) g_cap_list = fopen("ux0:data/twotowers/cap/draws.txt", "w");
+    if (g_cap_list)
+        fprintf(g_cap_list, "%4u %-6s prog %08X idx %5u prim %u target %08X %ux%u z %d test %d func %u mask %d blend %d cull %d fog %d stages %d%d%d%d\n",
+                g_cap_ndraw, path, hash, nidx, s_gpu.prim, g_cur_rt ? g_cur_rt->base : 0, g_cur_rt ? g_cur_rt->w : 0, g_cur_rt ? g_cur_rt->h : 0,
+                g_cur_ds != NULL, (int)s_3d.depth_test, (unsigned)s_3d.depth_func, (int)s_3d.depth_mask, (int)s_gpu.blend_enable,
+                (int)s_3d.cull_enable, (int)s_3d.fog_enable, s_stage[0].enabled, s_stage[1].enabled, s_stage[2].enabled, s_stage[3].enabled);
+    g_cap_ndraw++;
+    if (g_cur_rt && g_cur_rt->w >= 640 && g_cap_ndraw % 150 == 0) {
+        char w[24];
+        snprintf(w, sizeof w, "mid%04u", g_cap_ndraw);
+        cap_save(g_cur_rt, w);
+    }
+}
+#endif
 #if defined(__vita__)
 /* (PS Vita) a draw whose vertex program runs on the GPU, its inputs read by
  * the GPU straight from the guest's vertex buffers: no unpacking to floats on
@@ -4011,6 +4036,7 @@ static int gpu_batch_hw_direct(HwVp *hv)
     { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)nt, GL_UNSIGNED_SHORT, g_didx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
     if (g_cur_ds) vgl_depth_keep();
     g_vp_hw++; g_vp_direct++; g_cap_hw++;
+    if (g_cap_on) cap_note_draw("direct", hv->hash, nt);
     s_gpu.tris_drawn += nt / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
     s_3d.verts += hi - lo + 1;
@@ -4068,7 +4094,7 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 0; if (g_cap_wait <= 0) g_cap_wait = -3; }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 15; if (g_cap_wait <= 0) g_cap_wait = -3; }
         if (g_cap_wait > 0 && s_3d.fog_enable && s_3d.mode == 2) g_cap_wait = -(g_cap_wait + 10);   /* (armed: counts down at the presents) */
         if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
@@ -4203,6 +4229,7 @@ cpu_verts_ready:
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; g_cap_cpu++; }
         if (g_cur_ds) vgl_depth_keep();
+        if (g_cap_on) cap_note_draw("cpu", s_vpd_len ? 1 : 0, g_nidx);
         if (0)
 #endif
         {
@@ -4627,6 +4654,7 @@ static void gpu_present(uint32_t base, uint32_t pitch)
             for (i = 0; i < GSURF_MAX; i++) if (g_surf[i].tex && &g_surf[i] != pr && !g_surf[i].is_depth) cap_save(&g_surf[i], "atpresent");
         g_cap_on = 0;
         g_cap_wait = -3;   /* (one capture, as drawn) */
+        if (g_cap_list) { fclose(g_cap_list); g_cap_list = NULL; }
         gpu_sh_reset();
     }
     if (g_cap_wait < -10) { if (++g_cap_wait == -10) { g_cap_on = 1; g_cap_hw = g_cap_cpu = 0; fprintf(stderr, "  [CAP] capturing this frame\n"); } }

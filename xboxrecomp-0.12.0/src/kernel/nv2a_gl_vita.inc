@@ -703,3 +703,4 @@ static unsigned g_vp_draws, g_vp_verts, g_vp_up, g_vp_upkb, g_vp_hw;   /* ([VGLP
 static int g_cap_hw, g_cap_cpu;   /* (nv2a_gl.inc cap_save) */
 static unsigned g_vp_direct;      /* (nv2a_gl.inc gpu_batch_hw_direct) */
 static int g_cap_wait = -2, g_cap_on, g_cap_n, g_cap_mode;   /* (mode, for the GPU draws: 0 as they are, 1 depth func ALWAYS, 2 GEQUAL made LEQUAL, 3 depth cleared to 0 just before each) */
+static void cap_note_draw(const char *path, uint32_t hash, uint32_t nidx);
