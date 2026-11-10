@@ -797,7 +797,13 @@ static uint32_t texc_epoch(const Texture *t)
     /* (1.9.5) each swizzled texture every fourth tick, the textures taking
      * turns by their address: loaded art the CPU rewrites mid-level is rare,
      * and checking all of them in the same frame made that frame slow */
+#if defined(__vita__)
+    /* (PS Vita) a linear texture checked once a frame, not once a pushbuffer
+     * run: the checksums were ~110 ms of the render thread's frame */
+    if (!(tex_size_from_format(t->color) && s_texc_frame && !per_kick)) return per_kick ? g_pb_runs : (s_texc_frame | 0x20000000u);
+#else
     if (!(tex_size_from_format(t->color) && s_texc_frame && !per_kick)) return g_pb_runs;
+#endif
     if (s_tex_dyn[(t->offset >> 12) & 16383u]) return s_texc_frame | 0x80000000u;   /* (one the CPU has rewritten: every tick) */
     return ((s_texc_frame + ((t->offset >> 12) & 3u)) >> 2) | 0x40000000u;
 }
@@ -822,6 +828,22 @@ static uint32_t texc_sum(const Texture *t)
         uint32_t step = (t->pitch && !tex_size_from_format(t->color)) ? 64   /* (1.9.3: by the format -- see texc_epoch) */
                       : bytes > 16384 ? (bytes / 4096) & ~3u : 4;
         uint32_t h1 = 0x01000193u, h2 = 0x9E3779B9u, h3 = 0x85EBCA6Bu, s4 = step * 4;
+#if defined(RECOMP_COMPACT_GUEST)
+        if ((t->offset >> 24) == ((t->offset + bytes - 1) >> 24)) {
+            /* (the texture inside one 16 MB slice of the guest space: one
+             * translation, then plain loads -- XR_PTR per word was most of the
+             * checksums' time on the Vita) */
+            const uint8_t *b = (const uint8_t *)XR_PTR(t->offset);
+            for (i = 0; i + 3 * step + 4 <= bytes; i += s4) {
+                h  = (h  ^ *(const uint32_t *)(b + i))            * 16777619u;
+                h1 = (h1 ^ *(const uint32_t *)(b + i + step))     * 16777619u;
+                h2 = (h2 ^ *(const uint32_t *)(b + i + 2 * step)) * 16777619u;
+                h3 = (h3 ^ *(const uint32_t *)(b + i + 3 * step)) * 16777619u;
+            }
+            for (; i + 4 <= bytes; i += step) h = (h ^ *(const uint32_t *)(b + i)) * 16777619u;
+            return h ^ (h1 * 3u) ^ (h2 * 5u) ^ (h3 * 7u);
+        }
+#endif
         for (i = 0; i + 3 * step + 4 <= bytes; i += s4) {
             h  = (h  ^ *(const uint32_t *)(XR_PTR((t->offset) +  i)))            * 16777619u;
             h1 = (h1 ^ *(const uint32_t *)(XR_PTR((t->offset) +  i + step)))     * 16777619u;
