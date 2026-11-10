@@ -1755,7 +1755,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v38) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v39) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3837,6 +3837,13 @@ static void vgl_perf_frame(void)
                 (double)(g_vp_us[VP_BATCH] - (in < g_vp_us[VP_BATCH] ? in : g_vp_us[VP_BATCH])) / 1000.0 / f,
                 g_vp_us[VP_PRESENT] / 1000.0 / f,
                 ms - (g_vp_us[VP_BATCH] + g_vp_us[VP_PRESENT]) / 1000.0 / f);
+        {   /* (the sampling profiler's report, twotowers/src/prof_vita.c) */
+            extern const char *prof_take_report(void) __attribute__((weak));
+            extern int prof_alive(void) __attribute__((weak));
+            const char *r = prof_take_report ? prof_take_report() : NULL;
+            if (r) fputs(r, stderr);
+            else if (prof_alive && !prof_alive()) fprintf(stderr, "  [PROF] the sampler has not run\n");
+        }
         fprintf(stderr, "  [VGLPERF] per frame: %.0f draws (%.0f with the vertex program on the GPU), %.0f vertices transformed on the CPU, "
                 "%.1f texture uploads (%.0f KB); vertex programs compiled %u, failed %u\n",
                 g_vp_draws / f, g_vp_hw / f, g_vp_verts / f, g_vp_up / f, g_vp_upkb / f, g_hwvp_compiled, g_hwvp_failed);
