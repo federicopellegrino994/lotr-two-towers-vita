@@ -163,8 +163,12 @@ elseif(VITA)
     target_compile_options(${PROJECT_NAME} PRIVATE -Wno-incompatible-pointer-types
         -Wno-int-conversion -Wno-format)
     set(TT_GUEST_RENAMES "close=tt_guest_close;write=tt_guest_write;lseek=tt_guest_lseek;isatty=tt_guest_isatty")
-    set_source_files_properties(${RECOMP_GEN_SOURCES} src/twotowers_manual.c src/recomp_manual.c
+    set_source_files_properties(${RECOMP_GEN_SOURCES}
+        PROPERTIES COMPILE_DEFINITIONS "${TT_GUEST_RENAMES};RECOMP_PROFILE")
+    set_source_files_properties(src/twotowers_manual.c src/recomp_manual.c
         PROPERTIES COMPILE_DEFINITIONS "${TT_GUEST_RENAMES}")
+    # (sampling profiler: postproc_prof.py's hooks, src/prof_vita.c)
+    target_sources(${PROJECT_NAME} PRIVATE src/prof_vita.c)
     target_link_options(${PROJECT_NAME} PRIVATE -Wl,-q)
     set(VITA_APP_NAME "The Two Towers")
     set(VITA_TITLEID  "TTWR00001")

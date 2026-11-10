@@ -1322,6 +1322,7 @@ int main(int argc, char **argv)
         if (!getenv("RECOMP_WINDOW_SIZE")) setenv("RECOMP_WINDOW_SIZE", "960x544", 1);
         if (!getenv("RECOMP_FB_WINDOW")) setenv("RECOMP_FB_WINDOW", "1", 1);
     }
+    { extern void prof_start(void); prof_start(); }
 #endif
 #if defined(_WIN32)
     return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);

@@ -390,3 +390,9 @@ sulla CPU (gpu_transform_all), come previsto.
   una lista. Ora l'array TLS di ogni thread sta anche negli slot TLS 0x8A/0x8B
   e il percorso veloce è: lettura di TPIDRURO, due load, due confronti
   (vita_emutls.c). Cattura spenta.
+- v37: nessun guadagno (codice del gioco sempre ~320–380 ms/frame).
+- v38: profiler a campionamento. postproc_prof.py mette RECOMP_PROF_ENTER(va)
+  all'inizio di ogni funzione generata (scrive g_prof_fn, rimette quello del
+  chiamante all'uscita con una variabile cleanup); twotowers/src/prof_vita.c
+  campiona ogni ms e ogni 10 s scrive le 25 funzioni più presenti ([PROF]).
+  RECOMP_PROF=0 lo spegne. Il generatore (generate.py) lo esegue per ultimo.
