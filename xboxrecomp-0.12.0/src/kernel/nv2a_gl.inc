@@ -1755,7 +1755,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v39) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v40) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3840,7 +3840,10 @@ static void vgl_perf_frame(void)
         {   /* (the sampling profiler's report, twotowers/src/prof_vita.c) */
             extern const char *prof_take_report(void) __attribute__((weak));
             extern int prof_alive(void) __attribute__((weak));
-            const char *r = prof_take_report ? prof_take_report() : NULL;
+            extern const char *prof_start2(void) __attribute__((weak));
+            const char *r = prof_start2 ? prof_start2() : NULL;
+            if (r) fputs(r, stderr);
+            r = prof_take_report ? prof_take_report() : NULL;
             if (r) fputs(r, stderr);
             else if (prof_alive && !prof_alive()) fprintf(stderr, "  [PROF] the sampler has not run\n");
         }

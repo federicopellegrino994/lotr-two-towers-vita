@@ -81,13 +81,26 @@ static int prof_thread(SceSize args, void *argp)
     return 0;
 }
 
-void prof_start(void)
+/* started from the renderer's thread on its first report (pthread: the
+ * native thread v38/v39 made never ran); returns a line for the log */
+#include <pthread.h>
+static void *prof_pthread(void *a) { (void)a; prof_thread(0, NULL); return NULL; }
+const char *prof_start2(void)
 {
+    static int done;
+    static char msg[96];
+    pthread_t t;
+    pthread_attr_t at;
+    int r;
     const char *e = getenv("RECOMP_PROF");
-    SceUID th;
-    if (e && e[0] == '0') return;
-    th = sceKernelCreateThread("tt_prof", prof_thread, 0x40, 0x4000, 0, 0, NULL);
-    if (th >= 0) sceKernelStartThread(th, 0, NULL);
-    fprintf(stderr, "  [PROF] sampling profiler %s\n", th >= 0 ? "on" : "could not start");
+    if (done) return NULL;
+    done = 1;
+    if (e && e[0] == '0') return "  [PROF] off (RECOMP_PROF=0)\n";
+    pthread_attr_init(&at);
+    pthread_attr_setstacksize(&at, 64 * 1024);
+    r = pthread_create(&t, &at, prof_pthread, NULL);
+    snprintf(msg, sizeof msg, "  [PROF] sampling profiler: %s (%d)\n", r ? "could not start" : "on", r);
+    return msg;
 }
+void prof_start(void) { }
 #endif
