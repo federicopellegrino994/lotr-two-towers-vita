@@ -2080,6 +2080,14 @@ int xbox_HudWidePlace(float cx, float cy, float *k)
     return 0;
 }
 
+#if defined(__vita__)
+/* (PS Vita, [VGLPERF] textures in parts: surfaces, decode cache, checksums, GL textures, the rest) */
+#include <psp2/kernel/processmgr.h>
+static uint64_t g_tx_us[6];
+static unsigned g_tx_sums, g_tx_binds;
+#define TX_T0(v) SceUInt64 v = sceKernelGetProcessTimeWide()
+#define TX_ADD(k, v) (g_tx_us[k] += sceKernelGetProcessTimeWide() - (v))
+#endif
 #include "nv2a_sw3d.inc"
 #if defined(_WIN32)
 #include "nv2a_d3d11.inc"

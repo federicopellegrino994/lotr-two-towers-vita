@@ -1104,7 +1104,11 @@ static const uint32_t *texc_get(const Texture *t)
      * times a frame, and the checksum was most of the renderer's CPU time). */
     ep = texc_epoch(t);
     if (e && e->run == ep && e->gen == gen && e->trev == xbox_tex_rev) { e->last_use = s_texc_clock; s_texc_last_ver = e->ver; s_texc_last_hash = e->hash; s_texc_last_uidx = e->uidx; return e->argb; }
+#if defined(__vita__)
+    { TX_T0(ts); sum = texc_sum(t); TX_ADD(2, ts); g_tx_sums++; }
+#else
     sum = texc_sum(t);
+#endif
     if (e && e->sum == sum && e->gen == gen && e->trev == xbox_tex_rev) { e->run = ep; e->last_use = s_texc_clock; s_texc_last_ver = e->ver; s_texc_last_hash = e->hash; s_texc_last_uidx = e->uidx; return e->argb; }
     {   /* (for [SLOWFRAME]: why this decode, and the biggest of the frame) */
         uint32_t why = !e ? 0 : e->gen != gen ? 2 : e->trev != xbox_tex_rev ? 3 : 1;   /* new / changed / GPU wrote / settings */

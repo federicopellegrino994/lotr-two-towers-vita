@@ -1150,18 +1150,36 @@ static GLuint gtex_get(const Texture *t)
     GTex *e = NULL, *victim = NULL;
     int i;
     s_ultra_used = 0;
+#if defined(__vita__)
+    { TX_T0(tc); argb = texc_get_ver(t, &ver); TX_ADD(1, tc); }
+#else
     argb = texc_get_ver(t, &ver);
+#endif
     if (!argb) return 0;
     fhash_note(s_texc_last_hash);
     if (s_texc_last_uidx >= 0 && g_ultra_on == 1 && ultra_sky_check(s_texc_last_uidx, t, s_3d.depth_test, s_3d.depth_mask)) {   /* Ultra textures: the pack's picture, once it is read */
         GLuint hd = ultra_gpu_get(s_texc_last_uidx);
         if (hd) { s_ultra_used = 1; return hd; }
     }
-    for (i = 0; i < GTEX_MAX; i++) {
-        GTex *c = &g_tex[i];
-        if (c->tex && c->off == t->offset && c->color == t->color && c->w == t->width && c->h == t->height
-            && c->pitch == t->pitch) { e = c; break; }
-        if (!victim || (!c->tex && victim->tex) || (c->tex && victim->tex && c->used < victim->used)) victim = c;
+    {   /* (the slot this texture had last time, from a small index: the full
+         * scan of all GTEX_MAX slots on every bind only on a miss) */
+        static uint16_t gidx[4096];
+        uint32_t hk = ((t->offset >> 6) ^ (t->offset >> 17) ^ (t->color * 0x9E37u) ^ (t->width << 3) ^ (t->height << 7)) & 4095u;
+        int q = (int)gidx[hk] - 1;
+        if (q >= 0 && q < GTEX_MAX) {
+            GTex *c = &g_tex[q];
+            if (c->tex && c->off == t->offset && c->color == t->color && c->w == t->width && c->h == t->height
+                && c->pitch == t->pitch) e = c;
+        }
+        if (!e) {
+            for (i = 0; i < GTEX_MAX; i++) {
+                GTex *c = &g_tex[i];
+                if (c->tex && c->off == t->offset && c->color == t->color && c->w == t->width && c->h == t->height
+                    && c->pitch == t->pitch) { e = c; break; }
+                if (!victim || (!c->tex && victim->tex) || (c->tex && victim->tex && c->used < victim->used)) victim = c;
+            }
+            gidx[hk] = (uint16_t)((e ? e : victim) - g_tex + 1);
+        }
     }
     if (!e) {
         int lv = 1;
@@ -1755,7 +1773,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v42) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v43) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -2430,8 +2448,14 @@ static void gpu_bind_stages(void)
         tail.sscale[k][0] = S->t.width ? 1.0f / (float)S->t.width : 1.0f;
         tail.sscale[k][1] = S->t.height ? 1.0f / (float)S->t.height : 1.0f;
         if ((fl & 1) && (fl & 2)) {
+            static int surf_log = -1;
+            if (surf_log < 0) surf_log = getenv("RECOMP_SURF_LOG") != NULL;   /* (once: getenv on every stage of every draw cost) */
+#if defined(__vita__)
+            TX_T0(tsf);
+            g_tx_binds++;
+#endif
             gs = gpu_surface_for_texture(S->t.offset, S->t.width, S->t.height, &isd);
-            if (getenv("RECOMP_SURF_LOG") && (gs || (S->t.width <= 256 && S->t.height <= 256 && S->t.offset < 0x04000000u
+            if (surf_log && (gs || (S->t.width <= 256 && S->t.height <= 256 && S->t.offset < 0x04000000u
                                                      && gsurf_near(S->t.offset)))) {
                 static uint32_t seen[64]; static int ns; int q;
                 uint32_t key = S->t.offset ^ (s_tex_reg[k * 0x10 + 1] << 4);
@@ -2445,13 +2469,22 @@ static void gpu_bind_stages(void)
             }
             if (gs && !isd) gsurf_sync_from_mem(gs);
             if (gs) gsurf_resolve(gs);   /* (MSAA: the texture from its samples) */
+#if defined(__vita__)
+            TX_ADD(0, tsf);
+#endif
             if (gs) {
                 /* a surface bound as a target reads as zero, as in D3D */
                 tex[k] = (gs == g_cur_rt || gs == g_cur_ds) ? g_tex_black : gs->tex;
                 if (isd && tex[k] != g_tex_black) fl |= 8;
                 if (!S->normalized) { tail.sscale[k][0] = 1.0f / (float)gs->w; tail.sscale[k][1] = 1.0f / (float)gs->h; }
             } else {
+#if defined(__vita__)
+                TX_T0(tg);
                 tex[k] = gtex_get(&S->t);
+                TX_ADD(4, tg);
+#else
+                tex[k] = gtex_get(&S->t);
+#endif
             }
             if (!tex[k]) fl &= ~1;
             /* (a pack picture: always through its levels) */
@@ -3847,6 +3880,10 @@ static void vgl_perf_frame(void)
             if (r) fputs(r, stderr);
             else if (prof_alive && !prof_alive()) fprintf(stderr, "  [PROF] the sampler has not run\n");
         }
+        fprintf(stderr, "  [VGLPERF] textures per frame: %.0f binds; surfaces %.1f ms, GL textures %.1f ms of which decode cache %.1f ms "
+                "(checksums %.1f ms, %.0f of them)\n", g_tx_binds / f, g_tx_us[0] / 1000.0 / f, g_tx_us[4] / 1000.0 / f,
+                g_tx_us[1] / 1000.0 / f, g_tx_us[2] / 1000.0 / f, g_tx_sums / f);
+        memset(g_tx_us, 0, sizeof g_tx_us); g_tx_sums = g_tx_binds = 0;
         fprintf(stderr, "  [VGLPERF] per frame: %.0f draws (%.0f with the vertex program on the GPU), %.0f vertices transformed on the CPU, "
                 "%.1f texture uploads (%.0f KB); vertex programs compiled %u, failed %u\n",
                 g_vp_draws / f, g_vp_hw / f, g_vp_verts / f, g_vp_up / f, g_vp_upkb / f, g_hwvp_compiled, g_hwvp_failed);
