@@ -1773,7 +1773,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v45) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v46) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -2945,7 +2945,8 @@ static char *hwvp_translate_cg(HwVp *e)
     }
 
     hwvp_cat(&p, &cap, &len,
-        "uniform float4 vp;\n");
+        "uniform float4 vp;\n"
+        "uniform float4 vsw[4];\n");
     hwvp_cat(&p, &cap, &len, "uniform float4 c[%d]; // c_lo %d\n", s_hwvp_cg_n, s_hwvp_cg_lo);
     hwvp_cat(&p, &cap, &len, "float4 kc(float i) { return (i >= 0.0 && i < %d.0) ? c[(int)i] : float4(0.0, 0.0, 0.0, 1.0); }\n", s_hwvp_cg_n);
     hwvp_cat(&p, &cap, &len,
@@ -2965,6 +2966,10 @@ static char *hwvp_translate_cg(HwVp *e)
         "  float4 out v_t2 : TEXCOORD2, float4 out v_t3 : TEXCOORD3, float4 out v_d0 : TEXCOORD4,\n"
         "  float4 out v_d1 : TEXCOORD5, float4 out v_fog : TEXCOORD6) {\n"
         "  float a0 = 0.0; float4 m, l;\n");
+    /* (inputs straight from the guest's vertex buffers, gpu_batch_hw_direct:
+     * a D3DCOLOR's bytes are B,G,R,A -- vsw says which inputs to turn round) */
+    for (i = 0; i < e->nin; i++)
+        hwvp_cat(&p, &cap, &len, "  if (vsw[%u].%c > 0.5) vin%u = vin%u.zyxw;\n", i / 4, "xyzw"[i % 4], i, i);
     for (i = 0; i < 16; i++) hwvp_cat(&p, &cap, &len, "  float4 R%u = f4(0.0);\n", i);
     for (i = 0; i < 13; i++) hwvp_cat(&p, &cap, &len, "  float4 o%u = %s;\n", i, i == 3 ? "f4(1.0)" : "float4(0.0, 0.0, 0.0, 1.0)");
     for (k = 0; k < s_vpd_len; k++) {
@@ -3678,6 +3683,10 @@ static void hwvp_probe(HwVp *hv, GLuint game_prog, uint32_t nverts)
 #endif
 #if defined(__vita__)
 /* (the [VGLPERF] timers: vgl_perf_frame) */
+#define VP_TIMERS_FWD
+#endif
+#if defined(__vita__)
+/* (the [VGLPERF] timers: vgl_perf_frame) */
 #include <psp2/kernel/processmgr.h>
 enum { VP_BATCH, VP_TARGETS, VP_XFORM, VP_STAGES, VP_DRAW, VP_PRESENT, VP_IDX, VP_LOOKUP, VP_PROG, VP_STATE, VP_N };
 static uint64_t g_vp_us[VP_N];
@@ -3883,12 +3892,12 @@ static void vgl_perf_frame(void)
             if (r) fputs(r, stderr);
             else if (prof_alive && !prof_alive()) fprintf(stderr, "  [PROF] the sampler has not run\n");
         }
-        fprintf(stderr, "  [VGLPERF] more per frame: indices %.1f ms, program lookup %.1f ms, GL program %.1f ms, GL state %.1f ms\n",
-                g_vp_us[VP_IDX] / 1000.0 / f, g_vp_us[VP_LOOKUP] / 1000.0 / f, g_vp_us[VP_PROG] / 1000.0 / f, g_vp_us[VP_STATE] / 1000.0 / f);
+        fprintf(stderr, "  [VGLPERF] more per frame: %.0f draws straight from the guest's buffers; indices %.1f ms, program lookup %.1f ms, GL program %.1f ms, GL state %.1f ms\n",
+                g_vp_direct / f, g_vp_us[VP_IDX] / 1000.0 / f, g_vp_us[VP_LOOKUP] / 1000.0 / f, g_vp_us[VP_PROG] / 1000.0 / f, g_vp_us[VP_STATE] / 1000.0 / f);
         fprintf(stderr, "  [VGLPERF] textures per frame: %.0f binds; surfaces %.1f ms, GL textures %.1f ms of which decode cache %.1f ms "
                 "(checksums %.1f ms, %.0f of them)\n", g_tx_binds / f, g_tx_us[0] / 1000.0 / f, g_tx_us[4] / 1000.0 / f,
                 g_tx_us[1] / 1000.0 / f, g_tx_us[2] / 1000.0 / f, g_tx_sums / f);
-        memset(g_tx_us, 0, sizeof g_tx_us); g_tx_sums = g_tx_binds = 0;
+        memset(g_tx_us, 0, sizeof g_tx_us); g_tx_sums = g_tx_binds = 0; g_vp_direct = 0;
         fprintf(stderr, "  [VGLPERF] per frame: %.0f draws (%.0f with the vertex program on the GPU), %.0f vertices transformed on the CPU, "
                 "%.1f texture uploads (%.0f KB); vertex programs compiled %u, failed %u\n",
                 g_vp_draws / f, g_vp_hw / f, g_vp_verts / f, g_vp_up / f, g_vp_upkb / f, g_hwvp_compiled, g_hwvp_failed);
@@ -3897,6 +3906,118 @@ static void vgl_perf_frame(void)
     g_vp_draws = g_vp_verts = g_vp_up = g_vp_upkb = g_vp_hw = 0;
     n = 0; t0 = now;
 }
+
+#if defined(__vita__)
+/* (PS Vita) a draw whose vertex program runs on the GPU, its inputs read by
+ * the GPU straight from the guest's vertex buffers: no unpacking to floats on
+ * the CPU (hwvp_pack_range) and no remapping of every index to a slot
+ * (gpu_vertex_slot) -- the two were ~90 ms of the render thread's frame.
+ * The indices become a triangle list relative to the lowest one. A draw it
+ * cannot take (inline arrays, the packed CMP format, a buffer across two
+ * slices of the guest space, the capture on) returns 0 for the usual path.
+ * RECOMP_VGL_DIRECT=0 turns it off. */
+static uint16_t *g_didx;
+static uint32_t g_didx_cap;
+
+static int gpu_batch_hw_direct(HwVp *hv)
+{
+    static int on = -1;
+    uint32_t n = s_gpu.idx_count, i, lo = 0xFFFFFFFFu, hi = 0, nt = 0, k;
+    const uint32_t *ix = s_gpu.idx;
+    GLuint prog;
+    uint16_t *d;
+    if (on < 0) { const char *e = getenv("RECOMP_VGL_DIRECT"); on = !(e && e[0] == '0'); }
+    if (!on || s_gpu.inline_active || g_cap_on || n < 3) return 0;
+    for (k = 0; k < hv->nin; k++) {
+        const VertexAttr *at = &s_gpu.attr[hv->inreg[k]];
+        if (!at->size || !at->stride) continue;
+        if (!at->offset || at->type == 3 || at->type >= 6) return 0;
+    }
+    for (i = 0; i < n; i++) { uint32_t v = ix[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (hi - lo > 65535u) return 0;
+    for (k = 0; k < hv->nin; k++) {
+        const VertexAttr *at = &s_gpu.attr[hv->inreg[k]];
+        if (!at->size || !at->stride) continue;
+        if (((at->offset + lo * at->stride) >> 24) != ((at->offset + hi * at->stride + 15) >> 24)) return 0;
+    }
+    {
+        uint32_t need = n * 3 + 6;
+        if (need > g_didx_cap) {
+            uint16_t *nb = (uint16_t *)realloc(g_didx, need * 2);
+            if (!nb) return 0;
+            g_didx = nb; g_didx_cap = need;
+        }
+    }
+    d = g_didx;
+#define DT(a, b, c) (d[nt] = (uint16_t)((a) - lo), d[nt + 1] = (uint16_t)((b) - lo), d[nt + 2] = (uint16_t)((c) - lo), nt += 3)
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:      for (i = 0; i + 2 < n; i += 3) DT(ix[i], ix[i+1], ix[i+2]); break;
+    case NV_PRIM_TRIANGLE_STRIP: for (i = 0; i + 2 < n; i++) { if (i & 1) DT(ix[i+1], ix[i], ix[i+2]); else DT(ix[i], ix[i+1], ix[i+2]); } break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:        for (i = 1; i + 1 < n; i++) DT(ix[0], ix[i], ix[i+1]); break;
+    case NV_PRIM_QUADS:          for (i = 0; i + 3 < n; i += 4) { DT(ix[i], ix[i+1], ix[i+2]); DT(ix[i], ix[i+2], ix[i+3]); } break;
+    case NV_PRIM_QUAD_STRIP:     for (i = 0; i + 3 < n; i += 2) { DT(ix[i], ix[i+1], ix[i+3]); DT(ix[i], ix[i+3], ix[i+2]); } break;
+    default: return 0;
+    }
+#undef DT
+    if (!nt) return 1;
+    { VP_T0(t); gpu_bind_stages(); VP_ADD(VP_STAGES, t); }
+    { VP_T0(t); prog = gpu_program_for(hv->vs); VP_ADD(VP_PROG, t); }
+    if (!prog) return 0;
+    glBindVertexArray(g_vao_x);
+    g_sh.vao = 2;
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    {
+        float sw[16];
+        int changed = 0;
+        memset(sw, 0, sizeof sw);
+        for (k = 0; k < 16; k++) {
+            const VertexAttr *at;
+            GLenum ty; GLboolean nm; GLint sz;
+            if (k >= hv->nin) { glDisableVertexAttribArray(k); continue; }
+            at = &s_gpu.attr[hv->inreg[k]];
+            if (!at->size || !at->stride) {
+                glDisableVertexAttribArray(k);
+                glVertexAttrib4f(k, 0.0f, 0.0f, 0.0f, 1.0f);
+                continue;
+            }
+            sz = (GLint)(at->size > 4 ? 4 : at->size);
+            switch (at->type) {
+            case 0: ty = GL_UNSIGNED_BYTE; nm = GL_TRUE; sz = 4; sw[k] = 1.0f; break;   /* D3DCOLOR */
+            case 2: ty = GL_FLOAT; nm = GL_FALSE; break;
+            case 4: ty = GL_UNSIGNED_BYTE; nm = GL_TRUE; break;
+            case 1: ty = GL_SHORT; nm = GL_TRUE; break;
+            default: ty = GL_SHORT; nm = GL_FALSE; break;   /* 5: S32K */
+            }
+            glEnableVertexAttribArray(k);
+            glVertexAttribPointer(k, sz, ty, nm, (GLsizei)at->stride, XR_PTR(at->offset + lo * at->stride));
+        }
+        for (k = 0; k < 16; k++) if (g_vub[VB_VSC][4 + k / 4][k % 4] != sw[k]) { g_vub[VB_VSC][4 + k / 4][k % 4] = sw[k]; changed = 1; }
+        if (changed) g_vub_gen[VB_VSC]++;
+    }
+    if (!g_vpc_ok || memcmp(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow)) {
+        memcpy(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow);
+        g_vpc_ok = 1;
+        gpu_ub(UB_VPC, g_vpc_shadow, sizeof g_vpc_shadow);
+    }
+    {
+        VP_T0(t_st);
+        gpu_set_blend(0);
+        gpu_set_depth(g_cur_ds != NULL);
+        gpu_use(prog);
+        VP_ADD(VP_STATE, t_st);
+    }
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)nt, GL_UNSIGNED_SHORT, g_didx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
+    if (g_cur_ds) vgl_depth_keep();
+    g_vp_hw++; g_vp_direct++; g_cap_hw++;
+    s_gpu.tris_drawn += nt / 3;
+    s_gpu.drawn_offset = s_gpu.color_offset;
+    s_3d.verts += hi - lo + 1;
+    g_hwvp_stat_hw++;
+    return 1;
+}
+#endif
 static void gpu_batch_impl(void);
 static void gpu_batch(void)
 {
@@ -3960,6 +4081,13 @@ static void gpu_batch(void)
     g_gen++; if (!g_gen) g_gen = 1;
     g_nidx = 0;
 #if defined(__vita__)
+    if (s_3d.mode == 2 && s_vpd_len > 3) {
+        VP_T0(t_lk);
+        HwVp *hv = hwvp_lookup();
+        VP_ADD(VP_LOOKUP, t_lk);
+        g_frame_3d = 1;
+        if (hv && gpu_batch_hw_direct(hv)) return;
+    }
     VP_T0(t_idx);
 #endif
     switch (s_gpu.prim) {

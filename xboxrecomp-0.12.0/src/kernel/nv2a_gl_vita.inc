@@ -349,7 +349,7 @@ static void vgl_ub_set(int binding, const void *data, uint32_t bytes)
 /* the uniforms a program may have, and where their values come from */
 typedef struct { const char *name; uint8_t block, row; uint16_t n; } VUni;   /* (n: rows, 0 = 1) */
 static const VUni g_vuni[] = {
-    { "vp", VB_VSC, 0 }, { "clear_color", VB_CLC, 0 }, { "clc_f", VB_CLC, 0 }, { "post", VB_POST, 0 },
+    { "vp", VB_VSC, 0 }, { "vsw", VB_VSC, 4, 4 }, { "clear_color", VB_CLC, 0 }, { "clc_f", VB_CLC, 0 }, { "post", VB_POST, 0 },
     { "c0_0", VB_PSC, 5 }, { "c0_1", VB_PSC, 12 }, { "c0_2", VB_PSC, 19 }, { "c0_3", VB_PSC, 26 },
     { "c0_4", VB_PSC, 33 }, { "c0_5", VB_PSC, 40 }, { "c0_6", VB_PSC, 47 }, { "c0_7", VB_PSC, 54 },
     { "c1_0", VB_PSC, 6 }, { "c1_1", VB_PSC, 13 }, { "c1_2", VB_PSC, 20 }, { "c1_3", VB_PSC, 27 },
@@ -701,4 +701,5 @@ static void vgl_mem_report(const char *why);
 static void vgl_make_room(uint64_t need);
 static unsigned g_vp_draws, g_vp_verts, g_vp_up, g_vp_upkb, g_vp_hw;   /* ([VGLPERF] counters: nv2a_gl.inc) */
 static int g_cap_hw, g_cap_cpu;   /* (nv2a_gl.inc cap_save) */
+static unsigned g_vp_direct;      /* (nv2a_gl.inc gpu_batch_hw_direct) */
 static int g_cap_wait = -2, g_cap_on, g_cap_n, g_cap_mode;   /* (mode, for the GPU draws: 0 as they are, 1 depth func ALWAYS, 2 GEQUAL made LEQUAL, 3 depth cleared to 0 just before each) */
