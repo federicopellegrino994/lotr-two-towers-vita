@@ -1773,7 +1773,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v52) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v53) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3939,6 +3939,15 @@ static void cap_note_draw(const char *path, uint32_t hash, uint32_t nidx)
                 g_cap_ndraw, path, hash, nidx, s_gpu.prim, g_cur_rt ? g_cur_rt->base : 0, g_cur_rt ? g_cur_rt->w : 0, g_cur_rt ? g_cur_rt->h : 0,
                 g_cur_ds != NULL, (int)s_3d.depth_test, (unsigned)s_3d.depth_func, (int)s_3d.depth_mask, (int)s_gpu.blend_enable,
                 (int)s_3d.cull_enable, (int)s_3d.fog_enable, s_stage[0].enabled, s_stage[1].enabled, s_stage[2].enabled, s_stage[3].enabled);
+    if (g_cap_list && (s_gpu.blend_enable || !s_3d.depth_test)) {
+        int k;
+        fprintf(g_cap_list, "      blend %04X/%04X eq %04X color %08X mask %08X;", s_gpu.blend_sfactor & 0xFFFF, s_gpu.blend_dfactor & 0xFFFF,
+                s_3d.blend_eq & 0xFFFF, s_3d.blend_color, s_3d.color_mask);
+        for (k = 0; k < 4; k++) if (s_stage[k].enabled)
+            fprintf(g_cap_list, " stage %d tex %08X %ux%u fmt %08X mode %u%s;", k, s_stage[k].t.offset, s_stage[k].t.width, s_stage[k].t.height,
+                    s_stage[k].t.color, (unsigned)s_stage[k].mode, gsurf_find(s_stage[k].t.offset, 0) ? " (a render target)" : "");
+        fprintf(g_cap_list, "\n");
+    }
     g_cap_ndraw++;
     if (g_cur_rt && g_cur_rt->w >= 640 && g_cap_ndraw % 150 == 0) {
         char w[24];
@@ -4109,7 +4118,7 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 0; if (g_cap_wait <= 0) g_cap_wait = -3; }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 40; if (g_cap_wait <= 0) g_cap_wait = -3; }
 
         if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
