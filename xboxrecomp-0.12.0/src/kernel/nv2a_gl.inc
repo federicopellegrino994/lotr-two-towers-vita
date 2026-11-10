@@ -1773,7 +1773,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v49) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v50) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3768,7 +3768,7 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     if (g_cur_ds) vgl_depth_keep();
     if (!hv->dumped) hwvp_dump(hv, nverts);
     g_vp_hw++; g_cap_hw++;
-    if (g_cap_on) cap_note_draw("hw", hv->hash, g_nidx);
+    cap_note_draw("hw", hv->hash, g_nidx);
     s_gpu.tris_drawn += g_nidx / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
     s_3d.verts += nverts;
@@ -3915,8 +3915,10 @@ static void vgl_perf_frame(void)
  * the screen-sized target written out every 150 of its draws */
 static FILE *g_cap_list;
 static unsigned g_cap_ndraw;
+static unsigned g_cap_fdraws;   /* (draws this frame: the capture waits for a busy one, the level) */
 static void cap_note_draw(const char *path, uint32_t hash, uint32_t nidx)
 {
+    g_cap_fdraws++;
     if (!g_cap_on) return;
     if (!g_cap_list) g_cap_list = fopen("ux0:data/twotowers/cap/draws.txt", "w");
     if (g_cap_list)
@@ -3952,7 +3954,7 @@ static int gpu_batch_hw_direct(HwVp *hv)
     GLuint prog;
     uint16_t *d;
     if (on < 0) { const char *e = getenv("RECOMP_VGL_DIRECT"); on = !(e && e[0] == '0'); }
-    if (!on || s_gpu.inline_active || g_cap_on || n < 3) return 0;
+    if (!on || s_gpu.inline_active || n < 3) return 0;
     for (k = 0; k < hv->nin; k++) {
         const VertexAttr *at = &s_gpu.attr[hv->inreg[k]];
         if (!at->size || !at->stride) continue;
@@ -4036,7 +4038,7 @@ static int gpu_batch_hw_direct(HwVp *hv)
     { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)nt, GL_UNSIGNED_SHORT, g_didx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
     if (g_cur_ds) vgl_depth_keep();
     g_vp_hw++; g_vp_direct++; g_cap_hw++;
-    if (g_cap_on) cap_note_draw("direct", hv->hash, nt);
+    cap_note_draw("direct", hv->hash, nt);
     s_gpu.tris_drawn += nt / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
     s_3d.verts += hi - lo + 1;
@@ -4094,8 +4096,8 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 15; if (g_cap_wait <= 0) g_cap_wait = -3; }
-        if (g_cap_wait > 0 && s_3d.fog_enable && s_3d.mode == 2) g_cap_wait = -(g_cap_wait + 10);   /* (armed: counts down at the presents) */
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 5; if (g_cap_wait <= 0) g_cap_wait = -3; }
+
         if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
         if (!ok) return;
@@ -4229,7 +4231,7 @@ cpu_verts_ready:
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; g_cap_cpu++; }
         if (g_cur_ds) vgl_depth_keep();
-        if (g_cap_on) cap_note_draw("cpu", s_vpd_len ? 1 : 0, g_nidx);
+        cap_note_draw("cpu", s_vpd_len ? 1 : 0, g_nidx);
         if (0)
 #endif
         {
@@ -4657,6 +4659,8 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         if (g_cap_list) { fclose(g_cap_list); g_cap_list = NULL; }
         gpu_sh_reset();
     }
+    if (g_cap_wait > 0 && g_cap_fdraws > 1000) g_cap_wait = -(g_cap_wait + 10);   /* (armed by a frame of over 1000 draws: the level, not a cut-scene) */
+    g_cap_fdraws = 0;
     if (g_cap_wait < -10) { if (++g_cap_wait == -10) { g_cap_on = 1; g_cap_hw = g_cap_cpu = 0; fprintf(stderr, "  [CAP] capturing this frame\n"); } }
 #endif
     GSurf *s = gsurf_find(base, 0);
