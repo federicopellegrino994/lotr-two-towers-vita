@@ -405,3 +405,13 @@ sulla CPU (gpu_transform_all), come previsto.
   TPIDRURO + g_recomp_ctx_off (slot TLS 0x8C/0x8D). Il codice host continua a
   usare le vere variabili thread-local: vita_emutls.c mette la loro memoria
   dentro la stessa struct (xr_ctx_field), quindi vedono gli stessi registri.
+- v43–v46 (renderer): getenv per stadio, indice nella cache GL, checksum
+  delle texture (lineari una volta per frame, swizzled ogni 16 frame su 1024
+  punti, una sola traduzione d'indirizzo), vertici letti dalla GPU
+  direttamente dai buffer del gioco (gpu_batch_hw_direct, D3DCOLOR girato
+  nello shader con vsw). Frame da ~300 a ~180–280 ms; il collo di bottiglia
+  torna il codice del gioco.
+- v47 (codice generato): ogni funzione legge la struct dei registri una volta
+  sola (RECOMP_CTX_DECL -> _rctx, messo da postproc_prof.py in testa a ogni
+  funzione); MEM8/16/32 come puntatori volatile semplici (prima packed
+  volatile: accessi byte per byte), MEMF/MEMD/SMEM64 packed non volatile.
