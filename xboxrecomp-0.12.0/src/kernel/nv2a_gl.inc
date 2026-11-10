@@ -1773,7 +1773,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v50) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v51) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -4096,7 +4096,7 @@ static void gpu_batch(void)
         VP_T0(t);
         GSurf *was = g_cur_rt;
         int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 5; if (g_cap_wait <= 0) g_cap_wait = -3; }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 40; if (g_cap_wait <= 0) g_cap_wait = -3; }
 
         if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
@@ -4659,7 +4659,7 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         if (g_cap_list) { fclose(g_cap_list); g_cap_list = NULL; }
         gpu_sh_reset();
     }
-    if (g_cap_wait > 0 && g_cap_fdraws > 1000) g_cap_wait = -(g_cap_wait + 10);   /* (armed by a frame of over 1000 draws: the level, not a cut-scene) */
+    if (g_cap_wait > 0 && g_cap_fdraws > 1000 && --g_cap_wait == 0) g_cap_wait = -11;   /* (the n-th frame of over 1000 draws: the battle, not the cut-scene) */
     g_cap_fdraws = 0;
     if (g_cap_wait < -10) { if (++g_cap_wait == -10) { g_cap_on = 1; g_cap_hw = g_cap_cpu = 0; fprintf(stderr, "  [CAP] capturing this frame\n"); } }
 #endif
