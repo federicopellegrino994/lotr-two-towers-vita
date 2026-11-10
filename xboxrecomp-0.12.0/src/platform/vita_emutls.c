@@ -133,7 +133,7 @@ void *__emutls_get_address(struct __emutls_object *obj)
 #include "recomp_fastregs.h"
 #include <stddef.h>
 #define XR_CTX_SLOT 0x8C
-uint32_t g_recomp_ctx_off = 0x7FFFFFF0u;   /* (until the first thread sets it: the check word never matches) */
+uint32_t g_recomp_ctx_off = 0;   /* (until the first thread sets it: reads the thread's own TLS words, whose check word does not match) */
 #define XR_EV(n) extern struct __emutls_object xr_ev_##n __asm__("__emutls_v." #n);
 XR_EV(g_eax) XR_EV(g_ecx) XR_EV(g_edx) XR_EV(g_esp) XR_EV(g_ebx) XR_EV(g_esi) XR_EV(g_edi) XR_EV(g_ebp)
 XR_EV(g_seh_ebp) XR_EV(g_fs_base) XR_EV(g_df) XR_EV(g_fp_top) XR_EV(g_fp_cmp) XR_EV(g_fp_control_word)
