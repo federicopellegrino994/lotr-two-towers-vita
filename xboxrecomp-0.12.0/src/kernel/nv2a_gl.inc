@@ -432,19 +432,74 @@ static struct {
 } g_sh;
 static void gpu_sh_reset(void) { memset(&g_sh, 0, sizeof g_sh); }
 
+#if defined(__vita__)
+static void zrec_bound(GLuint fbo);
+#endif
 static void gpu_set_fbo(GLuint fbo)
 {
     if (!g_sh.tg || g_sh.fbo != fbo) {
         glBindFramebuffer(GL_FRAMEBUFFER, fbo); g_sh.fbo = fbo; g_sh.tg = 1;
 #if defined(__vita__)
         if (g_vgl_flip) g_sh.sc_ok = 0;   /* (a flipped scissor depends on the target's height) */
+        zrec_bound(fbo);
 #endif
     }
 }
 
 /* Framebuffer objects, one per (colour, depth) texture pair. */
 #define FBO_MAX 64
-static struct { GLuint col, dep, fbo; uint64_t used; } g_fbo[FBO_MAX];
+static struct { GLuint col, dep, fbo; uint64_t used; uint32_t zseen, sseen; } g_fbo[FBO_MAX];
+#if defined(__vita__)
+/* (PS Vita) vitaGL's renderbuffers hold no storage: every framebuffer makes
+ * its own depth buffer, so a zeta surface shared by two colour targets (the
+ * game's two screen buffers) is two depth buffers here. A clear made on one
+ * is carried to the others when they are next bound (gpu_set_fbo): each
+ * zeta keeps its last depth and stencil clears with a generation, each
+ * framebuffer the generations it has seen. */
+static struct { GLuint dep; uint32_t zgen, sgen; float z; int st; } g_zrec[16];
+static int zrec_find(GLuint dep)
+{
+    int i, v = -1;
+    for (i = 0; i < 16; i++) if (g_zrec[i].dep == dep) return i;
+    for (i = 0; i < 16; i++) if (!g_zrec[i].dep) { v = i; break; }
+    if (v < 0) v = (int)(dep % 16);
+    memset(&g_zrec[v], 0, sizeof g_zrec[v]);
+    g_zrec[v].dep = dep; g_zrec[v].zgen = g_zrec[v].sgen = 1;
+    return v;
+}
+static int fbo_find(GLuint fbo)
+{
+    int i;
+    for (i = 0; i < FBO_MAX; i++) if (g_fbo[i].fbo == fbo && fbo) return i;
+    return -1;
+}
+static unsigned g_zprop_n;
+static void vgl_zclear_quad(int which, float z, int stencil);
+static void gpu_sh_reset(void);
+static void zrec_cleared(GLuint fbo, int which, float z, int st)
+{
+    int f = fbo_find(fbo), r;
+    if (f < 0 || !g_fbo[f].dep) return;
+    r = zrec_find(g_fbo[f].dep);
+    if (which & 1) { g_zrec[r].zgen++; g_zrec[r].z = z; g_fbo[f].zseen = g_zrec[r].zgen; }
+    if (which & 2) { g_zrec[r].sgen++; g_zrec[r].st = st; g_fbo[f].sseen = g_zrec[r].sgen; }
+}
+static void zrec_bound(GLuint fbo)
+{
+    int f = fbo_find(fbo), r, which = 0;
+    if (f < 0 || !g_fbo[f].dep) return;
+    r = zrec_find(g_fbo[f].dep);
+    if (g_fbo[f].zseen != g_zrec[r].zgen) which |= 1;
+    if (g_fbo[f].sseen != g_zrec[r].sgen) which |= 2;
+    g_fbo[f].zseen = g_zrec[r].zgen; g_fbo[f].sseen = g_zrec[r].sgen;
+    if (!which || (g_zrec[r].zgen == 1 && g_zrec[r].sgen == 1)) return;   /* (never cleared yet) */
+    if (g_zprop_n++ < 5) fprintf(stderr, "  [VGL] zeta clear carried to framebuffer %u (depth %d stencil %d)\n", fbo, which & 1, (which >> 1) & 1);
+    glDisable(GL_SCISSOR_TEST);
+    vgl_zclear_quad(which, g_zrec[r].z, g_zrec[r].st);
+    gpu_sh_reset();
+    g_sh.fbo = fbo; g_sh.tg = 1;
+}
+#endif
 static GLuint gpu_fbo(GLuint col, GLuint dep)
 {
     int i, v = -1;
@@ -460,10 +515,11 @@ static GLuint gpu_fbo(GLuint col, GLuint dep)
     if (g_fbo[v].fbo) { glDeleteFramebuffers(1, &g_fbo[v].fbo); g_fbo[v].fbo = 0; }
 #endif
     if (!g_fbo[v].fbo) glGenFramebuffers(1, &g_fbo[v].fbo);
+    g_fbo[v].zseen = g_fbo[v].sseen = 0;
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo[v].fbo);
 #if defined(__vita__)
     if (col) glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, col, 0);
-    if (dep) { glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, dep); vgl_depth_keep(); }
+    if (dep) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, dep);
     vfb_note(g_fbo[v].fbo, col ? vtx_h(col) : vtx_h(dep | 0x80000000u));
 #else
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, col, 0);
@@ -745,8 +801,10 @@ static void gpu_clear_ds(GLuint fbo, int which, float z, int stencil)
         glDisable(GL_SCISSOR_TEST);
         vgl_zclear_quad(which, z, stencil);
         gpu_sh_reset();
+        zrec_cleared(fbo, which, z, stencil);
         return;
     }
+    zrec_cleared(fbo, which, z, stencil);
 #endif
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glDisable(GL_SCISSOR_TEST);
@@ -1697,7 +1755,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v34) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v35) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -3642,6 +3700,7 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     if (g_cap_on && g_cap_mode == 2 && s_3d.depth_test) { glDepthFunc(GL_LEQUAL); g_sh.ds_ok = 0; }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
+    if (g_cur_ds) vgl_depth_keep();
     if (!hv->dumped) hwvp_dump(hv, nverts);
     g_vp_hw++; g_cap_hw++;
     s_gpu.tris_drawn += g_nidx / 3;
@@ -3931,6 +3990,7 @@ cpu_verts_ready:
         gpu_use(prog);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; g_cap_cpu++; }
+        if (g_cur_ds) vgl_depth_keep();
         if (0)
 #endif
         {

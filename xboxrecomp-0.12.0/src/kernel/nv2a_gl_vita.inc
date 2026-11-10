@@ -281,11 +281,18 @@ static int g_zkeep = -1;
 static unsigned g_zkeep_n;
 static void vgl_depth_keep(void)
 {
+    /* (called after a draw with a zeta: vitaGL makes a framebuffer's depth
+     * surface at its first draw) */
+    static void *done[64];
+    static int nd;
     SceGxmDepthStencilSurface *ds;
+    int i;
     if (g_zkeep < 0) { const char *e = getenv("RECOMP_VGL_ZKEEP"); g_zkeep = !(e && e[0] == '0'); }
     if (!g_zkeep || !active_write_fb) return;
     ds = *(SceGxmDepthStencilSurface **)((uint8_t *)active_write_fb + 76);
-    if (!ds) { if (g_zkeep_n++ < 3) fprintf(stderr, "  [VGL] zeta keep: no depth surface yet\n"); return; }
+    if (!ds) return;
+    for (i = 0; i < nd; i++) if (done[i] == ds) return;
+    if (nd < 64) done[nd++] = ds; else { memmove(done, done + 1, sizeof done - sizeof done[0]); done[63] = ds; }
     sceGxmDepthStencilSurfaceSetForceLoadMode(ds, SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED);
     sceGxmDepthStencilSurfaceSetForceStoreMode(ds, SCE_GXM_DEPTH_STENCIL_FORCE_STORE_ENABLED);
     if (g_zkeep_n++ < 3) fprintf(stderr, "  [VGL] zeta keep: depth surface %p load/store forced\n", (void *)ds);

@@ -372,3 +372,13 @@ sulla CPU (gpu_transform_all), come previsto.
 - v34: vgl_depth_keep() forza load/store sulla superficie di profondità di
   ogni framebuffer con zeta (puntatore a active_write_fb+76, come
   vglTexImageDepthBuffer). RECOMP_VGL_ZKEEP=0 lo spegne. Catture spente.
+- v34 senza effetto: il puntatore alla superficie di profondità è nullo
+  quando si attacca il renderbuffer. Smontando vitaGL: i renderbuffer di
+  vitaGL non hanno memoria, ogni framebuffer si crea la SUA profondità al
+  primo draw (fb+76: una SceGxmDepthStencilSurface). Una zeta condivisa dal
+  gioco tra i due buffer dello schermo qui sono due profondità diverse: il
+  clear fatto su uno non arriva all'altro.
+- v35: g_zrec (per zeta: ultima profondità/stencil azzerati, con
+  generazione) e zseen/sseen per framebuffer; gpu_set_fbo porta il clear
+  mancante al framebuffer appena legato (quadrato, zrec_bound). Il
+  load/store forzato si fa dopo il primo draw (vgl_depth_keep).
