@@ -2756,7 +2756,12 @@ void sub_000DFFA0(void)
 static int tt_ga_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("TT_GPU_AHEAD"); on = e && *e == '1'; }   /* (v160: off -- v159's log: the game was a frame ahead already, never began one with the GPU in the last; its waits were for the one before, as stock) */
+    /* (v160: off -- v159's log: the game was a frame ahead already, never began one with the GPU in the last; its waits
+     * were for the one before, as stock). (v234: on again -- with the GL worker (v231) the render thread runs the next
+     * frame's start callback right after the last one's end, before the game looks: the game then waited for a frame
+     * end it had not sent yet, until the 2-second watchdog ([GPUWAIT] "the frame wait had lost its signal", 10-26 times
+     * in each v231-v233 log, 2-12 s each). Counted here, it goes on. TT_GPU_AHEAD=0: the stock wait. */
+    if (on < 0) { const char *e = getenv("TT_GPU_AHEAD"); on = !(e && *e == '0'); }
     return on;
 }
 #ifdef TT_PGO_GEN
