@@ -2258,7 +2258,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v230) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v231) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -5329,7 +5329,7 @@ static void dz_draw(uint32_t nt, uint32_t top)
 {
     const uint16_t *ci = ix_find(g_didx, nt);
     if (ci) {
-        g_ix_obj[0] = (uint32_t)(uintptr_t)ci;
+        { extern void glt_store32(volatile uint32_t *, uint32_t); glt_store32(&g_ix_obj[0], (uint32_t)(uintptr_t)ci); }   /* (v231: read by vitaGL at the draw, on the GL worker) */
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)(uintptr_t)g_ix_obj);
         vgl_draw_range(GL_TRIANGLES, top, (GLsizei)nt, NULL);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -5349,9 +5349,18 @@ static int dz_place(uint32_t hi)
     len = end - g_dz.start;
     if (len <= (1u << 20) && (g_dz.start >> 24) == ((end - 1) >> 24)) {   /* (v216) the static vertex cache */
         uint8_t *c = vc_find(g_dz.start, len);
-        if (c) { g_dz_obj[0] = (uint32_t)(uintptr_t)c; g_dz_draws++; g_dz_old += old; return 1; }
+        if (c) { extern void glt_store32(volatile uint32_t *, uint32_t); glt_store32(&g_dz_obj[0], (uint32_t)(uintptr_t)c); g_dz_draws++; g_dz_old += old; return 1; }
         g_vc_miss++;
         VWHERE("direct: the vertices copied");
+    }
+    {   /* (v231) with the GL worker (vgl_glt.c): the span copied into the queue here, into vitaGL's pool there */
+        extern int glt_active(void);
+        extern void glt_dz_copy(volatile uint32_t *, const void *, uint32_t, uint32_t);
+        if (glt_active() && len <= (1u << 20) && (g_dz.start >> 24) == ((end - 1) >> 24)) {
+            glt_dz_copy(&g_dz_obj[0], XR_PTR(g_dz.start), len, g_dz.start & 15u);
+            g_dz_draws++; g_dz_bytes += len; g_dz_old += old;
+            return 1;
+        }
     }
     p = (len <= (1u << 20) && (g_dz.start >> 24) == ((end - 1) >> 24)) ? (uint8_t *)vgl_reserve_data_pool(len + 32) : NULL;
     if (!p) {   /* the attributes back to client arrays, as before */
@@ -5898,6 +5907,17 @@ static void gpu_batch(void)
     }
 #endif
 #if defined(__vita__)
+    {   /* (v231) the lights' pass (v125, TT_LIGHTS=1 to draw it) dropped here, before the targets, the raster state and
+         * the program are set up for it: ~100 of Helm's Deep's draws a frame went through all of that only to be
+         * dropped in gpu_batch_hw_direct. Only the added-on draws (ONE/ONE) look the program up a second time. */
+        static int lights = -1;
+        if (lights < 0) { const char *e = getenv("TT_LIGHTS"); lights = e && e[0] == '1'; }
+        if (!lights && !g_cap_on && !s_gpu.inline_active && s_3d.mode == 2 && s_vpd_len > 3 && s_gpu.blend_enable
+            && (s_gpu.blend_sfactor & 0xFFFF) == 1 && (s_gpu.blend_dfactor & 0xFFFF) == 1) {
+            HwVp *hl = hwvp_lookup();
+            if (hl && hl->hash == 0x453E894Bu) { g_lite_skipped[2]++; jn_flush(); return; }
+        }
+    }
     {
         VP_T0(t);
         GSurf *was = (VWHERE("batch: targets"), g_cur_rt);
@@ -6741,6 +6761,11 @@ static void gpu_present(uint32_t base, uint32_t pitch)
     g_cap_last = g_cap_fdraws;
     g_cap_fdraws = 0;
     if (g_cap_wait < -10) { if (++g_cap_wait == -10) { g_cap_on = 1; g_cap_marked = 0; g_cap_hw = g_cap_cpu = 0; fprintf(stderr, "  [CAP] capturing this frame\n"); } }
+    {   /* (v231) the GL worker thread (vgl_glt.c): started after the first frames; everything on this thread while a
+         * capture is made (it reads vitaGL's state) */
+        extern void glt_present_hook(int direct);
+        glt_present_hook(g_cap_on || g_cap_screen || g_cap_wait < -3);
+    }
 #endif
     GSurf *s = gsurf_find(base, 0);
     int wide;

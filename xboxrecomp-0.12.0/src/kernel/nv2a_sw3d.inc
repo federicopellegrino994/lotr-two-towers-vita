@@ -821,7 +821,16 @@ static uint32_t texc_epoch(const Texture *t)
     if (!tex_size_from_format(t->color) && !per_kick) {
         static int old = -1;
         if (old < 0) old = getenv("RECOMP_TEX_LINEAR_ONCE") != NULL;
-        if (!old) return s_texc_vframe | 0x10000000u;
+        if (!old) {
+            /* (v231) a linear texture the CPU has not been seen rewriting: every 4th frame shown, in turns by address
+             * (1-2 a frame were summed in Helm's Deep, ~2 ms of the render thread: 1 MB read 64 bytes apart). One
+             * the CPU rewrites (s_tex_dyn: changed twice -- a film in software, a picture redrawn) every frame as
+             * before. TT_TEXLIN_EVERY=1: every frame. */
+            static int every = -1;
+            if (every < 0) { const char *e = getenv("TT_TEXLIN_EVERY"); every = e && e[0] == '1'; }
+            if (every || s_tex_dyn[(t->offset >> 12) & 16383u]) return s_texc_vframe | 0x10000000u;
+            return ((s_texc_vframe + ((t->offset >> 12) & 3u)) >> 2) | 0x18000000u;
+        }
     }
     if (!(tex_size_from_format(t->color) && s_texc_frame && !per_kick)) return per_kick ? g_pb_runs : (s_texc_frame | 0x20000000u);
 #else

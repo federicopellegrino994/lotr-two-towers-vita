@@ -42,9 +42,16 @@ extern const char g_vw_method[], g_vw_block[];
 extern volatile uint32_t g_rt_meth;
 #define RT_N 512
 static uint32_t s_rkey[RT_N], s_rcnt[RT_N];
+static void rt_count_key(const char *w);
+extern volatile const char *g_glt_where;
+extern volatile int g_glt_on;
 static void rt_count(void)
 {
-    const char *w = (const char *)g_vgl_where;
+    rt_count_key((const char *)g_vgl_where);
+    if (g_glt_on && g_glt_where) rt_count_key((const char *)g_glt_where);   /* (v231: the GL worker's zone, "glt: ...") */
+}
+static void rt_count_key(const char *w)
+{
     uint32_t key = (uint32_t)(uintptr_t)w, h, i;
     /* (v111) methods as small keys: the Vita's strings are above 0x80000000,
      * and the old 0x80000000/0xC0000000 tags took every zone for a method */

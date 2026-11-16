@@ -3,6 +3,7 @@ add_library(xbox_video STATIC
     video_player.c
     video_pump.c
     fb_present.c
+    vgl_glt.c
     gfx_menu.c
     host_text.c
 )

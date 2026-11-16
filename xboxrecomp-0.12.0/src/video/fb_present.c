@@ -1154,8 +1154,10 @@ extern void xbox_UnpinServiceThread(void);
 #include <psp2/kernel/sysmem.h>
 /* (v183) [RTPROF] zones inside vitaGL (see the wraps below) */
 extern volatile const char *g_vgl_where;
-#define VZ_IN(name) volatile const char *_vzw = g_vgl_where; g_vgl_where = (name)
-#define VZ_OUT() (g_vgl_where = _vzw)
+/* (v231) on the GL worker thread (vgl_glt.c) its own zone, not the render thread's */
+extern volatile const char **glt_where_ptr(void);
+#define VZ_IN(name) volatile const char **_vzp = glt_where_ptr(); volatile const char *_vzw = *_vzp; *_vzp = (name)
+#define VZ_OUT() (*_vzp = _vzw)
 
 /* (v79) vitaGL copies every draw's uniforms (vertex and fragment) into ONE
  * circular pool of a fixed 2 MB (gxm_utils.o: vglSetupUniformCircularPool,

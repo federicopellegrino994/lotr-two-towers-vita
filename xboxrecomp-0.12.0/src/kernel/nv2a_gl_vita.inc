@@ -349,7 +349,15 @@ static void vprog_forget(GLuint p);
 extern void *active_write_fb;
 static int g_zkeep = -1;
 static unsigned g_zkeep_n;
+static void vgl_depth_keep_impl(void);
+/* (v231) vitaGL's framebuffer state read: on the GL worker (vgl_glt.c), in order */
+static void vgl_depth_keep_b(const void *d, uint32_t n) { (void)d; (void)n; vgl_depth_keep_impl(); }
 static void vgl_depth_keep(void)
+{
+    extern void glt_call(void (*)(const void *, uint32_t), const void *, uint32_t);
+    glt_call(vgl_depth_keep_b, NULL, 0);
+}
+static void vgl_depth_keep_impl(void)
 {
     /* (called after a draw with a zeta: vitaGL makes a framebuffer's depth
      * surface at its first draw) */
@@ -979,10 +987,8 @@ static void vgl_va_pointer_inplace(GLuint i, GLint size, GLenum type, GLboolean 
     void *was;
     g_va_calls++;
     if (a && a->p_ok && a->size == size && a->type == type && a->norm == norm && a->stride == stride && a->ptr == ptr && a->buf == 0xFFFFFFFEu) { g_va_skipped++; return; }
-    was = vertex_array_unit;
-    vertex_array_unit = g_ip_obj;
-    (glVertexAttribPointer)(i, size, type, norm, stride, ptr);
-    vertex_array_unit = was;
+    (void)was;
+    { extern void glt_va_pointer_unit(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *, void *); glt_va_pointer_unit(i, size, type, norm, stride, ptr, g_ip_obj); }   /* (v231: on the GL worker, in order) */
     if (a) { a->p_ok = 1; a->size = size; a->type = type; a->norm = norm; a->stride = stride; a->ptr = ptr; a->buf = 0xFFFFFFFEu; }
 }
 /* (v170) THE VERTICES COPIED ONCE. For a client array vitaGL copies, for
@@ -1009,10 +1015,8 @@ static void vgl_va_pointer_dz(GLuint i, GLint size, GLenum type, GLboolean norm,
     void *was;
     g_va_calls++;
     if (a && a->p_ok && a->size == size && a->type == type && a->norm == norm && a->stride == stride && a->ptr == ptr && a->buf == 0xFFFFFFFDu) { g_va_skipped++; return; }
-    was = vertex_array_unit;
-    vertex_array_unit = g_dz_obj;
-    (glVertexAttribPointer)(i, size, type, norm, stride, ptr);
-    vertex_array_unit = was;
+    (void)was;
+    { extern void glt_va_pointer_unit(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *, void *); glt_va_pointer_unit(i, size, type, norm, stride, ptr, g_dz_obj); }   /* (v231: on the GL worker, in order) */
     if (a) { a->p_ok = 1; a->size = size; a->type = type; a->norm = norm; a->stride = stride; a->ptr = ptr; a->buf = 0xFFFFFFFDu; }
 }
 /* one past the highest attribute that may be enabled in the bound vertex array */
