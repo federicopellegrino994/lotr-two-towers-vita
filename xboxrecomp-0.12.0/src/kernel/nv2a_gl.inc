@@ -26,6 +26,8 @@
 #include <SDL.h>
 #if defined(__vita__)
 #include "nv2a_gl_vita.inc"
+#include <arm_neon.h>   /* (v159: the index range) */
+#include <psp2/kernel/clib.h>   /* (v216: the vertex cache heap) */
 #else
 #include <SDL_opengl.h>
 #endif
@@ -274,6 +276,30 @@ static int gl_max_tex(void)
     if (!m) { glGetIntegerv(GL_MAX_TEXTURE_SIZE, &m); if (m < 2048) m = 16384; }
     return (int)m;
 }
+#if defined(__vita__)
+/* (v146) The internal resolution on the Vita: in the open levels the GPU is
+ * the limit (the render thread waits inside vitaGL's draws, the game waits
+ * for the frame to be done -- a third of its time), and every 640x480 target
+ * drawn at 0.75 is 480x360: 44% fewer pixels. Shown stretched as before.
+ * TT_RES=0.5..1 (1: the full 640x480). */
+static float vita_res_scale(void)
+{
+    static float f = -1.0f;
+    if (f < 0.0f) {
+        const char *e = getenv("TT_RES");
+        f = e ? (float)atof(e) : 0.85f;   /* (v147: 0.85 -- 544x408; v146 had 0.75) */
+        if (!e) { extern float xbox_GfxAspect(void); if (xbox_GfxAspect() > 1.34f) f = 0.75f; }   /* (v203: 16:9 at about the pixel count of 544x408; v204: 0.75 -- 640x360, whole numbers: at 0.74 (631.5 x 355.2) the last row and column showed stray dots) */
+        if (!(f >= 0.5f)) f = 0.5f;
+        if (f > 1.0f) f = 1.0f;
+        { extern float xbox_GfxAspect(void); fprintf(stderr, "  [GL] internal resolution %.0f x %.0f (TT_RES %.2f)\n", 640.0f * f * (xbox_GfxAspect() > 1.34f ? xbox_GfxAspect() / (4.0f / 3.0f) : 1.0f), 480.0f * f, f); }
+    }
+    {   /* (v161) the dynamic resolution's step down, when it has taken one (vgl_dynres) */
+        extern float g_vgl_dynres;
+        if (g_vgl_dynres > 0.0f && g_vgl_dynres < f) return g_vgl_dynres;
+    }
+    return f;
+}
+#endif
 static void rs_fit(void)
 {
     float mx = (float)gl_max_tex(), k = 1.0f;
@@ -333,7 +359,7 @@ static void gpu_filter_opts(void)
         if (g_aniso < 1) g_aniso = 1;
         if (g_aniso > 16) g_aniso = 16;
 #if defined(__vita__)
-        g_mips = m && m[0] == '1';
+        g_mips = !(m && m[0] == '0');   /* (v198: on -- without them every far surface read its texture at full size, and the GPU was pixel-bound at 544x408; RECOMP_MIPMAPS=0 off) */
 #else
         g_mips = !(m && m[0] == '0');
 #endif
@@ -473,8 +499,35 @@ static int fbo_find(GLuint fbo)
     for (i = 0; i < FBO_MAX; i++) if (g_fbo[i].fbo == fbo && fbo) return i;
     return -1;
 }
+#if defined(__vita__)
+/* (v65 diagnostics) the flight recorder: the last 4 frames' draws, clears and
+ * depth clears in a small ring; a presented frame much darker than the ones
+ * before it (the world gone for a frame, the "black flashes") writes them out
+ * to ux0:data/twotowers/cap/flash_N.txt with the frame, up to 3 times */
+volatile const char *g_vgl_where = "starting";   /* (v66: for the hang report; v71: the render thread's sampled zones, prof_vita.c) */
+const char g_vw_method[] = "method", g_vw_block[] = "method block";
+volatile uint32_t g_rt_meth;
+#ifndef VWHERE
+#define VWHERE(x) (g_vgl_where = (x))
+#endif
+typedef struct { uint32_t kind, a, b, c, d, e; } FrRec;
+#define FR_N 2560
+static FrRec g_fr[4][FR_N];
+static uint32_t g_fr_n[4], g_fr_cur;
+static float g_fr_mean[4];
+static void fr_add(uint32_t kind, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    uint32_t i = g_fr_n[g_fr_cur];
+    if (i >= FR_N) return;
+    g_fr[g_fr_cur][i].kind = kind; g_fr[g_fr_cur][i].a = a; g_fr[g_fr_cur][i].b = b;
+    g_fr[g_fr_cur][i].c = c; g_fr[g_fr_cur][i].d = d; g_fr[g_fr_cur][i].e = e;
+    g_fr_n[g_fr_cur] = i + 1;
+}
+static GLint g_fr_vp[4];
+#endif
 static unsigned g_zprop_n;
 static void vgl_zclear_quad(int which, float z, int stencil);
+static void vgl_zc_viewport(GLuint fbo);
 static void gpu_sh_reset(void);
 static void zrec_cleared(GLuint fbo, int which, float z, int st)
 {
@@ -493,8 +546,10 @@ static void zrec_bound(GLuint fbo)
     if (g_fbo[f].sseen != g_zrec[r].sgen) which |= 2;
     g_fbo[f].zseen = g_zrec[r].zgen; g_fbo[f].sseen = g_zrec[r].sgen;
     if (!which || (g_zrec[r].zgen == 1 && g_zrec[r].sgen == 1)) return;   /* (never cleared yet) */
+    fr_add(4, fbo, (uint32_t)which, (uint32_t)(g_zrec[r].z * 1e6f), (uint32_t)g_zrec[r].st, 0);
     if (g_zprop_n++ < 5) fprintf(stderr, "  [VGL] zeta clear carried to framebuffer %u (depth %d stencil %d)\n", fbo, which & 1, (which >> 1) & 1);
     glDisable(GL_SCISSOR_TEST);
+    vgl_zc_viewport(fbo);
     vgl_zclear_quad(which, g_zrec[r].z, g_zrec[r].st);
     gpu_sh_reset();
     g_sh.fbo = fbo; g_sh.tg = 1;
@@ -686,8 +741,10 @@ static void gpu_copy_scaled(GLuint src, uint32_t uw, uint32_t uh, uint32_t sw, u
     gpu_sh_reset();
 }
 
+static unsigned g_gsurf_gen = 1;   /* (v74: a surface made, changed or let go -- gpu_bind_targets' last answer is old) */
 static void gsurf_free(GSurf *s)
 {
+    g_gsurf_gen++;
     if (s->mrb) { gpu_fbo_ms_forget(s->mrb); glDeleteRenderbuffers(1, &s->mrb); }
 #if defined(__vita__)
     if (s->tex) { gpu_fbo_forget(s->tex); if (s->is_depth) glDeleteRenderbuffers(1, &s->tex); else glDeleteTextures(1, &s->tex); }
@@ -760,8 +817,33 @@ static void vgl_zclear_prog(void)
     glAttachShader(g_zc_prog, vs); glAttachShader(g_zc_prog, fs);
     glLinkProgram(g_zc_prog);
 }
+/* (v65) the clear quad over the whole framebuffer: it was drawn through
+ * whatever viewport was set last -- a depth clear carried to the other
+ * colour buffer just after the 256x256 shadow targets (zrec_bound) cleared
+ * only that corner, and the rest of the screen kept the depth of an earlier
+ * frame: the world missing in patches, or in whole frames */
+static void vgl_zc_viewport(GLuint fbo)
+{
+    int f = fbo_find(fbo), i;
+    if (f < 0) return;
+    for (i = 0; i < GSURF_MAX; i++)
+        if (g_surf[i].tex && g_surf[i].tex == g_fbo[f].col) {
+            glViewport(0, 0, (GLsizei)g_surf[i].pw, (GLsizei)g_surf[i].ph);
+            g_sh.vp_ok = 0;
+            fr_add(5, fbo, g_surf[i].base, g_surf[i].pw, g_surf[i].ph, 0);
+            return;
+        }
+    for (i = 0; i < GSURF_MAX; i++)   /* (a depth-only framebuffer: its zeta's size) */
+        if (g_surf[i].tex && g_surf[i].tex == g_fbo[f].dep) {
+            glViewport(0, 0, (GLsizei)g_surf[i].pw, (GLsizei)g_surf[i].ph);
+            g_sh.vp_ok = 0;
+            return;
+        }
+}
 static void vgl_zclear_quad(int which, float z, int stencil)
 {
+    glGetIntegerv(GL_VIEWPORT, g_fr_vp);
+    fr_add(3, (uint32_t)which, (uint32_t)(z * 1e6f), (uint32_t)stencil, (uint32_t)g_fr_vp[2], (uint32_t)g_fr_vp[3]);
     static float q[6][4];
     static const float xy[6][2] = { {-1, -1}, {1, -1}, {1, 1}, {-1, -1}, {1, 1}, {-1, 1} };
     float zn = 2.0f * z - 1.0f;
@@ -780,7 +862,55 @@ static void vgl_zclear_quad(int which, float z, int stencil)
         glStencilOpSeparate(GL_FRONT_AND_BACK, GL_REPLACE, GL_REPLACE, GL_REPLACE);
         glStencilMask(0xFF);
     } else glDisable(GL_STENCIL_TEST);
+    /* (vitaGL applies the colour mask only with blending on: without this
+     * the quad wrote its 0,0,0,0 over the colour -- the battle's scene wiped
+     * by the stencil clear before its shadows, the v55 capture) */
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ZERO, GL_ONE);
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
     glUseProgram(g_zc_prog);
+    glBindVertexArray(g_vao_x);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    for (i = 0; i < 16; i++) {
+        if (!i) { glEnableVertexAttribArray(0); glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, q); }
+        else glDisableVertexAttribArray(i);
+    }
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+}
+/* (PS Vita) colour cleared with a channel mask: vitaGL's glClear ignores
+ * glColorMask, so the battle's alpha-only clear before its shadows (alpha to
+ * 0, the shadows MAX into it, then a full-screen quad darkens by it) wiped
+ * the whole scene to black -- the v55 capture, draw 640 to 660. A quad of the
+ * clear colour, blending ONE/ZERO so that the mask applies. */
+static GLuint g_cc_prog;
+static GLint g_cc_loc = -1;
+static void vgl_cclear_quad(float r, float g, float b, float a, int mr, int mg, int mb, int ma)
+{
+    static float q[6][4];
+    static const float xy[6][2] = { {-1, -1}, {1, -1}, {1, 1}, {-1, -1}, {1, 1}, {-1, 1} };
+    int i;
+    if (!g_cc_prog) {
+        static const char vs_src[] = "void main(float4 vin0, float4 out gl_Position : POSITION) { gl_Position = vin0; }\n";
+        static const char fs_src[] = "uniform float4 ccol;\nfloat4 main() : COLOR { return ccol; }\n";
+        const char *pa = vs_src, *pb = fs_src;
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER), fs = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(vs, 1, &pa, NULL); glCompileShader(vs);
+        glShaderSource(fs, 1, &pb, NULL); glCompileShader(fs);
+        g_cc_prog = glCreateProgram();
+        glAttachShader(g_cc_prog, vs); glAttachShader(g_cc_prog, fs);
+        glLinkProgram(g_cc_prog);
+        g_cc_loc = glGetUniformLocation(g_cc_prog, "ccol");
+    }
+    for (i = 0; i < 6; i++) { q[i][0] = xy[i][0]; q[i][1] = xy[i][1]; q[i][2] = 0.0f; q[i][3] = 1.0f; }
+    glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
+    glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    glColorMask(mr, mg, mb, ma);
+    glUseProgram(g_cc_prog);
+    glUniform4f(g_cc_loc, r, g, b, a);
     glBindVertexArray(g_vao_x);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     for (i = 0; i < 16; i++) {
@@ -799,6 +929,7 @@ static void gpu_clear_ds(GLuint fbo, int which, float z, int stencil)
     if (g_zc_mode) {
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glDisable(GL_SCISSOR_TEST);
+        vgl_zc_viewport(fbo);
         vgl_zclear_quad(which, z, stencil);
         gpu_sh_reset();
         zrec_cleared(fbo, which, z, stencil);
@@ -891,6 +1022,7 @@ static GSurf *gsurf_get(uint32_t base, uint32_t w, uint32_t h, int depth)
         if (!victim || (!c->tex && victim->tex) || (c->tex && victim->tex && c->used < victim->used)) victim = c;
     }
     if (s && s->w >= w && s->h >= h) { s->used = ++g_clock; return s; }
+    g_gsurf_gen++;
     if (s) {
         if (w < s->w) w = s->w;
         if (h < s->h) h = s->h;
@@ -1001,14 +1133,25 @@ typedef struct {
     GLuint tex;
     int levels;
     uint64_t used;
+    uint32_t seen_frame, seen_hash;   /* (PS Vita: checked already this frame) */
+    int opaque;                       /* (v206) every texel's alpha 255 */
 } GTex;
+static int g_gtex_opaque;             /* (v206) of the texture gtex_get just gave */
+static int g_ab2_ph;                  /* (v206 [AB2]: 1 = the alpha test kept everywhere, as before v206) */
+static unsigned g_ab2_drop, g_ab2_keep;
 #define FHASH_MAX 512
 static uint32_t g_fhash[2][FHASH_MAX];
 static int g_fhash_n[2], g_fhash_cur;
+/* (v111) the frame's texture set through a small hash (the list was scanned
+ * on every bind, up to 512 entries) */
+static uint32_t g_fh_set[2048], g_fh_gen[2048], g_fh_cur_gen = 1;
 static void fhash_note(uint32_t h)
 {
-    int c = g_fhash_cur, i, n = g_fhash_n[c];
-    for (i = 0; i < n; i++) if (g_fhash[c][i] == h) return;
+    int c = g_fhash_cur, n = g_fhash_n[c];
+    uint32_t k = (h * 2654435761u) >> 21, q;
+    for (q = 0; q < 2048 && g_fh_gen[k] == g_fh_cur_gen; q++, k = (k + 1) & 2047u)
+        if (g_fh_set[k] == h) return;
+    if (q < 2048) { g_fh_gen[k] = g_fh_cur_gen; g_fh_set[k] = h; }
     if (n < FHASH_MAX) { g_fhash[c][n] = h; g_fhash_n[c] = n + 1; }
 }
 int xbox_FrameTextureList(uint32_t *out, int max)
@@ -1143,6 +1286,12 @@ static GLuint ultra_gpu_get(int idx)
     return 0;
 }
 
+#if defined(__vita__)
+static uint16_t *g_gtex_fidx;
+static void cap_note_text(const char *fmt, ...);
+static char g_cap_dir[64] = "ux0:data/twotowers/cap/0";
+static int g_cap_idx;
+#endif
 static GLuint gtex_get(const Texture *t)
 {
     uint32_t ver = 0;
@@ -1150,12 +1299,108 @@ static GLuint gtex_get(const Texture *t)
     GTex *e = NULL, *victim = NULL;
     int i;
     s_ultra_used = 0;
+    g_gtex_opaque = 0;
 #if defined(__vita__)
-    { TX_T0(tc); argb = texc_get_ver(t, &ver); TX_ADD(1, tc); }
+    {   /* (v139) a film picture from the video decoder (hwmovie.c): drawn
+         * straight from the decoder's NV12 frame -- a vitaGL YUV texture whose
+         * memory is pointed at that frame, the GPU's texture unit turns it to
+         * RGB. No decode, no copy, no upload. TT_HWMOVIE_YUV=0: as RGBA. */
+        extern volatile uint32_t g_hwm_tex_addr[2]; extern void *volatile g_hwm_frame; extern volatile uint32_t g_hwm_fw, g_hwm_fh;
+        extern void *volatile g_hwm_rgba; extern volatile uint32_t g_hwm_rgba_w, g_hwm_rgba_h;
+        uint32_t o = t->offset & 0x03FFFFFFu;
+        void *fr = g_hwm_frame, *rg = g_hwm_rgba;
+        (void)rg;
+        {   /* (v141) the film's two RGBA textures: made here (their memory given to
+             * hwmovie.c, which converts each picture into the one not shown) */
+            extern void *volatile g_hwm_texmem[2]; extern volatile uint32_t g_hwm_texmem_w, g_hwm_texmem_h, g_hwm_texmem_stride;
+            extern volatile uint32_t g_hwm_req_w, g_hwm_req_h; extern volatile int g_hwm_show;
+            static GLuint ftex[2]; static uint32_t fw_, fh_;
+            uint32_t rw = g_hwm_req_w, rh = g_hwm_req_h;
+            if (rw && rh && (fw_ != rw || fh_ != rh)) {
+                int b2;
+                g_hwm_texmem[0] = g_hwm_texmem[1] = NULL;
+                if (!ftex[0]) glGenTextures(2, ftex);
+                glActiveTexture(GL_TEXTURE0);
+                void *zero = calloc((size_t)rw * rh, 4);   /* (real data: a texture made from NULL may not count as filled in vitaGL) */
+                for (b2 = 0; b2 < 2; b2++) {
+                    glBindTexture(GL_TEXTURE_2D, ftex[b2]);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)rw, (GLsizei)rh, 0, GL_RGBA, GL_UNSIGNED_BYTE, zero);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                }
+                {
+                    void *m0, *m1;
+                    glBindTexture(GL_TEXTURE_2D, ftex[0]); m0 = vglGetTexDataPointer(GL_TEXTURE_2D);
+                    glBindTexture(GL_TEXTURE_2D, ftex[1]); m1 = vglGetTexDataPointer(GL_TEXTURE_2D);
+                    g_hwm_texmem_stride = (rw + 7u) & ~7u;   /* (vitaGL's linear textures: rows of a multiple of 8 texels) */
+                    g_hwm_texmem_w = rw; g_hwm_texmem_h = rh;
+                    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                    g_hwm_texmem[0] = m0; g_hwm_texmem[1] = m1;
+                    fprintf(stderr, "  [HWMOVIE] film textures %u, %u (%ux%u) at %p, %p\n", ftex[0], ftex[1], rw, rh, m0, m1);
+                }
+                free(zero);
+                fw_ = rw; fh_ = rh;
+                g_sh.tex_ok = 0;
+            }
+            if (g_hwm_req_w && g_hwm_show >= 0 && g_hwm_texmem[0]
+                && ((g_hwm_tex_addr[0] && o == g_hwm_tex_addr[0]) || (g_hwm_tex_addr[1] && o == g_hwm_tex_addr[1])))
+                return ftex[g_hwm_show & 1];
+        }
+        if (fr && ((g_hwm_tex_addr[0] && o == g_hwm_tex_addr[0]) || (g_hwm_tex_addr[1] && o == g_hwm_tex_addr[1]))) {
+            static GLuint ytex; static uint32_t yw, yh; static void *yptr;
+            uint32_t w = g_hwm_fw, h = g_hwm_fh;
+            glActiveTexture(GL_TEXTURE0);
+            if (!ytex || yw != w || yh != h) {
+                if (!ytex) glGenTextures(1, &ytex);
+                glBindTexture(GL_TEXTURE_2D, ytex);
+                glTexImage2D(GL_TEXTURE_2D, 0, VGL_YUV420P_NV12_BT601, (GLsizei)w, (GLsizei)h, 0, VGL_YUV420P_NV12_BT601, GL_UNSIGNED_BYTE, NULL);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                yw = w; yh = h; yptr = NULL;
+                fprintf(stderr, "  [HWMOVIE] the film drawn from the decoder's frames (%ux%u NV12 texture %u)\n", w, h, ytex);
+            }
+            if (yptr != fr) { glBindTexture(GL_TEXTURE_2D, ytex); vglOverloadTexDataPointer(GL_TEXTURE_2D, fr); yptr = fr; }
+            g_sh.tex_ok = 0;
+            return ytex;
+        }
+    }
+    {   /* (v68) a texture already checked this frame: no second look at its
+         * memory -- the decode cache's lookup cost ~10 us a bind, 1400 binds
+         * a frame (16-23 ms of the render thread) */
+        static uint16_t fidx[4096];
+        uint32_t hk = ((t->offset >> 6) ^ (t->offset >> 17) ^ (t->color * 0x9E37u) ^ (t->width << 3) ^ (t->height << 7)) & 4095u;
+        int q = (int)fidx[hk] - 1;
+        if (q >= 0 && q < GTEX_MAX) {
+            GTex *c = &g_tex[q];
+            if (c->tex && c->seen_frame == g_present_n + 1 && c->off == t->offset && c->color == t->color
+                && c->w == t->width && c->h == t->height && c->pitch == t->pitch && g_ultra_on != 1 && !g_cap_on) {
+                fhash_note(c->seen_hash);
+                c->used = ++g_clock;
+                g_tq_n[0]++;
+                g_gtex_opaque = c->opaque;
+                return c->tex;
+            }
+        }
+        g_gtex_fidx = &fidx[hk];
+        g_tq_n[1]++;
+        if (q >= 0 && q < GTEX_MAX && g_tex[q].tex && g_tex[q].seen_frame == g_present_n + 1) g_tq_n[2]++;   /* (its slot held another texture of this frame) */
+    }
+    VWHERE("tex: decode cache");   /* (v112: finer zones in the texture lookup) */
+    { TX_T0(tc); s_texc_drop_ok = !g_cap_on; argb = texc_get_ver(t, &ver); s_texc_drop_ok = 0; TX_ADD(1, tc); }
+    VWHERE("tex: GL texture slot");
 #else
     argb = texc_get_ver(t, &ver);
 #endif
     if (!argb) return 0;
+#if defined(__vita__)
+    if (g_cap_on && argb != s_texc_dropped_px) {   /* (the capture: what the texture holds) */
+        uint32_t i, n = t->width * t->height, st = n > 4096 ? n / 4096 : 1, k = 0;
+        uint64_t sr = 0, sa = 0;
+        for (i = 0; i < n; i += st, k++) { uint32_t c = argb[i]; sr += ((c >> 16) & 255) + ((c >> 8) & 255) + (c & 255); sa += c >> 24; }
+        cap_note_text("TEX %08X %ux%u fmt %08X pitch %u: mean rgb %.0f alpha %.0f (ver %u)", t->offset, t->width, t->height, t->color, t->pitch,
+                      k ? (double)sr / (3.0 * k) : 0.0, k ? (double)sa / k : 0.0, ver);
+    }
+#endif
     fhash_note(s_texc_last_hash);
     if (s_texc_last_uidx >= 0 && g_ultra_on == 1 && ultra_sky_check(s_texc_last_uidx, t, s_3d.depth_test, s_3d.depth_mask)) {   /* Ultra textures: the pack's picture, once it is read */
         GLuint hd = ultra_gpu_get(s_texc_last_uidx);
@@ -1172,6 +1417,7 @@ static GLuint gtex_get(const Texture *t)
                 && c->pitch == t->pitch) e = c;
         }
         if (!e) {
+            g_tq_n[4]++;
             for (i = 0; i < GTEX_MAX; i++) {
                 GTex *c = &g_tex[i];
                 if (c->tex && c->off == t->offset && c->color == t->color && c->w == t->width && c->h == t->height
@@ -1216,7 +1462,15 @@ static GLuint gtex_get(const Texture *t)
         e->ver = ver - 1;
         g_sh.tex_ok = 0;
     }
+#if defined(__vita__)
+    if (e->ver != ver && argb == s_texc_dropped_px) {
+        /* (its copy was let go: decoded again for the upload) */
+        argb = texc_get_ver(t, &ver);
+        if (!argb) return e->tex;
+    }
+#endif
     if (e->ver != ver) {
+        VWHERE("tex: upload");
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, e->tex);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
@@ -1229,8 +1483,23 @@ static GLuint gtex_get(const Texture *t)
         if (e->levels > 1) glGenerateMipmap(GL_TEXTURE_2D);
         e->ver = ver;
         g_sh.tex_ok = 0;
+#if defined(__vita__)
+        {   /* (v206) no texel see-through at all? (the alpha test of a draw that only reads such textures cannot fail) */
+            const uint32_t n = t->width * t->height;
+            uint32_t q, a = 0xFF000000u;
+            for (q = 0; q < n; q++) a &= argb[q];
+            e->opaque = (a >> 24) == 0xFF;
+        }
+#endif
     }
     e->used = ++g_clock;
+    g_gtex_opaque = e->opaque;
+#if defined(__vita__)
+    VWHERE("tex: after");
+    if (argb != s_texc_dropped_px) texc_drop_last();   /* (on the GPU now: the copy let go) */
+    e->seen_frame = g_present_n + 1; e->seen_hash = s_texc_last_hash;
+    if (g_gtex_fidx) { *g_gtex_fidx = (uint16_t)(e - g_tex + 1); g_gtex_fidx = NULL; }
+#endif
     return e->tex;
 }
 
@@ -1239,6 +1508,15 @@ static GLuint gtex_get(const Texture *t)
 typedef struct { uint64_t key; GLuint obj; } GSmp;
 #define GSMP_MAX 128
 static GSmp g_smp_c[GSMP_MAX];
+#if defined(__vita__)
+static int g_vita_mip_sample = 1;
+
+/* (v198) between two levels the nearest one, not both blended: one texture read a pixel (TT_TRILINEAR=1: both) */
+static GLenum vita_mipf(void) { static int t = -1; if (t < 0) { const char *e = getenv("TT_TRILINEAR"); t = e && e[0] == '1'; } return t ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_NEAREST; }
+#define VITA_MIPF vita_mipf()
+#else
+#define VITA_MIPF GL_LINEAR_MIPMAP_LINEAR
+#endif
 static GLuint gpu_sampler_ex(uint32_t au, uint32_t av, int linear, int mip)
 {
     uint64_t k;
@@ -1246,6 +1524,9 @@ static GLuint gpu_sampler_ex(uint32_t au, uint32_t av, int linear, int mip)
     GLuint s = 0;
     gpu_filter_opts();
     if (!g_mips) mip = 0;
+#if defined(__vita__)
+    if (!g_vita_mip_sample) mip = 0;   /* (v198 [AB]: the mip levels there but not read) */
+#endif
     k = ((uint64_t)au << 16) | ((uint64_t)av << 8) | (uint64_t)linear | ((uint64_t)mip << 32) | (1ull << 40);
     for (i = 0; i < GSMP_MAX && g_smp_c[i].obj; i++)
         if (g_smp_c[i].key == k) return g_smp_c[i].obj;
@@ -1259,7 +1540,7 @@ static GLuint gpu_sampler_ex(uint32_t au, uint32_t av, int linear, int mip)
                                          : a[j] == 4 ? GL_CLAMP_TO_BORDER : GL_CLAMP_TO_EDGE);
         glSamplerParameteri(s, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
         glSamplerParameteri(s, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        glSamplerParameteri(s, GL_TEXTURE_MIN_FILTER, linear ? (mip ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR)
+        glSamplerParameteri(s, GL_TEXTURE_MIN_FILTER, linear ? (mip ? VITA_MIPF : GL_LINEAR)
                                                               : (mip ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST));
         glSamplerParameterf(s, GL_TEXTURE_MIN_LOD, 0.0f);
         glSamplerParameterf(s, GL_TEXTURE_MAX_LOD, mip ? 1000.0f : 0.0f);
@@ -1551,12 +1832,19 @@ static const char s_glsl_ps_tri[] =
 
 /* A shader object from sources (concatenated after an optional #define
  * line), compiled; 0 on failure (logged). Waits for the result. */
+static unsigned g_mg_n[4];            /* (v116: joinable draws, gpu_batch_hw_direct) */
+static unsigned g_jn_joined, g_jn_runs;   /* (v117: draws joined) */
+static unsigned g_shc_n; static uint64_t g_shc_us;   /* (v116: shader compiles and their time) */
 static GLuint gpu_shader_now(GLenum type, const char *const *src, int n, const char *what)
 {
     GLuint s = glCreateShader(type);
     GLint ok = 0;
     glShaderSource(s, n, src, NULL);
+#if defined(__vita__)
+    { SceUInt64 t0 = sceKernelGetProcessTimeWide(); glCompileShader(s); g_shc_us += sceKernelGetProcessTimeWide() - t0; g_shc_n++; }
+#else
     glCompileShader(s);
+#endif
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) {
         char log[2048];
@@ -1655,6 +1943,9 @@ static GPair *g_pair;
 static int g_pair_n;
 static uint32_t g_pair_hash_tab[8192];          /* index + 1, open addressing */
 
+#if defined(__vita__)
+static void shc_save(GLuint prog, GLuint vs, GLuint fs);
+#endif
 static int gpu_pair_ready(GPair *e)
 {
     GLint ok = 0;
@@ -1679,6 +1970,9 @@ static int gpu_pair_ready(GPair *e)
     }
     gpu_prog_bindings(e->prog);
     e->state = 1;
+#if defined(__vita__)
+    shc_save(e->prog, e->vs, e->fs);
+#endif
     return 1;
 }
 
@@ -1708,19 +2002,210 @@ static GLuint gpu_pair(GLuint vs, GLuint fs)
     return 0;
 }
 
+#if defined(__vita__)
+/* (v117) THE SHADERS KEPT ON THE CARD. vitaGL's shader cache is for its own
+ * fixed-function shaders: ours were compiled again on every run, 250-475 ms
+ * each (v116 log) -- the game standing still when a level first shows a
+ * material. Now the compiled shader (vitaGL's glGetProgramBinary holds the
+ * two of a linked program, each as glShaderBinary takes it: count, parameter
+ * indices, the GXP) is written to shader_cache/s_<hash of the source>.bin
+ * and read from there the next time. RECOMP_VGL_SHC=0: off. */
+#define SHC_MAX 2048
+static struct { GLuint id; uint64_t h; uint8_t cached, saved; } g_shc[SHC_MAX];
+static int g_shc_cnt, g_shc_mode = -1;
+static unsigned g_shc_hit, g_shc_written;
+static int shc_on(void)
+{
+    if (g_shc_mode < 0) { const char *e = getenv("RECOMP_VGL_SHC"); g_shc_mode = !(e && e[0] == '0'); }
+    return g_shc_mode;
+}
+static uint64_t shc_hash(GLenum type, const char *src)
+{
+    uint64_t h = 1469598103934665603ull ^ (uint64_t)type ^ 0x7631ull;
+    for (; *src; src++) { h ^= (uint8_t)*src; h *= 1099511628211ull; }
+    return h;
+}
+static void shc_path(char *o, size_t n, uint64_t h, const char *ext)
+{
+    const char *d = getenv("XBOXRECOMP_VITA_DIR");
+    if (!d || !*d) d = "ux0:data/twotowers";
+    snprintf(o, n, "%s/shader_cache/t_%08x%08x.%s", d, (unsigned)(h >> 32), (unsigned)h, ext);   /* (v118: t_, the format with the uniform blocks) */
+}
+static int shc_find(GLuint id)
+{
+    int i;
+    for (i = g_shc_cnt - 1; i >= 0; i--) if (g_shc[i].id == id) return i;
+    return -1;
+}
+static void shc_note(GLuint id, uint64_t h, int cached)
+{
+    int i = shc_find(id);
+    if (i < 0) { if (g_shc_cnt >= SHC_MAX) return; i = g_shc_cnt++; }
+    g_shc[i].id = id; g_shc[i].h = h; g_shc[i].cached = (uint8_t)cached; g_shc[i].saved = (uint8_t)cached;
+}
+/* (v118) THE UNIFORM BLOCKS. vitaGL's serialized shader leaves out the list
+ * glCompileShader makes of a shader's uniform blocks (shader + 816: nodes of
+ * name[128], buffer index, next) -- ours all have blocks (the vertex
+ * constants), and a shader read back had whatever was in that field: the
+ * v117 crash in malloc at the first draw of the second run. The list is
+ * kept in the file too (after the header) and put back after
+ * glShaderBinary. vitaGL's shader table is not exported: it is found from
+ * is_shark_online, 0x67004 before it in the same object's data (checked at
+ * each use: the entry must be a shader of the type asked for). */
+#define SHC_MAGIC 0x32535454u   /* "TTS2" */
+typedef struct { char name[128]; uint8_t idx; uint8_t pad[3]; void *next; } VglUBlock;
+static uint8_t *shc_struct(GLuint id, GLenum type)
+{
+    extern uint8_t is_shark_online;
+    extern void *vglMalloc(uint32_t size);
+    uint8_t **tab = (uint8_t **)((uintptr_t)&is_shark_online + 0x67004u);
+    uint8_t *sp;
+    uint32_t ty;
+    (void)vglMalloc;
+    if (!id || id > 2048) return NULL;
+    sp = tab[id - 1];
+    if ((uintptr_t)sp < 0x81000000u) return NULL;
+    memcpy(&ty, sp, 4);
+    return ty == (uint32_t)type ? sp : NULL;
+}
+/* a serialized shader that looks right: count, indices, "GXP" */
+static int shc_valid(const uint8_t *b, size_t len)
+{
+    uint32_t cnt; size_t off;
+    if (len < 16) return 0;
+    memcpy(&cnt, b, 4);
+    if (cnt > 1024) return 0;
+    off = 4 + (size_t)cnt * 4;
+    if (off + 8 > len) return 0;
+    return b[off] == 'G' && b[off + 1] == 'X' && b[off + 2] == 'P' && b[off + 3] == 0;
+}
+static GLuint shc_load(GLenum type, uint64_t h)
+{
+    char path[320];
+    FILE *f;
+    long len;
+    uint8_t *b;
+    GLuint s = 0;
+    shc_path(path, sizeof path, h, "bin");
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); len = ftell(f); fseek(f, 0, SEEK_SET);
+    if (len < 16 || len > 512 * 1024) { fclose(f); return 0; }
+    b = (uint8_t *)malloc((size_t)len);
+    if (b && fread(b, 1, (size_t)len, f) == (size_t)len) {
+        uint32_t magic, nblk;
+        memcpy(&magic, b, 4); memcpy(&nblk, b + 4, 4);
+        if (magic == SHC_MAGIC && nblk <= 16 && (size_t)8 + (size_t)nblk * 132 + 16 <= (size_t)len
+            && shc_valid(b + 8 + nblk * 132, (size_t)len - 8 - nblk * 132)) {
+            s = glCreateShader(type);
+            if (s) {
+                uint8_t *sp = shc_struct(s, type);
+                if (!sp) { glDeleteShader(s); s = 0; }
+                else {
+                    extern void *vglMalloc(uint32_t size);
+                    void *head = NULL;
+                    int q;
+                    glShaderBinary(1, &s, 0, b + 8 + nblk * 132, (GLsizei)((size_t)len - 8 - nblk * 132));
+                    for (q = (int)nblk - 1; q >= 0; q--) {   /* (the file has them head first) */
+                        VglUBlock *nb = (VglUBlock *)vglMalloc(sizeof *nb);
+                        if (!nb) break;
+                        memset(nb, 0, sizeof *nb);
+                        memcpy(nb->name, b + 8 + q * 132, 127);
+                        nb->idx = b[8 + q * 132 + 128];
+                        nb->next = head; head = nb;
+                    }
+                    memcpy(sp + 816, &head, 4);
+                    shc_note(s, h, 1); g_shc_hit++;
+                }
+            }
+        }
+    }
+    free(b);
+    fclose(f);
+    return s;
+}
+static void shc_write(GLuint id, GLenum type, uint64_t h, const uint8_t *b, size_t len)
+{
+    char path[320], tmp[320];
+    FILE *f;
+    uint8_t hdr[8 + 16 * 132];
+    uint32_t nblk = 0, magic = SHC_MAGIC;
+    uint8_t *sp = shc_struct(id, type);
+    VglUBlock *ub;
+    if (!sp || !shc_valid(b, len)) return;
+    memcpy(&ub, sp + 816, 4);
+    memset(hdr, 0, sizeof hdr);
+    for (; ub; ub = (VglUBlock *)ub->next) {
+        if (nblk >= 16 || (uintptr_t)ub < 0x81000000u) return;   /* (not a list we know: not kept) */
+        memcpy(hdr + 8 + nblk * 132, ub->name, 127);
+        hdr[8 + nblk * 132 + 128] = ub->idx;
+        nblk++;
+    }
+    memcpy(hdr, &magic, 4); memcpy(hdr + 4, &nblk, 4);
+    shc_path(path, sizeof path, h, "bin");
+    shc_path(tmp, sizeof tmp, h, "tmp");
+    f = fopen(tmp, "wb");
+    if (!f) return;
+    if (fwrite(hdr, 1, 8 + nblk * 132, f) != 8 + nblk * 132 || fwrite(b, 1, len, f) != len) { fclose(f); remove(tmp); return; }
+    fclose(f);
+    remove(path);
+    if (rename(tmp, path) == 0) g_shc_written++;
+}
+/* a program linked: its two shaders to the card, if they are not there */
+static void shc_save(GLuint prog, GLuint vs, GLuint fs)
+{
+    static uint8_t *buf;
+    enum { CAP = 512 * 1024 };
+    int iv, ifs;
+    GLsizei len = 0;
+    GLenum fmt = 0;
+    uint32_t vsz, fsz;
+    if (!shc_on()) return;
+    iv = shc_find(vs); ifs = shc_find(fs);
+    if ((iv < 0 || g_shc[iv].saved) && (ifs < 0 || g_shc[ifs].saved)) return;
+    if (!buf) buf = (uint8_t *)malloc(CAP);
+    if (!buf) return;
+    glGetProgramBinary(prog, CAP, &len, &fmt, buf);
+    if (len < 148 || len > CAP) return;
+    memcpy(&vsz, buf + 132, 4);
+    if ((size_t)136 + vsz + 4 > (size_t)len) return;
+    memcpy(&fsz, buf + 136 + vsz, 4);
+    if ((size_t)136 + vsz + 4 + fsz > (size_t)len) return;
+    if (iv >= 0 && !g_shc[iv].saved) { shc_write(vs, GL_VERTEX_SHADER, g_shc[iv].h, buf + 136, vsz); g_shc[iv].saved = 1; }
+    if (ifs >= 0 && !g_shc[ifs].saved) { shc_write(fs, GL_FRAGMENT_SHADER, g_shc[ifs].h, buf + 136 + vsz + 4, fsz); g_shc[ifs].saved = 1; }
+}
+#endif
+
 /* A shader object compiled (asynchronously where the driver can); state
  * read later with gpu_shader_done. */
 static GLuint gpu_shader_start(GLenum type, const char *src)
 {
+#if defined(__vita__)
+    uint64_t shh = 0;
+    if (shc_on()) {
+        GLuint c;
+        shh = shc_hash(type, src);
+        c = shc_load(type, shh);
+        if (c) { vgl_shader_note_src(c, src); return c; }
+    }
+#endif
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, NULL);
+#if defined(__vita__)
+    { SceUInt64 t0 = sceKernelGetProcessTimeWide(); glCompileShader(s); g_shc_us += sceKernelGetProcessTimeWide() - t0; g_shc_n++; }
+    if (shc_on()) shc_note(s, shh, 0);
+#else
     glCompileShader(s);
+#endif
     return s;
 }
 /* 1 compiled, 0 still compiling, -1 failed (the object is deleted) */
 static int gpu_shader_done(GLuint *s, const char *what, uint32_t id)
 {
     GLint ok = 0;
+#if defined(__vita__)
+    { int ci = shc_find(*s); if (ci >= 0 && g_shc[ci].cached) return 1; }   /* (v117: read from the card) */
+#endif
     if (g_parallel) {
         GLint done = 0;
         glGetShaderiv(*s, GL_COMPLETION_STATUS_KHR, &done);
@@ -1773,7 +2258,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v55) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v230) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -1860,12 +2345,23 @@ static int gpu_init(void)
         if (g_msaa > 1) fprintf(stderr, "  [GL] MSAA %dx\n", g_msaa);
         g_rsf = rs ? (float)atof(rs) : 1.0f;
         if (!(g_rsf >= 1.0f)) g_rsf = 1.0f;
+#if defined(__vita__)
+        g_rsf = vita_res_scale();
+#endif
         if (g_rsf > 12.0f) g_rsf = 12.0f;
         g_rs = (int)g_rsf;
         {
             const char *as = getenv("RECOMP_ASPECT");
             float a = as ? (float)atof(as) : 0.0f;
             if (a > 1.34f && a < 6.0f) g_aspect = a;
+#if defined(__vita__)
+            {   /* (v199) TT_WIDE=1: the picture's shape from the start -- the settings pass that reads it never runs on the Vita (v198: the game's cameras widened, the picture not) */
+                float w = xbox_GfxAspect();
+                if (w > 1.34f && w < 6.0f) g_aspect = w;   /* (v201: whatever RECOMP_ASPECT says -- the title always sets it from the ini, "4:3", and v200 stayed 4:3) */
+                fprintf(stderr, "  [GL] picture %.3f:1\n", g_aspect);
+                { extern char s_envlog[] __attribute__((weak)); fprintf(stderr, "  [ENV] env.txt:%s\n", s_envlog && s_envlog[0] ? s_envlog : " none read"); }
+            }
+#endif
         }
         g_rsx = g_rsf * (g_aspect / (4.0f / 3.0f));
         g_rsy = g_rsf;
@@ -1881,16 +2377,34 @@ static int gpu_init(void)
     g_post[0] = xbox_GfxGetF(GFX_BRIGHT); g_post[1] = xbox_GfxGetF(GFX_SHARP); g_post[2] = xbox_GfxGetF(GFX_COLOR);
     if (g_post[0] < 0.5f) g_post[0] = 1.0f;
     if (g_post[2] <= 0.0f) g_post[2] = 1.0f;
+#if defined(__vita__)
+    {   /* (v167) the present sharpens by default on the Vita (the 85% picture stretched to the screen looked soft):
+         * TT_SHARP=0..2 (0 off; default 0.8) */
+        const char *e = getenv("TT_SHARP");
+        if (e) g_post[1] = (float)atof(e); else if (g_post[1] <= 0.0f) g_post[1] = 0.8f;
+        if (g_post[1] < 0.0f) g_post[1] = 0.0f;
+        if (g_post[1] > 2.0f) g_post[1] = 2.0f;
+    }
+#endif
     g_present_smp = gpu_sampler(3, 3, 1);
     g_copy_smp = g_present_smp;
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     gpu_sh_reset();
 #if defined(__vita__)
-    vgl_surface_test();
-    gpu_sh_reset();
-    vgl_uniform_test();
-    gpu_sh_reset();
+    /* (v75) the start-up tests only with RECOMP_VGL_TESTS=1: they always
+     * gave the same answers (surfaces as OpenGL, the uniforms right), and
+     * v74 once stuck in the first one's clear, waiting on the GPU */
+    {
+        { extern int g_vgl_timers; const char *t = getenv("RECOMP_VGL_TIMERS"); g_vgl_timers = t && t[0] == '1'; }
+        const char *e = getenv("RECOMP_VGL_TESTS");
+        if (e && e[0] == '1') {
+            vgl_surface_test();
+            gpu_sh_reset();
+            vgl_uniform_test();
+            gpu_sh_reset();
+        } else g_vgl_flip = 0;
+    }
 #endif
     fprintf(stderr, "  [GL] renderer up\n");
     fflush(stderr);
@@ -2210,9 +2724,17 @@ static void gpu_set_blend(int write_mask_only_clear)
         glBlendEquationSeparate(eq, eq);
         glBlendColor(bf[0], bf[1], bf[2], bf[3]);
     } else {
-        glDisable(GL_BLEND);
 #if defined(__vita__)
+        /* (vitaGL applies the colour mask only with blending on: a masked
+         * draw without blending gets ONE/ZERO blending, which is the same) */
+        if (!(wr && wg && wb && wa)) {
+            glEnable(GL_BLEND);
+            glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
+            glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        } else glDisable(GL_BLEND);
         { GLenum s2 = GL_ONE, d2 = GL_ZERO; vgl_blend_const(&s2, &d2, bf); }
+#else
+        glDisable(GL_BLEND);
 #endif
     }
     g_sh.blend = k; memcpy(g_sh.bf, bf, sizeof bf); g_sh.bs_ok = 1;
@@ -2268,7 +2790,9 @@ static int gpu_set_raster(void)
     uint64_t k;
     int cull = 0;
     GLenum face = GL_BACK;
-    if (s_3d.cull_enable && !getenv("RECOMP_GPU_NOCULL")) {
+    static int nocull = -1, cullflip;   /* (v96: two getenv a draw) */
+    if (nocull < 0) { nocull = getenv("RECOMP_GPU_NOCULL") != NULL; cullflip = getenv("RECOMP_GPU_CULLFLIP") != NULL; }
+    if (s_3d.cull_enable && !nocull) {
         if (s_3d.cull_face == 0x408) return 0;        /* front and back: nothing drawn */
         cull = 1;
         face = s_3d.cull_face == 0x404 ? GL_FRONT : GL_BACK;
@@ -2277,12 +2801,21 @@ static int gpu_set_raster(void)
      * (0x900); see the top of this file for why D3D's clockwise is GL's
      * counter-clockwise here. */
     {
-        int fccw = (s_3d.front_face != 0x900) ^ (getenv("RECOMP_GPU_CULLFLIP") != NULL);
+        int fccw = (s_3d.front_face != 0x900) ^ cullflip;
 #if defined(__vita__)
         fccw ^= g_vgl_flip;   /* (y flipped back: the winding too) */
 #endif
         k = ((uint64_t)cull << 40) | ((uint64_t)face << 8) | (uint64_t)fccw | (1ull << 41);
         if (g_sh.rs_ok && g_sh.rs == k) return 1;
+#if defined(__vita__)
+        /* (v81) vitaGL (misc.o change_cull_mode) sums front face + cull face
+         * (+1 on the display) and only knows 0xD05 / 0xD06: GL_CW with
+         * GL_FRONT in a framebuffer object (0xD04) falls to "no polygons" and
+         * every draw is dropped until the cull state changes. The same cull
+         * said the other way round: front face always CCW, the culled face
+         * swapped when the front is CW. */
+        if (fccw) { fccw = 0; face = face == GL_FRONT ? GL_BACK : GL_FRONT; }
+#endif
         if (cull) { glEnable(GL_CULL_FACE); glCullFace(face); } else glDisable(GL_CULL_FACE);
         glFrontFace(fccw ? GL_CW : GL_CCW);
 #if !defined(__vita__)
@@ -2297,7 +2830,61 @@ static int gpu_set_raster(void)
 /* The colour and zeta targets the title has bound, made current. */
 static GSurf *g_cur_rt, *g_cur_ds;
 static int g_cur_sc[4];                 /* the clip rectangle on g_cur_rt */
+#if defined(__vita__)
+/* (v74) the targets of the draw before, when nothing they are made from
+ * has changed: 4-12% of the render thread went into finding the same two
+ * surfaces and framebuffer for every draw (v73) */
+static struct {
+    int ok, nd;
+    uint32_t co, pitch, cx, cy, cw, ch, fmt, zo, runs, gen;
+    float cmax;
+    GSurf *rt, *ds;
+    GLuint fbo;
+    int sc[4];
+} g_bt;
+#endif
+static unsigned g_vbs_draws, g_vbs_full, g_vbs_bytes;   /* (v102: vbs_place) */
+static unsigned g_vsm_quads, g_vsm_runs;   /* (v104) */
+static unsigned g_lite_skipped[3];   /* (v105) */
+static uint32_t g_lite_dst[8];
+static int gpu_bind_targets_(int need_depth);
+static unsigned g_bt_hit, g_bt_miss, g_bt_miss_run, g_bt_runs0;   /* (v94: [VGLPERF] targets) */
 static int gpu_bind_targets(int need_depth)
+{
+#if defined(__vita__)
+    extern volatile uint32_t g_pb_runs;
+    if (g_bt.ok && g_bt.nd == need_depth && g_bt.co == s_gpu.color_offset && g_bt.pitch == s_gpu.pitch
+        && g_bt.cx == s_gpu.clip_x && g_bt.cy == s_gpu.clip_y && g_bt.cw == s_gpu.clip_w && g_bt.ch == s_gpu.clip_h
+        && g_bt.fmt == s_gpu.format && g_bt.zo == s_zeta_offset && g_bt.runs == g_pb_runs && g_bt.gen == g_gsurf_gen
+        && g_bt.cmax == s_clip_max && g_sh.tg && g_sh.fbo == g_bt.fbo && g_sh.vp_ok && g_sh.sc_ok && g_sh.cbvs_ok
+        && !g_cap_on) {
+        g_bt_hit++;
+        g_cur_rt = g_bt.rt; g_cur_ds = g_bt.ds;
+        g_cur_rt->wr = ++g_wr_clock;
+        if (g_cur_ds) g_cur_ds->wr = ++g_wr_clock;
+        memcpy(g_cur_sc, g_bt.sc, sizeof g_bt.sc);
+        return 1;
+    }
+    {
+        int r;
+        g_bt_miss++;
+        if (g_bt.ok && g_bt.runs != g_pb_runs) g_bt_miss_run++;
+        r = gpu_bind_targets_(need_depth);
+        g_bt.ok = r && !g_cur_rt->mrb;
+        if (g_bt.ok) {
+            g_bt.nd = need_depth; g_bt.co = s_gpu.color_offset; g_bt.pitch = s_gpu.pitch;
+            g_bt.cx = s_gpu.clip_x; g_bt.cy = s_gpu.clip_y; g_bt.cw = s_gpu.clip_w; g_bt.ch = s_gpu.clip_h;
+            g_bt.fmt = s_gpu.format; g_bt.zo = s_zeta_offset; g_bt.runs = g_pb_runs; g_bt.gen = g_gsurf_gen;
+            g_bt.cmax = s_clip_max; g_bt.rt = g_cur_rt; g_bt.ds = g_cur_ds; g_bt.fbo = g_sh.fbo;
+            memcpy(g_bt.sc, g_cur_sc, sizeof g_bt.sc);
+        }
+        return r;
+    }
+#else
+    return gpu_bind_targets_(need_depth);
+#endif
+}
+static int gpu_bind_targets_(int need_depth)
 {
     uint32_t base = dma_resolve(s_gpu.color_offset);
     uint32_t bpp = surface_bpp();
@@ -2368,7 +2955,7 @@ static int gpu_bind_targets(int need_depth)
         float c[4];
         /* window z goes to depth as z / zmax (see nv2a_d3d11.inc) */
         float zmax = (((s_gpu.format >> 4) & 0xF) == 1) ? 65535.0f : 16777215.0f;
-        if (s_clip_max > 0.0f && !getenv("RECOMP_GPU_ZFORMAT")) zmax = s_clip_max;
+        { static int zf = -1; if (zf < 0) zf = getenv("RECOMP_GPU_ZFORMAT") != NULL; if (s_clip_max > 0.0f && !zf) zmax = s_clip_max; }
         c[0] = 2.0f / (float)g_cur_rt->w; c[1] = 2.0f / (float)g_cur_rt->h; c[2] = 1.0f / zmax; c[3] = 0;
 #if defined(__vita__)
         c[3] = g_vgl_flip ? -1.0f : 1.0f;   /* (the Cg vertex shader's y sign) */
@@ -2418,6 +3005,31 @@ typedef struct {
 } PsKey;
 static PsKey g_pskey;
 
+static int g_vstg_dyn, g_vstg_lin;
+static unsigned g_bs_gen;   /* (gpu_bind_stages calls: another caller's binding ends the keeping) */
+static void gpu_bind_stages(void);
+/* (v74, as nv2a_d3d11.inc gpu_stages) the textures and combiners kept as the
+ * last draw bound them when nothing they depend on has changed since: no
+ * texture, combiner or other register written with a new value, no new
+ * pushbuffer run when a linear texture is bound, no drawn surface sampled.
+ * They were built again for every draw: 11-15% of the render thread (v73).
+ * RECOMP_STAGES_ALWAYS=1: every draw. */
+static unsigned g_vstg_kept, g_vstg_made;
+static void gpu_stages_vgl(void)
+{
+    static int always = -1, valid; static long trev; static int zt, zw, md; static unsigned mygen, vpg;
+    if (always < 0) always = getenv("RECOMP_STAGES_ALWAYS") != NULL;
+    if (valid && !always && !(s_grp & (GRP_TEX | GRP_COMB | GRP_OTHER)) && !((s_grp & GRP_RUN) && g_vstg_lin)
+        && g_sh.tex_ok && g_sh.cbps_ok && trev == xbox_tex_rev && zt == s_3d.depth_test && zw == s_3d.depth_mask
+        && !g_cap_on && mygen == g_bs_gen && !s_gpu.inline_active && vpg == s_vp_gen && md == s_3d.mode) { g_vstg_kept++; return; }
+    s_grp &= ~(GRP_TEX | GRP_COMB | GRP_OTHER | GRP_RUN);
+    g_vstg_dyn = 0; g_vstg_lin = 0;
+    gpu_bind_stages();
+    mygen = g_bs_gen; vpg = s_vp_gen; md = s_3d.mode;
+    valid = !g_vstg_dyn && !s_gpu.inline_active; trev = xbox_tex_rev;
+    zt = s_3d.depth_test; zw = s_3d.depth_mask;
+    g_vstg_made++;
+}
 static void gpu_bind_stages(void)
 {
     struct {
@@ -2435,7 +3047,11 @@ static void gpu_bind_stages(void)
     char cb[sizeof st + sizeof tail];
     GLuint tex[4] = { 0 }, smp[4] = { 0 };
     int k, i;
+#if defined(__vita__)
+    int at_ntex = 0, at_seethru = 0;
+#endif
 
+    VWHERE("stages: combiner words");   /* (v176: finer zones) */
     memset(st, 0, sizeof st);
     memset(&tail, 0, sizeof tail);
     for (i = 0; i < s_cp.n; i++) {
@@ -2482,7 +3098,9 @@ static void gpu_bind_stages(void)
             TX_T0(tsf);
             g_tx_binds++;
 #endif
+            VWHERE("stages: surface lookup");
             gs = gpu_surface_for_texture(S->t.offset, S->t.width, S->t.height, &isd);
+            VWHERE("stages: per stage");
             if (surf_log && (gs || (S->t.width <= 256 && S->t.height <= 256 && S->t.offset < 0x04000000u
                                                      && gsurf_near(S->t.offset)))) {
                 static uint32_t seen[64]; static int ns; int q;
@@ -2497,18 +3115,26 @@ static void gpu_bind_stages(void)
             }
             if (gs && !isd) gsurf_sync_from_mem(gs);
             if (gs) gsurf_resolve(gs);   /* (MSAA: the texture from its samples) */
+            if (gs) g_vstg_dyn = 1;
+            if (!S->normalized) g_vstg_lin = 1;
 #if defined(__vita__)
             TX_ADD(0, tsf);
 #endif
             if (gs) {
                 /* a surface bound as a target reads as zero, as in D3D */
                 tex[k] = (gs == g_cur_rt || gs == g_cur_ds) ? g_tex_black : gs->tex;
+#if defined(__vita__)
+                at_seethru = 1;
+#endif
                 if (isd && tex[k] != g_tex_black) fl |= 8;
                 if (!S->normalized) { tail.sscale[k][0] = 1.0f / (float)gs->w; tail.sscale[k][1] = 1.0f / (float)gs->h; }
             } else {
 #if defined(__vita__)
                 TX_T0(tg);
+                VWHERE("texture lookup/decode");
                 tex[k] = gtex_get(&S->t);
+                if (tex[k]) { at_ntex++; if (!g_gtex_opaque || s_ultra_used) at_seethru = 1; }
+                VWHERE("stages: per stage");
                 TX_ADD(4, tg);
 #else
                 tex[k] = gtex_get(&S->t);
@@ -2516,11 +3142,27 @@ static void gpu_bind_stages(void)
             }
             if (!tex[k]) fl &= ~1;
             /* (a pack picture: always through its levels) */
+            VWHERE("stages: sampler");
             smp[k] = gpu_sampler_ex(S->t.addr_u, S->t.addr_v, S->bilinear || (!gs && s_ultra_used),
                                     (S->mip || (!gs && s_ultra_used)) && !gs && S->normalized);
         }
         tail.sflags[k] = fl;
+        VWHERE("stages: per stage");
     }
+    VWHERE("stages: shader key");
+#if defined(__vita__)
+    /* (v206) The game leaves the alpha test on for nearly all the world (v205 census: 420-485 of a frame's draws,
+     * 52-62 thousand indices, against 12 plain ones). A shader that can discard makes the Vita's GPU give up its
+     * hidden-surface removal for that draw: every covered pixel shaded. Where the test cannot fail -- no blending,
+     * and every texture the draw reads without a single see-through texel -- the shader is made without it.
+     * TT_ATEST_KEEP=1: as before. g_ab2_ph 1: as before, for the [AB2] turns. */
+    if (tail.atest[0]) {
+        static int keep = -1;
+        if (keep < 0) { const char *e = getenv("TT_ATEST_KEEP"); keep = e && e[0] == '1'; }
+        if (!keep && !g_ab2_ph && !s_gpu.blend_enable && at_ntex > 0 && !at_seethru) { tail.atest[0] = 0; g_ab2_drop++; }
+        else g_ab2_keep++;
+    }
+#endif
     {
         PsKey *K = &g_pskey;
         memset(K, 0, sizeof *K);
@@ -2543,6 +3185,18 @@ static void gpu_bind_stages(void)
         K->at_func = K->at_en ? tail.atest[1] : 0;
         memcpy(K->sdot, tail.sdot, 16); memcpy(K->sinp, tail.sinp, 16);
     }
+#if defined(__vita__)
+    {   /* the fallback shader's stage 0 (s_cg_ps_main): scale, on */
+        float g[4];
+        int fl0 = tail.sflags[0], m0 = tail.smode[0];
+        g[0] = (fl0 & 4) ? 1.0f : tail.sscale[0][0];
+        g[1] = (fl0 & 4) ? 1.0f : tail.sscale[0][1];
+        g[2] = ((fl0 & 1) && (fl0 & 2) && !(fl0 & 8) && m0 != 0 && m0 != 4) ? 1.0f : 0.0f;
+        g[3] = 0.0f;
+        if (memcmp(g_vub[VB_PSC][74], g, 16)) { memcpy(g_vub[VB_PSC][74], g, 16); g_vub_gen[VB_PSC]++; }
+    }
+#endif
+    VWHERE("stages: combiner constants upload");
     memcpy(cb, st, sizeof st);
     memcpy(cb + sizeof st, &tail, sizeof tail);
     if (!g_sh.cbps_ok || memcmp(g_sh.cbps, cb, sizeof cb)) {
@@ -2550,6 +3204,7 @@ static void gpu_bind_stages(void)
         memcpy(g_sh.cbps, cb, sizeof cb); g_sh.cbps_ok = 1;
     }
     if (!g_sh.tex_ok || memcmp(g_sh.tex, tex, sizeof tex) || memcmp(g_sh.smp, smp, sizeof smp)) {
+        VWHERE("stages: GL texture binds");
         for (k = 0; k < 4; k++) {
             glActiveTexture(GL_TEXTURE0 + k);
             glBindTexture(GL_TEXTURE_2D, tex[k]);
@@ -2557,6 +3212,8 @@ static void gpu_bind_stages(void)
         }
         memcpy(g_sh.tex, tex, sizeof tex); memcpy(g_sh.smp, smp, sizeof smp); g_sh.tex_ok = 1;
     }
+    g_bs_gen++;
+    VWHERE("batch: textures/stages");
 }
 
 /* ---------------- vertices on the CPU ---------------- */
@@ -2753,6 +3410,35 @@ static int g_hwvp_n;
 static int g_hwvp_on = -1;
 static float g_vpc_shadow[VP_CONSTS][4];
 static int g_vpc_ok;
+/* (v109) the vertex-program constants to the uniform rows: only the rows the
+ * pushbuffer changed since the last draw (s_vpc_lo..hi, nv2a_sw3d.inc) */
+static unsigned g_vpc_rows, g_vpc_syncs;
+static void gpu_vpc_sync(void)
+{
+#if defined(__vita__)
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("RECOMP_VGL_VPC_ROWS"); mode = !(e && e[0] == '0'); }
+    if (mode) {
+        if (!g_vpc_ok) { s_vpc_lo = 0; s_vpc_hi = VP_CONSTS - 1; s_vpc_dirty = 1; }
+        if (!s_vpc_dirty) return;
+        if (s_vpc_lo < 0) s_vpc_lo = 0;
+        if (s_vpc_hi > VP_CONSTS - 1) s_vpc_hi = VP_CONSTS - 1;
+        if (s_vpc_lo <= s_vpc_hi) {
+            memcpy(g_vub[VB_VPC][s_vpc_lo], s_3d.c[s_vpc_lo], (size_t)(s_vpc_hi - s_vpc_lo + 1) * 16);
+            g_vpc_rows += (unsigned)(s_vpc_hi - s_vpc_lo + 1); g_vpc_syncs++;
+            g_vub_gen[VB_VPC]++;
+            if (!g_vub_gen[VB_VPC]) g_vub_gen[VB_VPC] = 1;
+        }
+        g_vpc_ok = 1; s_vpc_dirty = 0; s_vpc_lo = VP_CONSTS; s_vpc_hi = -1;
+        return;
+    }
+#endif
+    if (!g_vpc_ok || memcmp(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow)) {
+        memcpy(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow);
+        g_vpc_ok = 1;
+        gpu_ub(UB_VPC, g_vpc_shadow, sizeof g_vpc_shadow);
+    }
+}
 static float *g_xin; static uint32_t g_xin_cap;
 static uint32_t g_hwvp_stat_hw, g_hwvp_stat_cpu, g_hwvp_compiled, g_hwvp_failed;
 #if defined(__vita__)
@@ -3095,6 +3781,20 @@ static HwVp *hwvp_lookup(void)
     uint32_t h, i;
     HwVp *e;
     if (!g_hwvp_user || !hwvp_enabled() || s_3d.mode != 2 || s_vp_slow || !s_vpd_len) return NULL;
+    {   /* (v96) the same decoded program as the last draw's: no hash, no compare */
+        static uint32_t last_rev; static HwVp *last_e;
+        if (last_e && last_rev == s_vpd_rev && last_e->state == 1) return last_e;
+        last_e = NULL;
+        h = hwvp_hash((const uint32_t (*)[4])s_vpd_src, s_vpd_len);
+        for (i = 0; i < (uint32_t)g_hwvp_n; i++) {
+            e = g_hwvp[i];
+            if (e->hash == h && e->len == s_vpd_len && !memcmp(e->words, s_vpd_src, s_vpd_len * 16)) {
+                hwvp_poll(e);
+                if (e->state == 1) { last_e = e; last_rev = s_vpd_rev; }
+                return e->state == 1 ? e : NULL;
+            }
+        }
+    }
     h = hwvp_hash((const uint32_t (*)[4])s_vpd_src, s_vpd_len);
     for (i = 0; i < (uint32_t)g_hwvp_n; i++) {
         e = g_hwvp[i];
@@ -3110,7 +3810,7 @@ static HwVp *hwvp_lookup(void)
     memcpy(e->words, s_vpd_src, s_vpd_len * 16);
     {
 #if defined(__vita__)
-        char *src = hwvp_translate_cg(e);
+        char *src = (VWHERE("compiling a vertex program"), hwvp_translate_cg(e));
 #else
         char *src = hwvp_translate(e);
 #endif
@@ -3147,6 +3847,7 @@ typedef struct {
     PsKey key;
     uint32_t hash, state;             /* 0 compiling, 1 ready, 2 failed */
     GLuint fs;
+    uint32_t tries, retry_at;         /* (PS Vita: a failed one compiled again later) */
 } HwPs;
 
 #define HWPS_MAX 1024
@@ -3453,6 +4154,33 @@ static void hwps_poll(HwPs *e)
 
 /* The fragment shader for the program in this key: the specialized one when
  * it is compiled, else the general one. */
+#if defined(__vita__)
+/* (PS Vita) sce's run-time Cg compiler fails now and then with an empty log
+ * when memory is short (AC8BD4C6 in the battle, v62): the shader is tried
+ * again every 200 presented frames, up to 8 times -- once it compiles,
+ * vitaGL's shader cache keeps it for the next runs */
+static void hwps_vita_retry(HwPs *e, uint32_t n)
+{
+    char *src;
+    GLint ok = 0;
+    if (e->state != 2 || e->tries >= 8) return;
+    if (!e->retry_at) { e->retry_at = g_present_n + 200; return; }
+    if (g_present_n < e->retry_at) return;
+    e->tries++;
+    e->retry_at = g_present_n + 200;
+    src = hwps_translate_cg(&e->key);
+    if (!src) return;
+    if (e->fs) { glDeleteShader(e->fs); e->fs = 0; }
+    e->fs = gpu_shader_start(GL_FRAGMENT_SHADER, src);
+    free(src);
+    if (e->fs) glGetShaderiv(e->fs, GL_COMPILE_STATUS, &ok);
+    fprintf(stderr, "  [VGL] combiner shader %u (%08X) tried again (%u): %s\n", n, e->hash, e->tries, ok ? "compiled" : "FAILED");
+    if (!ok) vgl_mem_report("combiner shader failed again");
+    /* (hwps_poll takes it from here, as for a new one) */
+    e->state = 0;
+    if (g_hwps_failed > 0) g_hwps_failed--;
+}
+#endif
 static GLuint hwps_lookup(const PsKey *k)
 {
     uint32_t h, i, n;
@@ -3465,6 +4193,9 @@ static GLuint hwps_lookup(const PsKey *k)
     }
     if (!g_hwps_on) return g_fs_main;
     if (last && !memcmp(&last->key, k, sizeof *k)) {
+#if defined(__vita__)
+        hwps_vita_retry(last, (uint32_t)g_hwps_n);
+#endif
         hwps_poll(last);
         if (last->state == 1) { g_hwps_stat_hw++; return last->fs; }
         g_hwps_stat_sw++;
@@ -3476,6 +4207,9 @@ static GLuint hwps_lookup(const PsKey *k)
         e = g_hwps[i];
         if (e->hash == h && !memcmp(&e->key, k, sizeof *k)) {
             last = e;
+#if defined(__vita__)
+            hwps_vita_retry(e, n);
+#endif
             hwps_poll(e);
             if (e->state == 1) { g_hwps_stat_hw++; return e->fs; }
             g_hwps_stat_sw++;
@@ -3489,7 +4223,7 @@ static GLuint hwps_lookup(const PsKey *k)
     e->key = *k; e->hash = h;
     {
 #if defined(__vita__)
-        char *src = hwps_translate_cg(k);
+        char *src = (VWHERE("compiling a combiner shader"), hwps_translate_cg(k));
 #else
         char *src = hwps_translate(k);
 #endif
@@ -3527,6 +4261,7 @@ static GLuint hwps_lookup(const PsKey *k)
     g_hwps_n = (LONG)(n + 1);
     last = e;
     hwps_poll(e);
+    VWHERE("batch: textures/stages");
     return e->state == 1 ? e->fs : g_fs_main;
 }
 
@@ -3646,6 +4381,8 @@ static void hwvp_probe_count(const char *what, HwVp *hv)
     }
     fprintf(stderr, "  [HWVP] probe %08X %s: %d red, %d other pixels (mean %u %u %u) of 4096\n", hv->hash, what, red, other,
             other ? sr / other : 0, other ? sg / other : 0, other ? sb / other : 0);
+    if (g_cap_on) cap_note_text("PROBE %08X %s: %d red, %d other pixels (mean %u %u %u) of 4096", hv->hash, what, red, other,
+                                other ? sr / other : 0, other ? sg / other : 0, other ? sb / other : 0);
 }
 static void hwvp_probe_begin(void)
 {
@@ -3722,9 +4459,17 @@ static void hwvp_probe(HwVp *hv, GLuint game_prog, uint32_t nverts)
 /* (the [VGLPERF] timers: vgl_perf_frame) */
 #include <psp2/kernel/processmgr.h>
 enum { VP_BATCH, VP_TARGETS, VP_XFORM, VP_STAGES, VP_DRAW, VP_PRESENT, VP_IDX, VP_LOOKUP, VP_PROG, VP_STATE, VP_N };
+static unsigned g_vpd_why[4], g_vpd_cmp, g_vpd_inl;
+static float *g_cmp_buf[16];
+static uint32_t g_cmp_cap[16];
+
 static uint64_t g_vp_us[VP_N];
-#define VP_T0(v) SceUInt64 v = sceKernelGetProcessTimeWide()
-#define VP_ADD(k, v) (g_vp_us[k] += sceKernelGetProcessTimeWide() - (v))
+/* (v98) the timers are a system call each, some twenty a draw (~1500 draws a
+ * frame): off unless RECOMP_VGL_TIMERS=1 -- the [RTPROF] sampler tells where
+ * the time goes without them */
+extern int g_vgl_timers;
+#define VP_T0(v) SceUInt64 v = g_vgl_timers ? sceKernelGetProcessTimeWide() : 0
+#define VP_ADD(k, v) (g_vgl_timers ? (void)(g_vp_us[k] += sceKernelGetProcessTimeWide() - (v)) : (void)0)
 #endif
 static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
 {
@@ -3732,8 +4477,8 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     uint32_t k;
     GLuint prog;
 #if defined(__vita__)
-    { VP_T0(t); gpu_bind_stages(); VP_ADD(VP_STAGES, t); }
-    { VP_T0(t); prog = gpu_program_for(hv->vs); VP_ADD(VP_PROG, t); }
+    { VWHERE("batch: textures/stages"); VP_T0(t); gpu_stages_vgl(); VP_ADD(VP_STAGES, t); }
+    { VWHERE("batch: program"); VP_T0(t); prog = gpu_program_for(hv->vs); VP_ADD(VP_PROG, t); VWHERE("batch: vertex attributes"); }
 #else
     gpu_bind_stages();
     prog = gpu_program_for(hv->vs);
@@ -3767,17 +4512,18 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     glBindVertexArray(g_vao_x);
     g_sh.vao = 2;
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-    for (k = 0; k < 16; k++) {
-        if (k < hv->nin) {
-            glEnableVertexAttribArray(k);
-            glVertexAttribPointer(k, 4, GL_FLOAT, GL_FALSE, (GLsizei)stride, g_xin + 4 * k);
-        } else glDisableVertexAttribArray(k);
+    {
+        uint32_t kmax = vgl_va_top();
+        if (kmax < hv->nin) kmax = hv->nin;
+        for (k = 0; k < kmax; k++) {
+            if (k < hv->nin) {
+                glEnableVertexAttribArray(k);
+                glVertexAttribPointer(k, 4, GL_FLOAT, GL_FALSE, (GLsizei)stride, g_xin + 4 * k);
+            } else glDisableVertexAttribArray(k);
+        }
     }
-    if (!g_vpc_ok || memcmp(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow)) {
-        memcpy(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow);
-        g_vpc_ok = 1;
-        gpu_ub(UB_VPC, g_vpc_shadow, sizeof g_vpc_shadow);
-    }
+    VWHERE("batch: vertex constants");
+    gpu_vpc_sync();
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     static int probe_on = -1;
     if (probe_on < 0) probe_on = getenv("RECOMP_VGL_PROBE") != NULL;
@@ -3789,7 +4535,20 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
         g_sh.vao = 2;
         glBindBuffer(GL_ARRAY_BUFFER, 0);
     }
-    VP_T0(t_st);
+    {   /* (v90) THE HUD BUG. vsw (VSC rows 4-7) tells the vertex program
+         * which inputs are D3DCOLORs to turn round (B,G,R,A): only the direct
+         * path (gpu_batch_hw_direct) set it, and here -- the inputs already
+         * floats -- it was left as the last direct draw had it. After a
+         * direct draw with a D3DCOLOR in the same input slot (the particles
+         * just before the HUD, in most frames of a battle) the HUD's own
+         * inputs were turned round: x <-> z of the position, the bar drawn
+         * at x = 1, the HUD, the haze, the pause menu gone; with other draws
+         * last, there. Since v74 (the direct path). */
+        int k2, changed = 0;
+        for (k2 = 0; k2 < 16; k2++) if (g_vub[VB_VSC][4 + k2 / 4][k2 % 4] != 0.0f) { g_vub[VB_VSC][4 + k2 / 4][k2 % 4] = 0.0f; changed = 1; }
+        if (changed) g_vub_gen[VB_VSC]++;
+    }
+    VWHERE("batch: GL state"); VP_T0(t_st);
     gpu_set_blend(0);
     gpu_set_depth(g_cur_ds != NULL);
     gpu_use(prog);
@@ -3801,7 +4560,123 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     if (g_cur_ds) vgl_depth_keep();
     if (!hv->dumped) hwvp_dump(hv, nverts);
     g_vp_hw++; g_cap_hw++;
+    if (g_cap_on && hv->nin) {
+        uint32_t q, nshow = nverts < 4 ? nverts : 4;
+        for (q = 0; q < nshow; q++) {
+            const float *v = g_xin + (size_t)q * 4 * hv->nin;
+            cap_note_text("  vertex %u: in0 %.2f %.2f %.2f %.2f%s", q, v[0], v[1], v[2], v[3], hv->nin > 1 ? "" : "");
+            if (hv->nin > 1) cap_note_text("            in1 %.3f %.3f %.3f %.3f", v[4], v[5], v[6], v[7]);
+        }
+        {   /* (v80) what the vertex program makes of vertex 0 (the CPU
+             * interpreter, same program and constants): where it lands, its
+             * colour and alpha; and the combiners with their constants --
+             * whether a draw that changes no pixel was given alpha 0 by the
+             * game itself */
+            float in[16][4], out[VP_OUTS][4];
+            uint32_t k;
+            memset(in, 0, sizeof in);
+            for (k = 0; k < 16; k++) in[k][3] = 1.0f;
+            for (k = 0; k < hv->nin && k < 16; k++) if (hv->inreg[k] < 16) memcpy(in[hv->inreg[k]], g_xin + 4 * k, 16);
+            if (s_3d.mode == 2) {
+                vp_run_fast(in, out);
+                for (k = 0; k < hv->nin; k++) cap_note_text("    in reg %u: %.3f %.3f %.3f %.3f", hv->inreg[k], in[hv->inreg[k]][0], in[hv->inreg[k]][1], in[hv->inreg[k]][2], in[hv->inreg[k]][3]);
+                cap_note_text("  VP out v0: pos %.2f %.2f %.2f %.3f  D0 %.3f %.3f %.3f %.3f  T0 %.3f %.3f %.3f %.3f",
+                              out[0][0], out[0][1], out[0][2], out[0][3], out[3][0], out[3][1], out[3][2], out[3][3],
+                              out[9][0], out[9][1], out[9][2], out[9][3]);
+            }
+            cap_note_text("  combiners: ctl %08X final %08X %08X shader %08X; stage0 c %08X/%08X a %08X/%08X f0 %08X f1 %08X; stage1 c %08X/%08X a %08X/%08X f0 %08X f1 %08X",
+                          s_3d.comb_ctl, s_3d.spec_fog0, s_3d.spec_fog1, s_3d.shader_prog,
+                          s_3d.c_icw[0], s_3d.c_ocw[0], s_3d.a_icw[0], s_3d.a_ocw[0], s_3d.factor0[0], s_3d.factor1[0],
+                          s_3d.c_icw[1], s_3d.c_ocw[1], s_3d.a_icw[1], s_3d.a_ocw[1], s_3d.factor0[1], s_3d.factor1[1]);
+        }
+    }
     cap_note_draw("hw", hv->hash, g_nidx);
+#if defined(__vita__)
+    /* (v84) in the capture, right after the HUD's first draw: two markers in
+     * the top-left corner -- magenta by vitaGL's glClear (scissored), green
+     * by our own quad -- to tell, in a frame whose tail draws nothing, whether
+     * anything at all still reaches the target */
+    if (g_cap_on && s_stage[0].enabled && s_stage[0].t.offset == 0x8148A000u && !g_cap_marked) {
+        g_cap_marked = 1;
+        /* (v91) the HUD draw again into a 64x64 probe target, read back:
+         * its vertex program with a plain red fragment shader (elements,
+         * then arrays), then with its own fragment shader -- red pixels and
+         * none: the vertex side is right, the fragment side is not; none and
+         * none: the vertex side. And the uniforms as they are sent. */
+        cap_note_text("UNIFORMS: vsw %g %g %g %g / %g %g %g %g; atest %g %g %g %g; gfb %g %g %g %g; bsrc %g %g %g %g; bmisc %g %g %g %g",
+                      g_vub[VB_VSC][4][0], g_vub[VB_VSC][4][1], g_vub[VB_VSC][4][2], g_vub[VB_VSC][4][3],
+                      g_vub[VB_VSC][5][0], g_vub[VB_VSC][5][1], g_vub[VB_VSC][5][2], g_vub[VB_VSC][5][3],
+                      g_vub[VB_PSC][69][0], g_vub[VB_PSC][69][1], g_vub[VB_PSC][69][2], g_vub[VB_PSC][69][3],
+                      g_vub[VB_PSC][74][0], g_vub[VB_PSC][74][1], g_vub[VB_PSC][74][2], g_vub[VB_PSC][74][3],
+                      g_vub[VB_PSC][72][0], g_vub[VB_PSC][72][1], g_vub[VB_PSC][72][2], g_vub[VB_PSC][72][3],
+                      g_vub[VB_PSC][73][0], g_vub[VB_PSC][73][1], g_vub[VB_PSC][73][2], g_vub[VB_PSC][73][3]);
+        hwvp_probe(hv, prog, nverts);
+        {   /* (v85) the same HUD draw once more, as it is but for the window
+             * z (vp.z = 0: no near/far clipping by z / clip max) and no depth
+             * test: if the bar shows in a frame without the HUD, that was it */
+            float zs = g_vub[VB_VSC][0][2];
+            cap_note_text("REDRAW of the HUD bar: vp %.6g %.6g %.9g %.3g, clip min %.6g max %.6g", g_vub[VB_VSC][0][0], g_vub[VB_VSC][0][1], zs, g_vub[VB_VSC][0][3], s_clip_min, s_clip_max);
+            g_vub[VB_VSC][0][2] = 0.0f; g_vub_gen[VB_VSC]++;
+            glDisable(GL_DEPTH_TEST);
+            vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx);
+            {   /* (v86) copies of the bar lower down: y+40 blending off,
+                 * y+80 a white texture in place of its own, y+120 both --
+                 * which one shows tells whether the bar's alpha (its texture)
+                 * is what is missing */
+                static GLuint white;
+                uint32_t q, k0 = 0, step;
+                for (q = 0; q < hv->nin; q++) if (hv->inreg[q] == 0) k0 = q;
+                if (!white) {
+                    static const uint32_t px[16] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                                     0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+                    glGenTextures(1, &white);
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, white);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                }
+                {   GLint was = 0;
+                    glActiveTexture(GL_TEXTURE0);
+                    glGetIntegerv(GL_TEXTURE_BINDING_2D, &was);
+                    cap_note_text("REDRAW: the bar's texture on unit 0 is GL texture %d; GL error before %04X", (int)was, (unsigned)glGetError());
+                    /* (v89) y+40 as it is with blending off; y+80 the same
+                     * after every uniform of the program is sent to vitaGL
+                     * again (our cache of what it holds forgotten); y+120
+                     * the same after vitaGL is made to switch program away
+                     * and back (its own per-program state redone) */
+                    GLuint myprog = g_vgl_prog;
+                    glDisable(GL_BLEND);
+                    for (step = 1; step <= 3; step++) {
+                        for (q = 0; q < nverts; q++) g_xin[(size_t)q * 4 * hv->nin + 4 * k0 + 1] += 40.0f;
+                        if (step >= 2 && g_vgl_cur) memset(g_vgl_cur->gen, 0, sizeof g_vgl_cur->gen);
+                        if (step == 3 && g_cc_prog) {
+                            vgl_use(g_cc_prog);
+                            vgl_use(myprog);
+                            if (g_vgl_cur) memset(g_vgl_cur->gen, 0, sizeof g_vgl_cur->gen);
+                        }
+                        glBindTexture(GL_TEXTURE_2D, (GLuint)was);
+                        vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx);
+                    }
+                    for (q = 0; q < nverts; q++) g_xin[(size_t)q * 4 * hv->nin + 4 * k0 + 1] -= 120.0f;
+                    glBindTexture(GL_TEXTURE_2D, (GLuint)was);
+                    glEnable(GL_BLEND);
+                    cap_note_text("REDRAW: copies (blending off) at y+40 as is, y+80 all uniforms sent again, y+120 also program switched away and back; GL error %04X", (unsigned)glGetError());
+                }
+            }
+            g_vub[VB_VSC][0][2] = zs; g_vub_gen[VB_VSC]++;
+        }
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(4, (GLint)g_cur_rt->ph - 12, 8, 8);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glScissor(16, (GLint)g_cur_rt->ph - 12, 8, 8);
+        vgl_cclear_quad(0.0f, 1.0f, 0.0f, 1.0f, 1, 1, 1, 1);
+        gpu_sh_reset();
+        cap_note_text("MARKERS drawn (magenta glClear at 4,4; green quad at 16,4; 8x8)");
+    }
+#endif
     s_gpu.tris_drawn += g_nidx / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
     s_3d.verts += nverts;
@@ -3832,11 +4707,8 @@ static int gpu_batch_hw(HwVp *hv, uint32_t nverts)
     }
     ib_at = gpu_ring(&g_rib, g_idx, g_nidx * 4, 4);
     if (ib_at == 0xFFFFFFFFu) return 1;
-    if (!g_vpc_ok || memcmp(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow)) {
-        memcpy(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow);
-        g_vpc_ok = 1;
-        gpu_ub(UB_VPC, g_vpc_shadow, sizeof g_vpc_shadow);
-    }
+    VWHERE("batch: vertex constants");
+    gpu_vpc_sync();
     gpu_set_blend(0);
     gpu_set_depth(g_cur_ds != NULL);
     gpu_use(prog);
@@ -3855,15 +4727,35 @@ static int g_null3_draw;   /* (RECOMP_GPU_NULL=3) */
  * ux0:data/twotowers/cap/<n>_<what>_<base>_<w>x<h>.tga. It starts 15 frames
  * after the first draw with fog (RECOMP_VGL_CAPTURE=0 off, =n after n frames). */
 
+/* (v61) a fixed 64 KB buffer: the v60 capture's 1.2 MB malloc failed (the
+ * heap is nearly full in the battle) and every picture came out empty */
+#define CAP_CHUNK (64 * 1024)
+static uint8_t g_cap_chunk[CAP_CHUNK];
+static int cap_write_bgra(FILE *f, const uint8_t *px, uint32_t n)
+{
+    uint32_t i = 0, k, m;
+    while (i < n) {
+        m = n - i; if (m > CAP_CHUNK / 4) m = CAP_CHUNK / 4;
+        for (k = 0; k < m; k++) {
+            const uint8_t *s0 = px + 4 * (size_t)(i + k);
+            g_cap_chunk[4*k] = s0[2]; g_cap_chunk[4*k+1] = s0[1]; g_cap_chunk[4*k+2] = s0[0]; g_cap_chunk[4*k+3] = s0[3];
+        }
+        if (fwrite(g_cap_chunk, 1, m * 4, f) != m * 4) return 0;
+        i += m;
+    }
+    return 1;
+}
 static void cap_save(const GSurf *sf, const char *what)
 {
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
     char path[128];
     FILE *f;
     const uint8_t *px;
     uint8_t hd[18];
     uint32_t i, n;
     uint8_t *row;
-    if (!sf || !sf->tex || g_cap_n >= 99) return;
+    if (!sf || !sf->tex || g_cap_n >= 99 || (g_cap_n >= 92 && strcmp(what, "present"))) return;
+    fprintf(stderr, "  [CAP] saving %08X %ux%u (%ux%u)\n", sf->base, sf->w, sf->h, sf->pw, sf->ph); fflush(stderr);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     gpu_sh_reset();
     glFinish();
@@ -3871,8 +4763,8 @@ static void cap_save(const GSurf *sf, const char *what)
     glBindTexture(GL_TEXTURE_2D, sf->tex);
     px = (const uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
     if (!px) return;
-    if (g_cap_n == 0) sceIoMkdir("ux0:data/twotowers/cap", 0777);
-    snprintf(path, sizeof path, "ux0:data/twotowers/cap/%02d_m%d_%s_%08X_%ux%u%s.tga", g_cap_n++, g_cap_mode, what, sf->base, sf->pw, sf->ph,
+    if (g_cap_n == 0) { sceIoMkdir("ux0:data/twotowers/cap", 0777); sceIoMkdir(g_cap_dir, 0777); }
+    snprintf(path, sizeof path, "%s/%02d_m%d_%s_%08X_%ux%u%s.tga", g_cap_dir, g_cap_n++, g_cap_mode, what, sf->base, sf->pw, sf->ph,
              sf->is_depth ? "_zeta" : "");
     f = fopen(path, "wb");
     if (!f) return;
@@ -3880,19 +4772,14 @@ static void cap_save(const GSurf *sf, const char *what)
     hd[2] = 2; hd[12] = sf->pw & 0xFF; hd[13] = sf->pw >> 8; hd[14] = sf->ph & 0xFF; hd[15] = sf->ph >> 8; hd[16] = 32; hd[17] = 8;
     fwrite(hd, 1, 18, f);
     n = sf->pw * sf->ph;
-    row = (uint8_t *)malloc(sf->pw * 4);
-    if (row) {
-        uint32_t y, x;
-        for (y = 0; y < sf->ph; y++) {
-            const uint8_t *src = px + (size_t)y * sf->pw * 4;
-            for (x = 0; x < sf->pw; x++) { row[4*x] = src[4*x+2]; row[4*x+1] = src[4*x+1]; row[4*x+2] = src[4*x]; row[4*x+3] = src[4*x+3]; }
-            fwrite(row, 1, sf->pw * 4, f);
-        }
-        free(row);
-    }
-    (void)i; (void)n;
+    /* (v60: the whole picture in one write -- row by row, 480 writes, took
+     * 3 to 4 s a picture on the memory card: the v58/v59 captures looked
+     * like a freeze) */
+    (void)row;
+    if (!cap_write_bgra(f, px, n)) fprintf(stderr, "  [CAP] write failed (memory card full?)\n");
     fclose(f);
-    fprintf(stderr, "  [CAP] %s (gpu draws so far %d, cpu draws %d)\n", path, g_cap_hw, g_cap_cpu);
+    fprintf(stderr, "  [CAP] %s (gpu draws so far %d, cpu draws %d) in %u ms\n", path, g_cap_hw, g_cap_cpu,
+            (unsigned)((sceKernelGetProcessTimeWide() - t0) / 1000));
     fflush(stderr);
 }
 #endif
@@ -3926,12 +4813,75 @@ static void vgl_perf_frame(void)
             r = prof_take_report ? prof_take_report() : NULL;
             if (r) fputs(r, stderr);
             else if (prof_alive && !prof_alive()) fprintf(stderr, "  [PROF] the sampler has not run\n");
+            {
+                extern const char *prof_take_rt_report(void) __attribute__((weak));
+                r = prof_take_rt_report ? prof_take_rt_report() : NULL;
+                if (r) fputs(r, stderr);
+            }
+            {
+                extern const char *prof_take_inc_report(void) __attribute__((weak));
+                r = prof_take_inc_report ? prof_take_inc_report() : NULL;
+                if (r) fputs(r, stderr);
+            }
         }
         fprintf(stderr, "  [VGLPERF] more per frame: %.0f draws straight from the guest's buffers; indices %.1f ms, program lookup %.1f ms, GL program %.1f ms, GL state %.1f ms\n",
                 g_vp_direct / f, g_vp_us[VP_IDX] / 1000.0 / f, g_vp_us[VP_LOOKUP] / 1000.0 / f, g_vp_us[VP_PROG] / 1000.0 / f, g_vp_us[VP_STATE] / 1000.0 / f);
+        if (g_vgl_timers) fprintf(stderr, "  [VGLBLK] per frame, wall ms / of them not running: draws %.1f / %.1f (x8 of %u sampled), targets %.1f / %.1f (%u), clears %.1f / %.1f (%u), copies %.1f / %.1f (%u), present %.1f / %.1f\n",
+                g_bk_wall[BK_DRAW] * 8 / 1000.0 / f, ((double)g_bk_wall[BK_DRAW] - (double)g_bk_run[BK_DRAW]) * 8 / 1000.0 / f, g_bk_n[BK_DRAW],
+                g_bk_wall[BK_TARGETS] / 1000.0 / f, ((double)g_bk_wall[BK_TARGETS] - (double)g_bk_run[BK_TARGETS]) / 1000.0 / f, g_bk_n[BK_TARGETS],
+                g_bk_wall[BK_CLEAR] / 1000.0 / f, ((double)g_bk_wall[BK_CLEAR] - (double)g_bk_run[BK_CLEAR]) / 1000.0 / f, g_bk_n[BK_CLEAR],
+                g_bk_wall[BK_BLIT] / 1000.0 / f, ((double)g_bk_wall[BK_BLIT] - (double)g_bk_run[BK_BLIT]) / 1000.0 / f, g_bk_n[BK_BLIT],
+                g_bk_wall[BK_PRESENT] / 1000.0 / f, ((double)g_bk_wall[BK_PRESENT] - (double)g_bk_run[BK_PRESENT]) / 1000.0 / f);
+        memset(g_bk_wall, 0, sizeof g_bk_wall); memset(g_bk_run, 0, sizeof g_bk_run); memset(g_bk_n, 0, sizeof g_bk_n);
+        fprintf(stderr, "  [VGLPERF] draws joined per frame: %.0f into %.0f lists; vertices read in place: %.0f draws\n", g_jn_joined / f, g_jn_runs / f, g_ip_draws / f);
+        fprintf(stderr, "  [VCOPY1] vertices copied once: %.0f draws a frame, %.0f KB (vitaGL's way %.0f KB), %u back to client arrays\n",
+                g_dz_draws / f, (double)g_dz_bytes / 1024.0 / f, (double)g_dz_old / 1024.0 / f, g_dz_fb);
+        g_dz_draws = g_dz_fb = 0; g_dz_bytes = g_dz_old = 0;
+        fprintf(stderr, "  [VCACHE] per frame: %.0f spans drawn from the cache (%.0f KB not copied), %.0f copied (%.0f changed), %.0f new; %.0f KB read to check; %.0f triangle lists kept (%.0f KB), %.0f new; cache %u of %u KB, %u spans; %u went dynamic, %u dropped for room, %u found no room\n",
+                g_vc_hit / f, (double)g_vc_hit_b / 1024.0 / f, g_vc_miss / f, g_vc_chg / f, g_vc_new / f, (double)g_vc_hash_b / 1024.0 / f,
+                g_ix_hit / f, (double)g_ix_hit_b / 1024.0 / f, g_ix_new / f, g_vc_used >> 10, g_vc_size >> 10, g_vc_entries, g_vc_dyn, g_vc_evict, g_vc_nomem);
+        g_vc_hit = g_vc_miss = g_vc_new = g_vc_chg = g_vc_dyn = g_vc_nomem = g_vc_evict = g_ix_hit = g_ix_new = g_ix_miss = 0;
+        g_vc_hit_b = g_vc_hash_b = g_ix_hit_b = 0;
+        {   /* (v179) the render thread's wake-ups by the game (a system call each) and its short waits */
+            extern volatile unsigned g_rt_spin_hits, g_rt_spin_miss, g_rt_wakes;
+            fprintf(stderr, "  [RTWAKE] per frame: %.0f wake-ups by the game, %.0f waits ended by a kick while awake, %.0f went to sleep\n",
+                    g_rt_wakes / f, g_rt_spin_hits / f, g_rt_spin_miss / f);
+            g_rt_wakes = g_rt_spin_hits = g_rt_spin_miss = 0;
+        }
+        g_ip_draws = 0;
+        g_jn_joined = g_jn_runs = 0;
+        fprintf(stderr, "  [VGLPERF] joinable draws per frame: %.0f with nothing changed since the draw before (%.0f of them on the same vertex buffers), %.0f with only constants changed; %.0f of 2 triangles or fewer\n",
+                g_mg_n[0] / f, g_mg_n[1] / f, g_mg_n[2] / f, g_mg_n[3] / f);
+        memset(g_mg_n, 0, sizeof g_mg_n);
+        if (g_shc_n) fprintf(stderr, "  [VGLPERF] shaders compiled in these frames: %u, %.1f ms in all (%.1f ms each)\n", g_shc_n, g_shc_us / 1000.0, g_shc_us / 1000.0 / g_shc_n);
+        if (g_shc_hit || g_shc_written) fprintf(stderr, "  [VGLPERF] shader cache: %u read from the card, %u written, so far\n", g_shc_hit, g_shc_written);
+        g_shc_n = 0; g_shc_us = 0;
+        fprintf(stderr, "  [VGLPERF] texture lookups per frame: %.0f found again this frame, %.0f looked up (%.0f of them pushed out by another), %.0f decode-cache scans, %.0f GL slot scans\n",
+                g_tq_n[0] / f, g_tq_n[1] / f, g_tq_n[2] / f, g_tq_n[3] / f, g_tq_n[4] / f);
+        memset(g_tq_n, 0, sizeof g_tq_n);
         fprintf(stderr, "  [VGLPERF] textures per frame: %.0f binds; surfaces %.1f ms, GL textures %.1f ms of which decode cache %.1f ms "
                 "(checksums %.1f ms, %.0f of them)\n", g_tx_binds / f, g_tx_us[0] / 1000.0 / f, g_tx_us[4] / 1000.0 / f,
                 g_tx_us[1] / 1000.0 / f, g_tx_us[2] / 1000.0 / f, g_tx_sums / f);
+        fprintf(stderr, "  [VGLPERF] stages per frame: %.0f kept, %.0f bound again\n", g_vstg_kept / f, g_vstg_made / f);
+        fprintf(stderr, "  [VGLPERF] combiners per frame: %.0f decoded, %.0f kept (only textures changed)\n", g_comb_made / f, g_comb_kept / f);
+        g_comb_made = g_comb_kept = 0;
+        xbox_VitaUniPoolReport(f);
+        fprintf(stderr, "  [VGLPERF] not drawn per frame: %.0f effect quads, %.0f round shadows, %.0f lights' draws\n",
+                g_lite_skipped[0] / f, g_lite_skipped[1] / f, g_lite_skipped[2] / f);
+        g_lite_skipped[0] = g_lite_skipped[1] = g_lite_skipped[2] = 0;
+        fprintf(stderr, "  [VGLPERF] single quads per frame: %.0f, drawn in %.0f runs\n", g_vsm_quads / f, g_vsm_runs / f);
+        g_vsm_quads = g_vsm_runs = 0;
+        fprintf(stderr, "  [VGLPERF] vertex buffers per frame: %.0f draws, %.0f KB copied; %u draws found the buffer full\n", g_vbs_draws / f, g_vbs_bytes / 1024.0 / f, g_vbs_full);
+        g_vbs_draws = g_vbs_bytes = g_vbs_full = 0;
+        {   extern volatile uint32_t g_pb_runs;
+            fprintf(stderr, "  [VGLPERF] targets per frame: %.0f kept, %.0f looked up again (%.0f of them for a new command run); %.1f command runs; vertex attribute calls %.0f, %.0f of them skipped\n",
+                    g_bt_hit / f, g_bt_miss / f, g_bt_miss_run / f, (double)(g_pb_runs - g_bt_runs0) / f, g_va_calls / f, g_va_skipped / f);
+            g_bt_hit = g_bt_miss = g_bt_miss_run = 0; g_bt_runs0 = g_pb_runs; g_va_calls = g_va_skipped = 0;
+        }
+        g_vstg_kept = g_vstg_made = 0;
+        fprintf(stderr, "  [VGLPERF] direct draws per frame: %.0f from inline vertices, %.0f packed-normal inputs; not direct: %.0f short, %.0f attribute type, %.0f over 64K vertices, %.0f out of range\n",
+                g_vpd_inl / f, g_vpd_cmp / f, g_vpd_why[0] / f, g_vpd_why[1] / f, g_vpd_why[2] / f, g_vpd_why[3] / f);
+        memset(g_vpd_why, 0, sizeof g_vpd_why); g_vpd_cmp = g_vpd_inl = 0;
         memset(g_tx_us, 0, sizeof g_tx_us); g_tx_sums = g_tx_binds = 0; g_vp_direct = 0;
         fprintf(stderr, "  [VGLPERF] per frame: %.0f draws (%.0f with the vertex program on the GPU), %.0f vertices transformed on the CPU, "
                 "%.1f texture uploads (%.0f KB); vertex programs compiled %u, failed %u\n",
@@ -3948,29 +4898,60 @@ static void vgl_perf_frame(void)
  * the screen-sized target written out every 150 of its draws */
 static FILE *g_cap_list;
 static unsigned g_cap_ndraw;
+static int g_cap_screen;
+static unsigned g_cap_last;    /* (draws of the frame before) */
 static unsigned g_cap_fdraws;   /* (draws this frame: the capture waits for a busy one, the level) */
+static void cap_note_text(const char *fmt, ...)
+{
+    va_list ap;
+    if (!g_cap_on) return;
+    if (!g_cap_list) { char p2[96]; sceIoMkdir(g_cap_dir, 0777); snprintf(p2, sizeof p2, "%s/draws.txt", g_cap_dir); g_cap_list = fopen(p2, "w"); }
+    if (!g_cap_list) return;
+    fprintf(g_cap_list, "   - after draw %u: ", g_cap_ndraw);
+    va_start(ap, fmt); vfprintf(g_cap_list, fmt, ap); va_end(ap);
+    fprintf(g_cap_list, "\n");
+}
 static void cap_note_draw(const char *path, uint32_t hash, uint32_t nidx)
 {
     g_cap_fdraws++;
+    fr_add(path[0] == 'h' ? 1 : path[0] == 'd' ? 2 : 6, hash, nidx, g_cur_rt ? g_cur_rt->base : 0, g_cur_ds ? g_cur_ds->base : 0,
+           ((uint32_t)s_3d.depth_test & 1) | (((uint32_t)s_3d.depth_mask & 1) << 1) | (((uint32_t)s_3d.depth_func & 0xF) << 2)
+           | (((uint32_t)s_gpu.blend_enable & 1) << 6) | (((uint32_t)s_3d.stencil_test & 1) << 7)
+           | (((s_3d.color_mask >> 16) & 1) << 8) | (((s_3d.color_mask >> 8) & 1) << 9) | ((s_3d.color_mask & 1) << 10)
+           | (((s_3d.color_mask >> 24) & 1) << 11) | (((uint32_t)s_3d.st_func & 0xF) << 12) | (((uint32_t)s_gpu.prim & 0xF) << 16));
     if (!g_cap_on) return;
-    if (!g_cap_list) g_cap_list = fopen("ux0:data/twotowers/cap/draws.txt", "w");
+    if (!g_cap_list) { char p2[96]; sceIoMkdir(g_cap_dir, 0777); snprintf(p2, sizeof p2, "%s/draws.txt", g_cap_dir); g_cap_list = fopen(p2, "w"); }
     if (g_cap_list)
         fprintf(g_cap_list, "%4u %-6s prog %08X idx %5u prim %u target %08X %ux%u z %d test %d func %u mask %d blend %d cull %d fog %d stages %d%d%d%d\n",
                 g_cap_ndraw, path, hash, nidx, s_gpu.prim, g_cur_rt ? g_cur_rt->base : 0, g_cur_rt ? g_cur_rt->w : 0, g_cur_rt ? g_cur_rt->h : 0,
                 g_cur_ds != NULL, (int)s_3d.depth_test, (unsigned)s_3d.depth_func, (int)s_3d.depth_mask, (int)s_gpu.blend_enable,
                 (int)s_3d.cull_enable, (int)s_3d.fog_enable, s_stage[0].enabled, s_stage[1].enabled, s_stage[2].enabled, s_stage[3].enabled);
-    if (g_cap_list && (s_gpu.blend_enable || !s_3d.depth_test)) {
+    if (g_cap_list) {
         int k;
-        fprintf(g_cap_list, "      blend %04X/%04X eq %04X color %08X mask %08X;", s_gpu.blend_sfactor & 0xFFFF, s_gpu.blend_dfactor & 0xFFFF,
-                s_3d.blend_eq & 0xFFFF, s_3d.blend_color, s_3d.color_mask);
+        fprintf(g_cap_list, "      blend %04X/%04X eq %04X color %08X mask %08X; stencil %u func %04X ref %u mask %02X; alpha test %d func %04X ref %u; scissor %d,%d %dx%d;",
+                s_gpu.blend_sfactor & 0xFFFF, s_gpu.blend_dfactor & 0xFFFF,
+                s_3d.blend_eq & 0xFFFF, s_3d.blend_color, s_3d.color_mask, s_3d.stencil_test, s_3d.st_func, s_3d.st_ref, s_3d.st_mask,
+                s_3d.alpha_test, s_3d.alpha_func, s_3d.alpha_ref, g_cur_sc[0], g_cur_sc[1], g_cur_sc[2], g_cur_sc[3]);
         for (k = 0; k < 4; k++) if (s_stage[k].enabled)
             fprintf(g_cap_list, " stage %d tex %08X %ux%u fmt %08X mode %u%s;", k, s_stage[k].t.offset, s_stage[k].t.width, s_stage[k].t.height,
                     s_stage[k].t.color, (unsigned)s_stage[k].mode, gsurf_find(s_stage[k].t.offset, 0) ? " (a render target)" : "");
         fprintf(g_cap_list, "\n");
+#if defined(__vita__)
+        fprintf(g_cap_list, "      clip z %.6g..%.6g, vp %.6g %.6g %.9g %.3g; patcher: vp made %u failed %u, fp made %u failed %u, null %u/%u, last err %08X\n", s_clip_min, s_clip_max, g_vub[VB_VSC][0][0], g_vub[VB_VSC][0][1], g_vub[VB_VSC][0][2], g_vub[VB_VSC][0][3],
+                g_gxm_vc, g_gxm_vf, g_gxm_fc, g_gxm_ff, g_gxm_nullv, g_gxm_nullf, (unsigned)g_gxm_last_err);
+        fprintf(g_cap_list, "      vitaGL: nopoly %u cull %u/%04X disp %u depth %u/%04X/%u scissor %u region %d %d %d %d %d %d %d %d stencil %u blend %u/%08X phase %u dirtyfb %u err %04X wfb %p inuse %p rt %p prog %p vp %d %d %d %d\n",
+                no_polygons_mode, cull_face_state, gl_cull_mode, is_rendering_display, depth_test_state, depth_func, depth_mask_state,
+                scissor_test_state, region[0], region[1], region[2], region[3], region[4], region[5], region[6], region[7],
+                stencil_test_state, blend_state, blend_info, phase, dirty_framebuffer, vgl_error,
+                active_write_fb, in_use_framebuffer, gxm_render_target, cur_program, gl_viewport[0], gl_viewport[1], gl_viewport[2], gl_viewport[3]);
+#endif
     }
     g_cap_ndraw++;
-    if (g_cur_rt && g_cur_rt->w >= 640 && (g_cap_ndraw % 150 == 0 || (nidx <= 6 && s_gpu.blend_enable && g_cap_n < 90)
-                                         || (s_3d.color_mask == 0x01000000u && g_cap_ndraw % 20 == 0))) {
+    /* (v59: the scene itself is right by now -- the faults are in the frame's
+     * last passes, the glow and the HUD: every 3rd draw of the last 200 of
+     * the frame before) */
+    if (g_cur_rt && g_cur_rt->w >= 640 && (g_cap_ndraw % 150 == 0
+                                         || (g_cap_last > 200 && g_cap_ndraw + 200 >= g_cap_last && g_cap_ndraw % 4 == 0))) {
         char w[24];
         snprintf(w, sizeof w, "mid%04u", g_cap_ndraw);
         cap_save(g_cur_rt, w);
@@ -3989,37 +4970,508 @@ static void cap_note_draw(const char *path, uint32_t hash, uint32_t nidx)
 static uint16_t *g_didx;
 static uint32_t g_didx_cap;
 
+/* (v102) the direct draws' vertices in vertex buffer objects. From client
+ * arrays vitaGL copies every attribute's stride x vertices by itself -- an
+ * interleaved buffer of five attributes five times (~3 MB a frame, the
+ * "vitaGL glDrawElements" share of the render thread). Here the vertex range
+ * is copied once into a buffer vitaGL draws from in place: three buffers
+ * taken in turn, a frame each (the GPU is at most two frames behind).
+ * RECOMP_VGL_VBO_MB (each; default 3, 0 = off). */
+static struct { GLuint buf[3]; uint8_t *ptr[3]; uint32_t size, at; int cur, state; } g_vbs;
+static void vbs_frame(void) { g_vbs.cur = (g_vbs.cur + 1) % 3; g_vbs.at = 0; }
+static int vbs_ready(void)
+{
+    int i;
+    if (g_vbs.state) return g_vbs.state > 0;
+    {
+        const char *e = getenv("RECOMP_VGL_VBO_MB");
+        int mb = e ? atoi(e) : 0;   /* (v103: off -- v102 on the Vita drew garbage geometry at 3 fps) */
+        if (mb <= 0) { g_vbs.state = -1; return 0; }
+        g_vbs.size = (uint32_t)mb << 20;
+    }
+    for (i = 0; i < 3; i++) {
+        (glGenBuffers)(1, &g_vbs.buf[i]);
+        glBindBuffer(GL_ARRAY_BUFFER, g_vbs.buf[i]);
+        (glBufferData)(GL_ARRAY_BUFFER, (GLsizeiptr)g_vbs.size, NULL, GL_DYNAMIC_DRAW);
+        g_vbs.ptr[i] = (uint8_t *)(glMapBuffer)(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
+        (glUnmapBuffer)(GL_ARRAY_BUFFER);
+        if (!g_vbs.ptr[i]) { g_vbs.state = -1; fprintf(stderr, "  [VGL] vertex buffers: no memory (%u MB each), client arrays as before\n", g_vbs.size >> 20); glBindBuffer(GL_ARRAY_BUFFER, 0); return 0; }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    g_vbs.state = 1;
+    fprintf(stderr, "  [VGL] vertex buffers: 3 x %u MB\n", g_vbs.size >> 20);
+    return 1;
+}
+/* the offsets in the current buffer of each input's first vertex (lo), or
+ * 0xFFFFFFFF where it stays a client array; 0 = nothing placed */
+static int vbs_place(const HwVp *hv, uint32_t lo, uint32_t hi, uint32_t voff[16])
+{
+    struct { uint32_t stride, mn, mx; uint32_t at; } g[4];
+    int ng = 0, gi[16], i;
+    uint32_t k, need = 0, at0;
+    for (k = 0; k < 16; k++) { voff[k] = 0xFFFFFFFFu; gi[k] = -1; }
+    if (!vbs_ready()) return 0;
+    for (k = 0; k < hv->nin; k++) {
+        const VertexAttr *at = &s_gpu.attr[hv->inreg[k]];
+        uint32_t esz;
+        if (!at->size || !at->stride || !at->offset || at->type == 6) continue;
+        esz = at->type == 2 ? 4u * (at->size > 4 ? 4 : at->size) : at->type == 0 || at->type == 4 ? 4u : 2u * (at->size > 4 ? 4 : at->size);
+        for (i = 0; i < ng; i++)
+            if (g[i].stride == at->stride && at->offset + at->stride > g[i].mn && at->offset < g[i].mn + at->stride) break;
+        if (i == ng) {
+            if (ng == 4) continue;
+            g[ng].stride = at->stride; g[ng].mn = at->offset; g[ng].mx = at->offset + esz; ng++;
+        } else {
+            if (at->offset < g[i].mn) g[i].mn = at->offset;
+            if (at->offset + esz > g[i].mx) g[i].mx = at->offset + esz;
+        }
+        gi[k] = i;
+    }
+    if (!ng) return 0;
+    at0 = (g_vbs.at + 15u) & ~15u;
+    for (i = 0; i < ng; i++) {
+        uint32_t bytes = (hi - lo) * g[i].stride + (g[i].mx - g[i].mn);
+        if (g[i].mx - g[i].mn > g[i].stride * 2u) return 0;   /* (not one interleaved vertex after all) */
+        g[i].at = at0 + need;
+        need += (bytes + 15u) & ~15u;
+    }
+    if (at0 + need > g_vbs.size) { g_vbs_full++; return 0; }
+    for (i = 0; i < ng; i++)
+        memcpy(g_vbs.ptr[g_vbs.cur] + g[i].at, XR_PTR(g[i].mn + lo * g[i].stride), (hi - lo) * g[i].stride + (g[i].mx - g[i].mn));
+    g_vbs.at = at0 + need;
+    g_vbs_bytes += need; g_vbs_draws++;
+    for (k = 0; k < hv->nin; k++)
+        if (gi[k] >= 0) voff[k] = g[gi[k]].at + (s_gpu.attr[hv->inreg[k]].offset - g[gi[k]].mn);
+    return 1;
+}
+/* (v117) DRAWS JOINED. A fifth of a battle's draws change nothing since the
+ * draw before them (no state, no constant, no clear or copy between:
+ * s_last_chg == 0, what the D3D11 renderer joins on) and read the same
+ * vertex buffers: pieces of one model, the quads of one effect. Each cost a
+ * whole trip through vitaGL (~70 us). Now a direct draw is kept back -- its
+ * state bound, its triangle list in g_didx -- and such a draw after it only
+ * adds its triangles; the list is drawn before anything else touches GL.
+ * RECOMP_VGL_JOIN=0: off. */
+/* (v170) the attributes of the draw set up, for the one copy of their span (g_dz_obj) */
+static struct { int on; uint32_t start, lo, n; uint32_t off[16], st[16], esz[16]; uint8_t k[16]; GLint sz[16]; GLenum ty[16]; GLboolean nm[16]; } g_dz;
+extern void *__real_sceClibMemcpy(void *d, const void *s, unsigned n);   /* (v183: sceClibMemcpy is wrapped for [RTPROF]) */
+static int g_dz_mode = -1;
+/* (v216) THE STATIC VERTEX CACHE. Each direct draw (a joined list) had the
+ * span of guest memory its attributes read copied into vitaGL's frame pool
+ * (dz_place): ~1.6 MB a frame in Rohan's second level, the render thread's
+ * biggest zone (12.7%, "direct: the vertices copied") -- and most of it is
+ * the scenery, the same bytes every frame. Now a span (keyed by its guest
+ * address and length) whose bytes stay the same over two frames is copied
+ * once into memory of its own (an arena from vitaGL's RAM pool, TT_VCACHE_MB,
+ * default 6) and drawn from there for as long as its bytes do not change.
+ * Every use reads the span once (a 64-bit hash, NEON) and compares: a span
+ * that changed is copied into the frame pool as before (so a changed buffer
+ * never draws stale vertices); its old copy is freed 4 frames later (the GPU
+ * may still read it). A span that changes 3 times is left to the old way
+ * (no reading) for 600 frames. Spans under 256 bytes: the old way. The same
+ * for the triangle lists: one whose indices were the same in two frames is
+ * kept and drawn from an element buffer of ours (vitaGL copies nothing).
+ * When the arena is full the copies not used for 6 frames are dropped.
+ * TT_VCACHE_MB=0: off. */
+#define VC_N 4096u
+#define IX_N 2048u
+enum { VC_EMPTY, VC_SEEN, VC_HASHED, VC_CACHED, VC_DYN };
+typedef struct { uint32_t start, len, f_last, f_use, f_dyn, sz, uses; uint32_t sh[16][2]; uint8_t *mem, *dst; uint8_t st, chg; } VcEnt;
+typedef struct { uint32_t h0, h1, n, f_last, f_use, sz; uint8_t *mem, *dst; uint8_t st; } IxEnt;
+static VcEnt *g_vc;
+static IxEnt *g_ix;
+static SceClibMspace g_vc_ms;
+static int g_vc_on = -1;
+static uint32_t g_vc_now = 0xFFFFFFFFu, g_vc_sweep_f = 0xFFFFFFFFu;
+#define VC_RET_N 8192u
+static struct { uint8_t *m; uint32_t f, sz; } g_vc_ret[VC_RET_N];
+static uint32_t g_vc_rh, g_vc_rt;
+static uint32_t g_ix_obj[5] = { 0, 0, 0, 0xFFFFFFFFu, 0 };
+static int vc_init(void)
+{
+    const char *e;
+    int mb;
+    uint8_t *a = NULL;
+    if (g_vc_on >= 0) return g_vc_on;
+    g_vc_on = 0;
+    e = getenv("TT_VCACHE_MB");
+    mb = e ? atoi(e) : 8;
+    if (mb <= 0) { fprintf(stderr, "  [VCACHE] off (TT_VCACHE_MB=0)\n"); return 0; }
+    g_vc = (VcEnt *)calloc(VC_N, sizeof *g_vc);
+    g_ix = (IxEnt *)calloc(IX_N, sizeof *g_ix);
+    if (!g_vc || !g_ix) { fprintf(stderr, "  [VCACHE] off: no memory for the tables\n"); return 0; }
+    /* (v217) vitaGL's phycont pool first (v216: only 3 of 6 MB found in its RAM pool, the cache too small) */
+    for (; mb >= 1 && !a; mb /= 2) {
+        a = (uint8_t *)vglAlloc((uint32_t)mb << 20, VGL_MEM_PHYCONT);
+        if (!a) a = (uint8_t *)vglAlloc((uint32_t)mb << 20, VGL_MEM_RAM);
+        if (a) break;
+    }
+    if (!a) { fprintf(stderr, "  [VCACHE] off: no room in vitaGL's RAM pool\n"); return 0; }
+    g_vc_ms = sceClibMspaceCreate(a, (SceSize)mb << 20);
+    if (!g_vc_ms) { vglFree(a); fprintf(stderr, "  [VCACHE] off: no heap\n"); return 0; }
+    g_vc_size = (uint32_t)mb << 20;
+    g_vc_on = 1;
+    fprintf(stderr, "  [VCACHE] static vertex cache: %d MB\n", mb);
+    return 1;
+}
+static void vc_hash(const uint8_t *p, uint32_t len, uint32_t *o0, uint32_t *o1)
+{
+    static const uint32_t lane[4] = { 1u, 0x01000193u, 0x5BD1E995u, 0x68E31DA4u };
+    const uint32x4_t P1 = vdupq_n_u32(2654435761u), P2 = vdupq_n_u32(2246822519u), L = vld1q_u32(lane);
+    uint32x4_t a0 = vaddq_u32(vdupq_n_u32(0x9E3779B1u ^ len), L), a1 = vaddq_u32(vdupq_n_u32(0x85EBCA77u), L);
+    uint32x4_t a2 = vaddq_u32(vdupq_n_u32(0xC2B2AE3Du), L), a3 = vaddq_u32(vdupq_n_u32(0x27D4EB2Fu ^ len), L);
+    uint32_t i = 0, h = 0x165667B1u ^ len, g = 0x3C6EF372u + len, w[16], k;
+#define VC_R(a, v) (a = vmlaq_u32(a, v, P2), a = vsriq_n_u32(vshlq_n_u32(a, 13), a, 19), a = vmulq_u32(a, P1))
+    for (; i + 64 <= len; i += 64) {
+        __builtin_prefetch(p + i + 384);
+        VC_R(a0, vreinterpretq_u32_u8(vld1q_u8(p + i)));
+        VC_R(a1, vreinterpretq_u32_u8(vld1q_u8(p + i + 16)));
+        VC_R(a2, vreinterpretq_u32_u8(vld1q_u8(p + i + 32)));
+        VC_R(a3, vreinterpretq_u32_u8(vld1q_u8(p + i + 48)));
+    }
+#undef VC_R
+    for (; i + 4 <= len; i += 4) {
+        uint32_t v; memcpy(&v, p + i, 4);
+        h += v * 3266489917u; h = (h << 17 | h >> 15) * 668265263u;
+    }
+    for (; i < len; i++) { h += p[i] * 374761393u; h = (h << 11 | h >> 21) * 2654435761u; }
+    vst1q_u32(w, a0); vst1q_u32(w + 4, a1); vst1q_u32(w + 8, a2); vst1q_u32(w + 12, a3);
+    for (k = 0; k < 16; k++) {
+        h ^= w[k]; h = (h << 13 | h >> 19) * 2654435761u;
+        g += w[k] ^ (g >> 15); g = (g << 17 | g >> 15) * 2246822519u;
+    }
+    h ^= h >> 15; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+    g ^= g >> 16; g *= 0x85EBCA6Bu; g ^= g >> 13; g *= 0xC2B2AE35u; g ^= g >> 16;
+    *o0 = h; *o1 = g;
+}
+static int vc_retire(uint8_t *m, uint32_t sz, uint32_t now)
+{
+    if (g_vc_rh - g_vc_rt >= VC_RET_N) return 0;
+    g_vc_ret[g_vc_rh % VC_RET_N].m = m; g_vc_ret[g_vc_rh % VC_RET_N].f = now; g_vc_ret[g_vc_rh % VC_RET_N].sz = sz;
+    g_vc_rh++;
+    return 1;
+}
+/* the copies let go 4+ frames ago: the GPU is done with them (vitaGL reuses its frame pool after 3) */
+static void vc_frame(uint32_t now)
+{
+    g_vc_now = now;
+    while (g_vc_rt != g_vc_rh && now - g_vc_ret[g_vc_rt % VC_RET_N].f >= 4u) {
+        sceClibMspaceFree(g_vc_ms, g_vc_ret[g_vc_rt % VC_RET_N].m);
+        g_vc_used -= g_vc_ret[g_vc_rt % VC_RET_N].sz;
+        g_vc_rt++;
+    }
+}
+/* the arena full: the copies not used for 6 frames freed (at most once a frame) */
+static void vc_sweep(uint32_t now)
+{
+    uint32_t i;
+    g_vc_sweep_f = now;
+    for (i = 0; i < VC_N; i++) {
+        VcEnt *e = &g_vc[i];
+        if (e->mem && now - e->f_use >= 6u) {
+            sceClibMspaceFree(g_vc_ms, e->mem); g_vc_used -= e->sz; g_vc_entries--;
+            e->mem = e->dst = NULL; e->sz = 0;
+            if (e->st == VC_CACHED) { e->st = VC_HASHED; e->f_last = e->f_use; }
+            g_vc_evict++;
+        }
+    }
+    for (i = 0; i < IX_N; i++) {
+        IxEnt *x = &g_ix[i];
+        if (x->mem && now - x->f_use >= 6u) {
+            sceClibMspaceFree(g_vc_ms, x->mem); g_vc_used -= x->sz;
+            x->mem = x->dst = NULL; x->sz = 0; x->f_last = x->f_use;
+            g_vc_evict++;
+        }
+    }
+}
+static uint8_t *vc_alloc(uint32_t sz, uint32_t now)
+{
+    uint8_t *m = (uint8_t *)sceClibMspaceMalloc(g_vc_ms, sz);
+    if (!m && g_vc_sweep_f != now) { vc_sweep(now); m = (uint8_t *)sceClibMspaceMalloc(g_vc_ms, sz); }
+    if (m) g_vc_used += sz; else g_vc_nomem++;
+    return m;
+}
+/* an entry's copy let go (deferred); 0: the list of those is full, kept */
+static int vc_drop(VcEnt *e, uint32_t now)
+{
+    if (!e->mem) return 1;
+    if (!vc_retire(e->mem, e->sz, now)) return 0;
+    e->mem = e->dst = NULL; e->sz = 0; g_vc_entries--;
+    return 1;
+}
+/* (v217) the span's 16 stripes hashed (all, or stripe k only) */
+#define VC_ST 16u
+static void vc_hash_stripes(const uint8_t *src, uint32_t len, uint32_t (*sh)[2], int k)
+{
+    uint32_t j;
+    for (j = 0; j < VC_ST; j++) {
+        uint32_t a = len * j / VC_ST, b = len * (j + 1) / VC_ST;
+        if (k >= 0 && (uint32_t)k != j) continue;
+        vc_hash(src + a, b - a, &sh[j][0], &sh[j][1]);
+        g_vc_hash_b += b - a;
+    }
+}
+static int vc_same(uint32_t (*x)[2], uint32_t (*y)[2])
+{
+    return memcmp(x, y, sizeof(uint32_t) * 2 * VC_ST) == 0;
+}
+/* the cached copy of the guest span [start, start + len), or NULL: copy it as before */
+static uint8_t *vc_find(uint32_t start, uint32_t len)
+{
+    uint32_t now, slot, i, sz, k;
+    uint32_t sh[VC_ST][2];
+    int full = 0;
+    VcEnt *e = NULL, *v = NULL;
+    const uint8_t *src;
+    uint8_t *m, *dst;
+    if (len < 256u || !vc_init()) return NULL;
+    now = vglGetFrameNumber();
+    if (now != g_vc_now) vc_frame(now);
+    slot = (start * 2654435761u) ^ (len * 40503u);
+    for (i = 0; i < 8; i++) {
+        VcEnt *c = &g_vc[(slot + i) & (VC_N - 1)];
+        if (c->st != VC_EMPTY && c->start == start && c->len == len) { e = c; break; }
+        if (!v || (v->st != VC_EMPTY && (c->st == VC_EMPTY || c->f_use < v->f_use))) v = c;
+    }
+    if (!e) {
+        if (v->st != VC_EMPTY && (v->f_use == now || !vc_drop(v, now))) return NULL;
+        memset(v, 0, sizeof *v);
+        v->start = start; v->len = len; v->st = VC_SEEN; v->f_last = v->f_use = now;
+        g_vc_new++;
+        return NULL;
+    }
+    e->f_use = now;
+    src = XR_PTR(start);
+    if (e->st == VC_SEEN) {
+        if (e->f_last != now) { VWHERE("direct: vertex cache check"); vc_hash_stripes(src, len, e->sh, -1); e->st = VC_HASHED; e->f_last = now; }
+        return NULL;
+    }
+    if (e->st == VC_DYN) {
+        if (now - e->f_dyn >= 600u && vc_drop(e, now)) { e->st = VC_SEEN; e->chg = 0; e->f_last = now; }
+        return NULL;
+    }
+    VWHERE("direct: vertex cache check");
+    if (e->st == VC_CACHED) {
+        /* (v217) one stripe a use, in turn: the whole span read over 16 uses */
+        k = e->uses++ & (VC_ST - 1);
+        vc_hash_stripes(src, len, sh, (int)k);
+        if (sh[k][0] == e->sh[k][0] && sh[k][1] == e->sh[k][1]) { g_vc_hit++; g_vc_hit_b += len; return e->dst; }
+    } else {   /* VC_HASHED: all of it, the same as the frame before? */
+        if (e->f_last == now) return NULL;   /* (the same frame: not yet two frames the same) */
+        vc_hash_stripes(src, len, sh, -1); full = 1;
+        if (vc_same(sh, e->sh)) {
+            sz = len + 32u;
+            m = vc_alloc(sz, now);
+            if (!m) { e->f_last = now; return NULL; }
+            dst = (uint8_t *)(((uintptr_t)m + 15u) & ~(uintptr_t)15u) + (start & 15u);
+            __real_sceClibMemcpy(dst, src, len);
+            vc_hash_stripes(src, len, sh, -1);   /* (the guest's bytes unchanged while they were copied?) */
+            if (!vc_same(sh, e->sh)) {   /* no: the GPU never saw this copy, freed now */
+                sceClibMspaceFree(g_vc_ms, m); g_vc_used -= sz;
+                memcpy(e->sh, sh, sizeof sh); e->f_last = now; g_vc_chg++;
+                return NULL;
+            }
+            e->mem = m; e->dst = dst; e->sz = sz; e->st = VC_CACHED; e->uses = 0; g_vc_entries++;
+            g_vc_hit++; g_vc_hit_b += len;
+            return dst;
+        }
+    }
+    /* changed: copied as before, hashed again in a later frame */
+    g_vc_chg++;
+    e->f_last = now;
+    if (!vc_drop(e, now) || ++e->chg >= 3) { e->st = VC_DYN; e->f_dyn = now; g_vc_dyn++; }
+    else {
+        e->st = VC_HASHED;
+        if (full) memcpy(e->sh, sh, sizeof sh); else vc_hash_stripes(src, len, e->sh, -1);
+    }
+    return NULL;
+}
+/* the kept copy of a triangle list (16-bit, nt indices), or NULL */
+static const uint16_t *ix_find(const uint16_t *d, uint32_t nt)
+{
+    uint32_t now, slot, i, h0, h1, sz;
+    IxEnt *x = NULL, *v = NULL;
+    uint8_t *m;
+    if (nt < 96u || !vc_init()) return NULL;
+    now = vglGetFrameNumber();
+    if (now != g_vc_now) vc_frame(now);
+    vc_hash((const uint8_t *)d, nt * 2u, &h0, &h1);
+    slot = h0 ^ (nt * 40503u);
+    for (i = 0; i < 8; i++) {
+        IxEnt *c = &g_ix[(slot + i) & (IX_N - 1)];
+        if (c->st != VC_EMPTY && c->h0 == h0 && c->h1 == h1 && c->n == nt) { x = c; break; }
+        if (!v || (v->st != VC_EMPTY && (c->st == VC_EMPTY || c->f_use < v->f_use))) v = c;
+    }
+    if (!x) {
+        if (v->st != VC_EMPTY) {
+            if (v->f_use == now) return NULL;
+            if (v->mem) { if (!vc_retire(v->mem, v->sz, now)) return NULL; }
+        }
+        memset(v, 0, sizeof *v);
+        v->h0 = h0; v->h1 = h1; v->n = nt; v->st = VC_SEEN; v->f_last = v->f_use = now;
+        g_ix_new++;
+        return NULL;
+    }
+    x->f_use = now;
+    if (x->mem) { g_ix_hit++; g_ix_hit_b += nt * 2u; return (const uint16_t *)x->dst; }
+    if (x->f_last == now) { g_ix_miss++; return NULL; }
+    sz = nt * 2u + 16u;
+    m = vc_alloc(sz, now);
+    if (!m) { x->f_last = now; g_ix_miss++; return NULL; }
+    x->mem = m; x->sz = sz;
+    x->dst = (uint8_t *)(((uintptr_t)m + 15u) & ~(uintptr_t)15u);
+    __real_sceClibMemcpy(x->dst, d, nt * 2u);
+    g_ix_hit++; g_ix_hit_b += nt * 2u;
+    return (const uint16_t *)x->dst;
+}
+/* the direct path's draw: the triangle list in g_didx, indices 0..top */
+static void dz_draw(uint32_t nt, uint32_t top)
+{
+    const uint16_t *ci = ix_find(g_didx, nt);
+    if (ci) {
+        g_ix_obj[0] = (uint32_t)(uintptr_t)ci;
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)(uintptr_t)g_ix_obj);
+        vgl_draw_range(GL_TRIANGLES, top, (GLsizei)nt, NULL);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    } else vgl_draw_range(GL_TRIANGLES, top, (GLsizei)nt, g_didx);
+}
+static int dz_place(uint32_t hi)
+{
+    uint32_t j, end = 0, len, old = 0;
+    uint8_t *p, *dst;
+    if (!g_dz.on) return 1;
+    g_dz.on = 0;
+    for (j = 0; j < g_dz.n; j++) {
+        uint32_t e = g_dz.off[j] + hi * g_dz.st[j] + g_dz.esz[j];
+        if (e > end) end = e;
+        old += (hi - g_dz.lo + 1) * g_dz.st[j];
+    }
+    len = end - g_dz.start;
+    if (len <= (1u << 20) && (g_dz.start >> 24) == ((end - 1) >> 24)) {   /* (v216) the static vertex cache */
+        uint8_t *c = vc_find(g_dz.start, len);
+        if (c) { g_dz_obj[0] = (uint32_t)(uintptr_t)c; g_dz_draws++; g_dz_old += old; return 1; }
+        g_vc_miss++;
+        VWHERE("direct: the vertices copied");
+    }
+    p = (len <= (1u << 20) && (g_dz.start >> 24) == ((end - 1) >> 24)) ? (uint8_t *)vgl_reserve_data_pool(len + 32) : NULL;
+    if (!p) {   /* the attributes back to client arrays, as before */
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        for (j = 0; j < g_dz.n; j++)
+            glVertexAttribPointer(g_dz.k[j], g_dz.sz[j], g_dz.ty[j], g_dz.nm[j], (GLsizei)g_dz.st[j], XR_PTR(g_dz.off[j] + g_dz.lo * g_dz.st[j]));
+        g_dz_fb++;
+        return 0;
+    }
+    dst = (uint8_t *)(((uintptr_t)p + 15u) & ~(uintptr_t)15u) + (g_dz.start & 15u);
+    __real_sceClibMemcpy(dst, XR_PTR(g_dz.start), len);   /* (v171) the copy vitaGL itself uses (v170: newlib memcpy, the copy cost as much as it saved) */
+    g_dz_obj[0] = (uint32_t)(uintptr_t)dst;
+    g_dz_draws++; g_dz_bytes += len; g_dz_old += old;
+    return 1;
+}
+static struct { int active, has_ds; HwVp *hv; uint32_t sig, lo, hi, nt; } g_jn;
+static int g_jn_mode = -1;
+static void jn_flush(void)
+{
+    if (!g_jn.active) return;
+    g_jn.active = 0;
+    if (!g_jn.nt) { g_dz.on = 0; return; }
+    VWHERE("direct: the vertices copied");
+    dz_place(g_jn.hi);
+    VWHERE("batch: vitaGL glDrawElements");
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    { VP_T0(t); dz_draw(g_jn.nt, g_jn.hi - g_jn.lo); VP_ADD(VP_DRAW, t); g_vp_draws++; }
+    VWHERE("direct: after the draw");
+    if (g_jn.has_ds) vgl_depth_keep();
+    g_jn_runs++;
+}
 static int gpu_batch_hw_direct(HwVp *hv)
 {
     static int on = -1;
     uint32_t n = s_gpu.idx_count, i, lo = 0xFFFFFFFFu, hi = 0, nt = 0, k;
+    uint32_t jsig, jbase;
+    int has_cmp = 0, join = 0;
     const uint32_t *ix = s_gpu.idx;
     GLuint prog;
     uint16_t *d;
+    int inl = s_gpu.inline_active;
+    static int inl_on = -1;
     if (on < 0) { const char *e = getenv("RECOMP_VGL_DIRECT"); on = !(e && e[0] == '0'); }
-    if (!on || s_gpu.inline_active || n < 3) return 0;
+    /* (v77) the inline vertices (the HUD, the menus) back on the CPU path:
+     * drawn direct (v74-v76) the HUD and the pause menu were gone.
+     * RECOMP_VGL_DIRECT_INLINE=1: direct */
+    if (inl_on < 0) { const char *e = getenv("RECOMP_VGL_DIRECT_INLINE"); inl_on = e && e[0] == '1'; }
+    if (inl && !inl_on) { g_vpd_why[1]++; return 0; }
+    if (!on || n < 3) { g_vpd_why[0]++; return 0; }
+    {   /* (v125) TT_LIGHTS=1: the lights' pass. Each torch or fire draws the
+         * walls and ground it lights once more, added on (ONE/ONE, vertex
+         * program 453E894B): 164 of a crowded frame's 810 draws. Off by
+         * default: the scene keeps its own lighting, without the flicker. */
+        static int lights = -1;
+        if (lights < 0) { const char *e = getenv("TT_LIGHTS"); lights = e && e[0] == '1'; }
+        if (!lights && !g_cap_on && hv->hash == 0x453E894Bu && s_gpu.blend_enable
+            && (s_gpu.blend_sfactor & 0xFFFF) == 1 && (s_gpu.blend_dfactor & 0xFFFF) == 1) { g_lite_skipped[2]++; jn_flush(); return 1; }
+    }
+    VWHERE("direct: index range");   /* (v108: finer zones) */
+    /* (v74) the vertices inline in the pushbuffer (INLINE_ARRAY) and the
+     * packed normals (CMP, type 6) too: before, those draws -- the
+     * characters -- had every input unpacked to floats on the CPU (the
+     * render thread's biggest share, "vertex attributes", v73) */
     for (k = 0; k < hv->nin; k++) {
         const VertexAttr *at = &s_gpu.attr[hv->inreg[k]];
         if (!at->size || !at->stride) continue;
-        if (!at->offset || at->type == 3 || at->type >= 6) return 0;
+        if (!inl && !at->offset) continue;   /* (v95) no buffer: a constant (0, 0, 0, 1), as on the CPU path -- such draws went to the CPU path */
+        if (at->type == 3 || at->type > 6) { g_vpd_why[1]++; return 0; }
+        if (at->type == 6) has_cmp = 1;
     }
+#if defined(__vita__) && defined(__ARM_NEON)
+    {   /* (v159) the index range four at a time (NEON): every direct draw scans its indices, 3-4% of the render thread */
+        i = 0;
+        if (n >= 16) {
+            uint32x4_t vlo = vdupq_n_u32(lo), vhi = vdupq_n_u32(hi);
+            for (; i + 4 <= n; i += 4) { uint32x4_t v = vld1q_u32(&ix[i]); vlo = vminq_u32(vlo, v); vhi = vmaxq_u32(vhi, v); }
+            {
+                uint32x2_t a = vpmin_u32(vget_low_u32(vlo), vget_high_u32(vlo)), b = vpmax_u32(vget_low_u32(vhi), vget_high_u32(vhi));
+                a = vpmin_u32(a, a); b = vpmax_u32(b, b);
+                lo = vget_lane_u32(a, 0); hi = vget_lane_u32(b, 0);
+            }
+        }
+        for (; i < n; i++) { uint32_t v = ix[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    }
+#else
     for (i = 0; i < n; i++) { uint32_t v = ix[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
-    if (hi - lo > 65535u) return 0;
+#endif
+    if (hi - lo > 65535u) { g_vpd_why[2]++; return 0; }
     for (k = 0; k < hv->nin; k++) {
         const VertexAttr *at = &s_gpu.attr[hv->inreg[k]];
         if (!at->size || !at->stride) continue;
-        if (((at->offset + lo * at->stride) >> 24) != ((at->offset + hi * at->stride + 15) >> 24)) return 0;
+        if (!inl && !at->offset) continue;
+        if (inl) {
+            if ((size_t)at->offset + (size_t)hi * at->stride + 4 * (at->size > 4 ? 4 : at->size) > (size_t)s_gpu.inline_count * 4) { g_vpd_why[3]++; return 0; }
+        } else if (((at->offset + lo * at->stride) >> 24) != ((at->offset + hi * at->stride + 15) >> 24)) { g_vpd_why[3]++; return 0; }
     }
+    if (g_jn_mode < 0) { const char *e = getenv("RECOMP_VGL_JOIN"); g_jn_mode = !(e && e[0] == '0'); }
+    jsig = (uint32_t)(uintptr_t)hv * 2654435761u;
+    for (k = 0; k < hv->nin; k++) {
+        const VertexAttr *at = &s_gpu.attr[hv->inreg[k]];
+        jsig = (jsig ^ at->offset ^ (at->stride << 8) ^ (at->type << 16) ^ (at->size << 20)) * 16777619u;
+    }
+    if (g_jn.active) {
+        if (!s_last_chg && !inl && !has_cmp && !g_cap_on && g_jn.hv == hv && g_jn.sig == jsig
+            && lo >= g_jn.lo && hi - g_jn.lo <= 65535u && g_jn.nt + n * 3 < 60000u) join = 1;
+        else jn_flush();
+    }
+    jbase = join ? g_jn.lo : lo;
+    nt = join ? g_jn.nt : 0;
     {
-        uint32_t need = n * 3 + 6;
+        uint32_t need = nt + n * 3 + 6;
         if (need > g_didx_cap) {
             uint16_t *nb = (uint16_t *)realloc(g_didx, need * 2);
-            if (!nb) return 0;
+            if (!nb) { jn_flush(); return 0; }
             g_didx = nb; g_didx_cap = need;
         }
     }
     d = g_didx;
-#define DT(a, b, c) (d[nt] = (uint16_t)((a) - lo), d[nt + 1] = (uint16_t)((b) - lo), d[nt + 2] = (uint16_t)((c) - lo), nt += 3)
+    VWHERE("direct: triangle list");
+#define DT(a, b, c) (d[nt] = (uint16_t)((a) - jbase), d[nt + 1] = (uint16_t)((b) - jbase), d[nt + 2] = (uint16_t)((c) - jbase), nt += 3)
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:      for (i = 0; i + 2 < n; i += 3) DT(ix[i], ix[i+1], ix[i+2]); break;
     case NV_PRIM_TRIANGLE_STRIP: for (i = 0; i + 2 < n; i++) { if (i & 1) DT(ix[i+1], ix[i], ix[i+2]); else DT(ix[i], ix[i+1], ix[i+2]); } break;
@@ -4027,12 +5479,37 @@ static int gpu_batch_hw_direct(HwVp *hv)
     case NV_PRIM_POLYGON:        for (i = 1; i + 1 < n; i++) DT(ix[0], ix[i], ix[i+1]); break;
     case NV_PRIM_QUADS:          for (i = 0; i + 3 < n; i += 4) { DT(ix[i], ix[i+1], ix[i+2]); DT(ix[i], ix[i+2], ix[i+3]); } break;
     case NV_PRIM_QUAD_STRIP:     for (i = 0; i + 3 < n; i += 2) { DT(ix[i], ix[i+1], ix[i+3]); DT(ix[i], ix[i+3], ix[i+2]); } break;
-    default: return 0;
+    default: jn_flush(); return 0;
     }
 #undef DT
+    if (join) {   /* the run goes on: nothing of GL is touched */
+        s_gpu.tris_drawn += (nt - g_jn.nt) / 3;
+        g_jn.nt = nt;
+        if (hi > g_jn.hi) g_jn.hi = hi;
+        g_jn_joined++;
+        g_vp_hw++; g_vp_direct++; g_cap_hw++;
+        s_gpu.drawn_offset = s_gpu.color_offset;
+        s_3d.verts += hi - lo + 1;
+        g_hwvp_stat_hw++;
+        return 1;
+    }
     if (!nt) return 1;
-    { VP_T0(t); gpu_bind_stages(); VP_ADD(VP_STAGES, t); }
-    { VP_T0(t); prog = gpu_program_for(hv->vs); VP_ADD(VP_PROG, t); }
+    {   /* (v116) how many draws could be joined to the one before: nothing
+         * changed since it (no state, no constants) -- and of those, the same
+         * vertex buffers ([VGLPERF] joinable) */
+        static uint32_t prev_sig;
+        uint32_t sig = (uint32_t)(uintptr_t)hv * 2654435761u ^ (uint32_t)inl;
+        for (k = 0; k < hv->nin; k++) {
+            const VertexAttr *at = &s_gpu.attr[hv->inreg[k]];
+            sig = (sig ^ at->offset ^ (at->stride << 8) ^ (at->type << 16) ^ (at->size << 20)) * 16777619u;
+        }
+        if (!s_last_chg) { g_mg_n[0]++; if (sig == prev_sig) g_mg_n[1]++; }
+        else if (s_last_chg == CHG_CONST) g_mg_n[2]++;
+        if (nt <= 6) g_mg_n[3]++;
+        prev_sig = sig;
+    }
+    { VWHERE("batch: textures/stages"); VP_T0(t); gpu_stages_vgl(); VP_ADD(VP_STAGES, t); }
+    { VWHERE("batch: program"); VP_T0(t); prog = gpu_program_for(hv->vs); VP_ADD(VP_PROG, t); VWHERE("batch: vertex attributes"); }
     if (!prog) return 0;
     glBindVertexArray(g_vao_x);
     g_sh.vao = 2;
@@ -4041,46 +5518,130 @@ static int gpu_batch_hw_direct(HwVp *hv)
         float sw[16];
         int changed = 0;
         memset(sw, 0, sizeof sw);
-        for (k = 0; k < 16; k++) {
+        uint32_t kmax = vgl_va_top();   /* (v96) not all 16 every draw: the inputs, and what is still enabled above them */
+        if (kmax < hv->nin) kmax = hv->nin;
+        uint32_t voff[16];
+        int zc = 0;
+        if (inl || !vbs_place(hv, lo, hi, voff)) memset(voff, 0xFF, sizeof voff);
+        if (!inl && ip_on() && hi - lo + 1 >= 24u && !g_cap_on) {   /* (v122: read in place) */
+            zc = 1;
+            for (k = 0; k < hv->nin && zc; k++) {
+                const VertexAttr *at = &s_gpu.attr[hv->inreg[k]];
+                uint32_t ga;
+                if (!at->size || !at->stride || !at->offset || at->type == 6) continue;
+                ga = at->offset + lo * at->stride;
+                if (!ip_slice(ga, XR_PTR(ga & 0xFF000000u))) zc = 0;
+            }
+            if (zc) g_ip_draws++;
+        }
+        g_dz.on = 0;
+        if (g_dz_mode < 0) { const char *e = getenv("TT_VCOPY1"); g_dz_mode = !(e && e[0] == '0'); }
+        if (g_dz_mode && !inl && !zc && !has_cmp && !g_cap_on && voff[0] == 0xFFFFFFFFu) {
+            /* (v170) one copy of the span the attributes read, if no larger than vitaGL's copies */
+            uint32_t st0 = 0xFFFFFFFFu, en = 0, sum = 0, j = 0;
+            int ok = 1;
+            for (k = 0; k < hv->nin && k < kmax; k++) {
+                const VertexAttr *at = &s_gpu.attr[hv->inreg[k]];
+                uint32_t sz1 = at->size > 4 ? 4 : at->size, es, a0;
+                if (!at->size || !at->stride || !at->offset) continue;
+                if (voff[k] != 0xFFFFFFFFu) { ok = 0; break; }
+                switch (at->type) { case 0: es = 4; break; case 2: es = 4 * sz1; break; case 4: es = sz1; break; default: es = 2 * sz1; break; }
+                a0 = at->offset + lo * at->stride;
+                if (a0 < st0) st0 = a0;
+                if (at->offset + hi * at->stride + es > en) en = at->offset + hi * at->stride + es;
+                sum += (hi - lo + 1) * at->stride;
+                g_dz.off[j] = at->offset; g_dz.st[j] = at->stride; g_dz.esz[j] = es; g_dz.k[j] = (uint8_t)k;
+                j++;
+            }
+            if (ok && j && en - st0 <= sum && (st0 >> 24) == ((en - 1) >> 24)) { g_dz.on = 1; g_dz.n = j; g_dz.start = st0; g_dz.lo = lo; }
+        }
+        for (k = 0; k < kmax; k++) {
             const VertexAttr *at;
             GLenum ty; GLboolean nm; GLint sz;
             if (k >= hv->nin) { glDisableVertexAttribArray(k); continue; }
             at = &s_gpu.attr[hv->inreg[k]];
-            if (!at->size || !at->stride) {
+            if (!at->size || !at->stride || (!inl && !at->offset)) {
                 glDisableVertexAttribArray(k);
                 glVertexAttrib4f(k, 0.0f, 0.0f, 0.0f, 1.0f);
                 continue;
             }
             sz = (GLint)(at->size > 4 ? 4 : at->size);
-            switch (at->type) {
-            case 0: ty = GL_UNSIGNED_BYTE; nm = GL_TRUE; sz = 4; sw[k] = 1.0f; break;   /* D3DCOLOR */
-            case 2: ty = GL_FLOAT; nm = GL_FALSE; break;
-            case 4: ty = GL_UNSIGNED_BYTE; nm = GL_TRUE; break;
-            case 1: ty = GL_SHORT; nm = GL_TRUE; break;
-            default: ty = GL_SHORT; nm = GL_FALSE; break;   /* 5: S32K */
+            {
+                const uint8_t *src = inl ? (const uint8_t *)s_gpu.inline_buf + at->offset + (size_t)lo * at->stride
+                                         : (const uint8_t *)XR_PTR(at->offset + lo * at->stride);
+                if (at->type == 6) {   /* CMP: 11:11:10 signed, unpacked to floats for these vertices */
+                    uint32_t nv = hi - lo + 1, j;
+                    float *o;
+                    if ((size_t)nv * 3 > g_cmp_cap[k]) {
+                        float *nb = (float *)realloc(g_cmp_buf[k], (size_t)nv * 3 * 2 * sizeof(float));
+                        if (!nb) return 0;
+                        g_cmp_buf[k] = nb; g_cmp_cap[k] = nv * 3 * 2;
+                    }
+                    o = g_cmp_buf[k];
+                    for (j = 0; j < nv; j++) {
+                        uint32_t v; int32_t x, y, z;
+                        memcpy(&v, src + (size_t)j * at->stride, 4);
+                        x = (int32_t)(v << 21) >> 21; y = (int32_t)(v << 10) >> 21; z = (int32_t)v >> 22;
+                        o[3 * j] = (float)x * (1.0f / 1023.0f); o[3 * j + 1] = (float)y * (1.0f / 1023.0f); o[3 * j + 2] = (float)z * (1.0f / 511.0f);
+                    }
+                    glEnableVertexAttribArray(k);
+                    glBindBuffer(GL_ARRAY_BUFFER, 0);
+                    glVertexAttribPointer(k, 3, GL_FLOAT, GL_FALSE, 12, o);
+                    g_vpd_cmp++;
+                    continue;
+                }
+                switch (at->type) {
+                case 0: ty = GL_UNSIGNED_BYTE; nm = GL_TRUE; sz = 4; sw[k] = 1.0f; break;   /* D3DCOLOR */
+                case 2: ty = GL_FLOAT; nm = GL_FALSE; break;
+                case 4: ty = GL_UNSIGNED_BYTE; nm = GL_TRUE; break;
+                case 1: ty = GL_SHORT; nm = GL_TRUE; break;
+                default: ty = GL_SHORT; nm = GL_FALSE; break;   /* 5: S32K */
+                }
+                glEnableVertexAttribArray(k);
+                if (voff[k] != 0xFFFFFFFFu) {
+                    glBindBuffer(GL_ARRAY_BUFFER, g_vbs.buf[g_vbs.cur]);
+                    glVertexAttribPointer(k, sz, ty, nm, (GLsizei)at->stride, (const void *)(uintptr_t)voff[k]);
+                } else if (zc) {
+                    glBindBuffer(GL_ARRAY_BUFFER, 0);
+                    vgl_va_pointer_inplace(k, sz, ty, nm, (GLsizei)at->stride, src);
+                } else if (g_dz.on) {   /* (v170) the offset in the span, copied once before the draw */
+                    uint32_t j;
+                    for (j = 0; j < g_dz.n && g_dz.k[j] != k; j++) ;
+                    if (j < g_dz.n) { g_dz.sz[j] = sz; g_dz.ty[j] = ty; g_dz.nm[j] = nm; }
+                    glBindBuffer(GL_ARRAY_BUFFER, 0);
+                    vgl_va_pointer_dz(k, sz, ty, nm, (GLsizei)at->stride, (const void *)(uintptr_t)(at->offset + lo * at->stride - g_dz.start));
+                } else {
+                    glBindBuffer(GL_ARRAY_BUFFER, 0);
+                    glVertexAttribPointer(k, sz, ty, nm, (GLsizei)at->stride, src);
+                }
             }
-            glEnableVertexAttribArray(k);
-            glVertexAttribPointer(k, sz, ty, nm, (GLsizei)at->stride, XR_PTR(at->offset + lo * at->stride));
         }
+        VWHERE("direct: swizzle constants");
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
         for (k = 0; k < 16; k++) if (g_vub[VB_VSC][4 + k / 4][k % 4] != sw[k]) { g_vub[VB_VSC][4 + k / 4][k % 4] = sw[k]; changed = 1; }
         if (changed) g_vub_gen[VB_VSC]++;
     }
-    if (!g_vpc_ok || memcmp(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow)) {
-        memcpy(g_vpc_shadow, s_3d.c, sizeof g_vpc_shadow);
-        g_vpc_ok = 1;
-        gpu_ub(UB_VPC, g_vpc_shadow, sizeof g_vpc_shadow);
-    }
+    VWHERE("batch: vertex constants");
+    gpu_vpc_sync();
     {
-        VP_T0(t_st);
+        VWHERE("batch: GL state"); VP_T0(t_st);
         gpu_set_blend(0);
         gpu_set_depth(g_cur_ds != NULL);
         gpu_use(prog);
         VP_ADD(VP_STATE, t_st);
     }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)nt, GL_UNSIGNED_SHORT, g_didx); VP_ADD(VP_DRAW, t); g_vp_draws++; }
+    if (g_jn_mode && !inl && !has_cmp && !g_cap_on) {   /* (v117) kept back: the draws after it may join */
+        g_jn.active = 1; g_jn.has_ds = g_cur_ds != NULL; g_jn.hv = hv; g_jn.sig = jsig; g_jn.lo = lo; g_jn.hi = hi; g_jn.nt = nt;
+    } else {
+    VWHERE("direct: the vertices copied");
+    dz_place(hi);
+    { VP_T0(t); dz_draw(nt, hi - lo); VP_ADD(VP_DRAW, t); g_vp_draws++; }
+    VWHERE("direct: after the draw");
     if (g_cur_ds) vgl_depth_keep();
+    }
     g_vp_hw++; g_vp_direct++; g_cap_hw++;
+    if (inl) g_vpd_inl++;
     cap_note_draw("direct", hv->hash, nt);
     s_gpu.tris_drawn += nt / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
@@ -4089,10 +5650,134 @@ static int gpu_batch_hw_direct(HwVp *hv)
     return 1;
 }
 #endif
+/* (v104) the single quads. Half of a battle's draws (~700 of 1500 a frame)
+ * are one quad each -- sparks, embers, blood, decals -- and each cost what a
+ * whole character does on the way to vitaGL. Their four vertices are run
+ * through the vertex program on the CPU instead (the CPU path), and the
+ * quads that follow one another with the same textures, combiners, blending
+ * and target are collected and drawn in one call. The GL state is bound
+ * when a run starts; the run is drawn before anything else touches GL
+ * (the next different draw, a clear, a copy, the present).
+ * RECOMP_VGL_QUADS=0 turns it off. */
+typedef struct {
+    uint32_t co, pitch, cx, cy, cw, ch, fmt, zo, be, bs, bd, mode;
+    SwStage st[4];
+    uint8_t s3[sizeof s_3d];
+} VsmKey;
+#define VSM_VERTS 2048
+#define VSM_IDX 3072
+/* (v218) THE ADDITIVE QUADS, ONE DRAW PER TEXTURE. A burning level (Rohan's
+ * second) draws ~250 flame and ember quads a frame (vertex program 9D5CFD70:
+ * a unit quad placed by its constants, one draw each), added on (blend
+ * dfactor ONE, no depth write), three 32x32 textures in random turn: v104's
+ * runs broke at every texture change. Added-on quads can be drawn in any
+ * order (the sum is the same, also when it saturates), so now the run keeps
+ * up to VSM_NB buckets, one per texture, all else of the state the same
+ * (g_vsm_gk: the key without the textures); each quad's four vertices are
+ * run through its program on the CPU into its bucket; all buckets are drawn
+ * (each with its own textures bound) before anything else touches GL.
+ * RECOMP_VGL_QUADS: 2 (default) the added-on ones; 1 v104's (every single
+ * quad, no reordering); 0 off. */
+#define VSM_NB 4
+typedef struct { VsmKey key; GVert *v; uint16_t *ix; uint32_t nv, ni; int has_ds; GLuint tex[4], smp[4], prog; } VsmBucket;
+static struct { VsmBucket b[VSM_NB]; int nb; int on; } g_vsm = { .on = -1 };
+static VsmKey g_vsm_k, g_vsm_gk, g_vsm_kg;
+static size_t vsm_s3_from(void) { return offsetof(__typeof__(s_3d), alpha_test); }
+static size_t vsm_s3_to(void) { return offsetof(__typeof__(s_3d), comb_seen); }
+static void vsm_key(VsmKey *k)
+{
+    memset(k, 0, sizeof *k);
+    k->co = s_gpu.color_offset; k->pitch = s_gpu.pitch; k->cx = s_gpu.clip_x; k->cy = s_gpu.clip_y; k->cw = s_gpu.clip_w; k->ch = s_gpu.clip_h;
+    k->fmt = s_gpu.format; k->zo = s_zeta_offset; k->be = s_gpu.blend_enable; k->bs = s_gpu.blend_sfactor; k->bd = s_gpu.blend_dfactor; k->mode = s_3d.mode;
+    memcpy(k->st, s_stage, sizeof k->st);
+    memcpy(k->s3, (const uint8_t *)&s_3d + vsm_s3_from(), vsm_s3_to() - vsm_s3_from());
+}
+/* the key without what tells the textures apart (their address, their decoded texels) */
+static void vsm_group(VsmKey *g, const VsmKey *k)
+{
+    int i;
+    *g = *k;
+    for (i = 0; i < 4; i++) { g->st[i].t.offset = 0; g->st[i].texels = NULL; }
+}
+static void vsm_flush(void)
+{
+    uint32_t i;
+    int b, ds = 0, n = 0, rebound = 0;
+    if (!g_vsm.nb) return;
+    VWHERE("batch: the quads' run");
+    glBindVertexArray(g_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    g_sh.vao = 0;
+    for (b = 0; b < g_vsm.nb; b++) {
+        VsmBucket *B = &g_vsm.b[b];
+        if (!B->nv || !B->ni) continue;
+        if (!g_sh.tex_ok || memcmp(g_sh.tex, B->tex, sizeof B->tex) || memcmp(g_sh.smp, B->smp, sizeof B->smp)) {
+            int k;
+            for (k = 0; k < 4; k++) {
+                glActiveTexture(GL_TEXTURE0 + k);
+                glBindTexture(GL_TEXTURE_2D, B->tex[k]);
+                glBindSampler((GLuint)k, B->smp[k]);
+            }
+            memcpy(g_sh.tex, B->tex, sizeof B->tex); memcpy(g_sh.smp, B->smp, sizeof B->smp); g_sh.tex_ok = 1;
+            rebound = 1;
+        }
+        gpu_use(B->prog);
+        for (i = 0; i < 8; i++) {
+            glEnableVertexAttribArray(i);
+            glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, sizeof(GVert), (const char *)B->v + 16 * i);
+        }
+        (glDrawElements)(GL_TRIANGLES, (GLsizei)B->ni, GL_UNSIGNED_SHORT, B->ix);   /* (the uniforms went up when the run began) */
+        ds |= B->has_ds;
+        g_vp_draws++; n++;
+        B->nv = B->ni = 0;
+    }
+    if (ds) vgl_depth_keep();
+    if (rebound) g_sh.tex_ok = 0;   /* (textures bound behind gpu_stages_vgl's back: the next draw binds its own again) */
+    g_vsm_runs += n;
+    g_vsm.nb = 0;
+}
+/* the draw just transformed (g_verts, g_idx): into bucket b */
+static void vsm_append(int b, uint32_t nverts)
+{
+    uint32_t i;
+    VsmBucket *B = &g_vsm.b[b];
+    if (B->nv + nverts > VSM_VERTS || B->ni + g_nidx > VSM_IDX) return;   /* (the caller has made room) */
+    memcpy(B->v + B->nv, g_verts, nverts * sizeof(GVert));
+    for (i = 0; i < g_nidx; i++) B->ix[B->ni + i] = (uint16_t)(g_idx[i] + B->nv);
+    B->nv += nverts; B->ni += g_nidx;
+    g_vsm_quads++;
+    s_gpu.tris_drawn += g_nidx / 3;
+    s_gpu.drawn_offset = s_gpu.color_offset;
+}
+/* indices and CPU-transformed vertices of the current draw, as gpu_batch_impl
+ * makes them; 0 if nothing is left to draw */
+static int vsm_gather(uint32_t *nverts_out)
+{
+    uint32_t i, n = s_gpu.idx_count, nverts = 0;
+    g_gen++; if (!g_gen) g_gen = 1;
+    g_nidx = 0;
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:      for (i = 0; i + 2 < n; i += 3) gpu_tri(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2], &nverts); break;
+    case NV_PRIM_TRIANGLE_STRIP: for (i = 0; i + 2 < n; i++) { if (i & 1) gpu_tri(s_gpu.idx[i+1], s_gpu.idx[i], s_gpu.idx[i+2], &nverts); else gpu_tri(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2], &nverts); } break;
+    case NV_PRIM_TRIANGLE_FAN:   for (i = 1; i + 1 < n; i++) gpu_tri(s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1], &nverts); break;
+    case NV_PRIM_QUADS:          for (i = 0; i + 3 < n; i += 4) { gpu_tri(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2], &nverts); gpu_tri(s_gpu.idx[i], s_gpu.idx[i+2], s_gpu.idx[i+3], &nverts); } break;
+    default: return 0;
+    }
+    if (!g_nidx || nverts > 8) return 0;
+    g_frame_3d = 1;
+    gpu_transform_all(nverts);
+    g_vp_verts += nverts;
+    gpu_drop_bad_tris(nverts);
+    if (!g_nidx) return 0;
+    *nverts_out = nverts;
+    return 1;
+}
 static void gpu_batch_impl(void);
 static void gpu_batch(void)
 {
     VP_T0(t);
+    VWHERE("batch: indices");
     gpu_batch_impl();
     VP_ADD(VP_BATCH, t);
 }
@@ -4123,6 +5808,84 @@ static void gpu_batch(void)
         if (!g_slot || !g_slot_gen) return;
     }
 #if defined(__vita__)
+    {   /* (v105) the light mode: what weighs on the frame and is not needed
+         * to play is not drawn -- the single quads of the effects (sparks,
+         * embers, smoke, blood, decals), everything drawn into the small
+         * render targets (the characters' shadows) and every draw that
+         * samples a render target (the shadows laid on the ground, the heat
+         * haze). RECOMP_VGL_LITE=0: all of it drawn. */
+        static int lite = -1;
+        if (lite < 0) { const char *e = getenv("RECOMP_VGL_LITE"); lite = e && e[0] == '1';   /* (v106: off -- no gain, the game thread is the limit; black squares) */ }
+        {   /* (v117) TT_EFFECTS=0: the single quads drawn blended (sparks,
+             * embers, smoke, blood, marks on the ground) not drawn -- the
+             * rest of the picture as it is. (v121: all the blended ones;
+             * only the additive were 4-27 a frame, nothing gained.)
+             * TT_EFFECTS=2: only the additive, as in v117. */
+            static int fx = -1;
+            /* (v122) the default is now 3: the blended single quads not
+             * drawn, but the additive ones (glows: few, 4-27 a frame) are.
+             * 1 = all drawn, 0 = none, 2 = only the additive not drawn. */
+            if (fx < 0) { const char *e = getenv("TT_EFFECTS"); fx = e ? atoi(e) : 3; }
+            /* (v125) TT_BLOBS=1: the characters' round shadows on the ground.
+             * The game paints them, two quads a character, into a 256x256
+             * texture laid on the ground: 192 of a crowded frame's 810 draws
+             * (the fourth level). Off by default: that texture stays clear. */
+            static int blobs = -1;
+            if (blobs < 0) { const char *e = getenv("TT_BLOBS"); blobs = e && e[0] == '1'; }
+            if (!blobs && !g_cap_on && !s_gpu.inline_active && n <= 6 && s_gpu.blend_enable
+                && s_gpu.clip_x + s_gpu.clip_w == 256 && s_gpu.clip_y + s_gpu.clip_h == 256) { g_lite_skipped[1]++; return; }
+            if (fx != 1 && !g_cap_on && !s_gpu.inline_active && n <= 6 && s_gpu.blend_enable && s_3d.mode == 2 && s_vpd_len > 3) {
+                int add = (s_gpu.blend_dfactor & 0xFFFF) == 1;
+                static int glows = -1;   /* (v218) TT_GLOWS=0: the added-on ones (flames, embers, glows) not drawn either */
+                if (glows < 0) { const char *e = getenv("TT_GLOWS"); glows = !(e && e[0] == '0'); }
+                if (fx == 0 || (fx == 2 && add) || (fx == 3 && !add) || (add && !glows)) { g_lite_skipped[0]++; return; }
+            }
+        }
+        if (lite && !g_cap_on && !s_gpu.inline_active) {
+            int st;
+            if (n <= 6 && s_gpu.blend_enable && s_3d.mode == 2 && s_vpd_len > 3) { g_lite_skipped[0]++; return; }
+            if (s_gpu.clip_x + s_gpu.clip_w < 640) { g_lite_skipped[1]++; return; }
+            for (st = 0; st < 4; st++)
+                if (s_stage[st].enabled) {
+                    int q;
+                    if (gsurf_find(s_stage[st].t.offset, 0)) { g_lite_skipped[2]++; return; }
+                    for (q = 0; q < 8; q++) if (g_lite_dst[q] && g_lite_dst[q] == s_stage[st].t.offset) { g_lite_skipped[2]++; return; }   /* (a copy that was not made) */
+                }
+        }
+    }
+    int vsm_small = 0, vsm_keep = 0;
+    if (g_vsm.on < 0) {
+        const char *e = getenv("RECOMP_VGL_QUADS");
+        int b;
+        g_vsm.on = e ? atoi(e) : 0;   /* (v105-v217: off -- v104's log: 633 quads in 323 runs, the CPU path cost more than it saved; v218: 2 by default -- grouped well, 170 quads in 3 runs, but "batch: indices" (their CPU transform) 28% of the render thread: Rohan 2 70 -> 82 ms. v219: off again) */
+        for (b = 0; g_vsm.on && b < VSM_NB; b++) {
+            g_vsm.b[b].v = (GVert *)malloc(VSM_VERTS * sizeof(GVert)); g_vsm.b[b].ix = (uint16_t *)malloc(VSM_IDX * sizeof(uint16_t));
+            if (!g_vsm.b[b].v || !g_vsm.b[b].ix) g_vsm.on = 0;
+        }
+        fprintf(stderr, "  [VGL] single quads collected: %s\n", g_vsm.on == 1 ? "all (in order)" : g_vsm.on ? "the added-on ones, one draw per texture" : "off");
+    }
+    if (g_vsm.on && n >= 3 && n <= 6 && s_3d.mode == 2 && s_vpd_len > 3 && !s_gpu.inline_active && !g_cap_on && !s_3d.stencil_test
+        && (s_gpu.prim == NV_PRIM_QUADS || s_gpu.prim == NV_PRIM_TRIANGLE_STRIP || s_gpu.prim == NV_PRIM_TRIANGLE_FAN || s_gpu.prim == NV_PRIM_TRIANGLES)
+        && (g_vsm.on == 1 || (s_gpu.blend_enable && (s_gpu.blend_dfactor & 0xFFFF) == 1 && !s_3d.depth_mask && (s_3d.blend_eq & 0xFFFF) == 0x8006))) {
+        int b;
+        vsm_key(&g_vsm_k);
+        if (g_vsm.on == 1) g_vsm_kg = g_vsm_k; else vsm_group(&g_vsm_kg, &g_vsm_k);
+        vsm_small = 1;
+        if (g_vsm.nb && !memcmp(&g_vsm_kg, &g_vsm_gk, sizeof g_vsm_kg)) {
+            for (b = 0; b < g_vsm.nb; b++) if (!memcmp(&g_vsm_k, &g_vsm.b[b].key, sizeof g_vsm_k)) break;
+            if (b < g_vsm.nb) {
+                /* the run goes on: nothing of GL is touched */
+                VsmBucket *B = &g_vsm.b[b];
+                if (B->nv + 8 <= VSM_VERTS && B->ni + 12 <= VSM_IDX) {
+                    uint32_t nv2 = 0;
+                    if (vsm_gather(&nv2)) vsm_append(b, nv2);
+                    return;
+                }
+            } else if (g_vsm.nb < (g_vsm.on == 1 ? 1 : VSM_NB)) vsm_keep = 1;   /* (another texture: a bucket more, the others not drawn yet) */
+        }
+    }
+    if (!vsm_keep) vsm_flush();
+    if (!(g_jn.active && !s_last_chg && !s_gpu.inline_active && !g_cap_on)) jn_flush();   /* (v117: unless this draw may join the one kept back) */
     {   /* (the first batches, written out at once: a crash keeps them) */
         static unsigned nb;
         if (nb < 4) {
@@ -4137,28 +5900,32 @@ static void gpu_batch(void)
 #if defined(__vita__)
     {
         VP_T0(t);
-        GSurf *was = g_cur_rt;
-        int ok = gpu_bind_targets(need_depth);
-        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 40; if (g_cap_wait <= 0) g_cap_wait = -3; }
+        GSurf *was = (VWHERE("batch: targets"), g_cur_rt);
+        int ok;
+        { BK_T0(); ok = gpu_bind_targets(need_depth); BK_END(BK_TARGETS); }
+        if (g_cap_wait == -2) { const char *e = getenv("RECOMP_VGL_CAPTURE"); g_cap_wait = e ? atoi(e) : 0; if (g_cap_wait <= 0) g_cap_wait = -3; }
 
-        if (g_cap_on && was && was != g_cur_rt && (!g_cap_mode || was->w >= 640)) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
+        if (g_cap_on && was && was != g_cur_rt) { cap_save(was, "left"); ok = gpu_bind_targets(need_depth); }
         VP_ADD(VP_TARGETS, t);
-        if (!ok) return;
+        if (!ok) { if (g_cap_on) cap_note_text("SKIP: no target (colour %08X clip %ux%u)", s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h); return; }
     }
 #else
     if (!gpu_bind_targets(need_depth)) return;
 #endif
-    if (!gpu_set_raster()) return;
+    VWHERE("batch: raster state");
+    if (!gpu_set_raster()) { if (g_cap_on) cap_note_text("SKIP: raster state"); return; }
     g_gen++; if (!g_gen) g_gen = 1;
     g_nidx = 0;
 #if defined(__vita__)
     if (s_3d.mode == 2 && s_vpd_len > 3) {
         VP_T0(t_lk);
+        VWHERE("batch: vertex program lookup");
         HwVp *hv = hwvp_lookup();
         VP_ADD(VP_LOOKUP, t_lk);
         g_frame_3d = 1;
-        if (hv && gpu_batch_hw_direct(hv)) return;
+        if (hv && !vsm_small && gpu_batch_hw_direct(hv)) return;
     }
+    jn_flush();   /* (v117: another path draws) */
     VP_T0(t_idx);
 #endif
     switch (s_gpu.prim) {
@@ -4192,8 +5959,9 @@ static void gpu_batch(void)
     }
 #if defined(__vita__)
     VP_ADD(VP_IDX, t_idx);
+    VWHERE("batch: after indices");
 #endif
-    if (!g_nidx) return;
+    if (!g_nidx) { if (g_cap_on) cap_note_text("SKIP: no triangles (prim %u, %u indices, inline %d)", s_gpu.prim, n, s_gpu.inline_active); return; }
     if (s_3d.mode == 2 && s_vpd_len > 3) g_frame_3d = 1;
     if (g_wide_prev && s_3d.mode == 2 && s_vpd_len <= 3 && g_aspect > 1.34f) {
         static int hud = -1;
@@ -4236,10 +6004,14 @@ static void gpu_batch(void)
     {
 #if defined(__vita__)
         VP_T0(t_lk);
+        VWHERE("batch: vertex program lookup");
         HwVp *hv = hwvp_lookup();
         VP_ADD(VP_LOOKUP, t_lk);
 #else
         HwVp *hv = hwvp_lookup();
+#endif
+#if defined(__vita__)
+        if (vsm_small) hv = NULL;
 #endif
         if (hv) {
             if (gpu_batch_hw(hv, nverts)) return;
@@ -4259,7 +6031,7 @@ cpu_verts_ready:
 #if defined(__vita__)
         /* vitaGL copies client arrays at the draw */
         (void)vb_at; (void)ib_at;
-        { VP_T0(t); gpu_bind_stages(); VP_ADD(VP_STAGES, t); }
+        { VWHERE("batch: textures/stages"); VP_T0(t); gpu_stages_vgl(); VP_ADD(VP_STAGES, t); }
         gpu_set_blend(0);
         gpu_set_depth(g_cur_ds != NULL);
         glBindVertexArray(g_vao);
@@ -4271,6 +6043,17 @@ cpu_verts_ready:
         g_sh.vao = 0;
         prog = gpu_program_for(g_vs_main);
         gpu_use(prog);
+        if (vsm_small && nverts <= 8 && g_nidx <= 12 && g_vsm.nb < VSM_NB) {
+            /* a run of quads begins (or a bucket more): its state is bound, its uniforms sent */
+            VsmBucket *B = &g_vsm.b[g_vsm.nb];
+            vgl_ub_flush();
+            if (!g_vsm.nb) g_vsm_gk = g_vsm_kg;
+            B->key = g_vsm_k; B->has_ds = g_cur_ds != NULL; B->nv = B->ni = 0;
+            memcpy(B->tex, g_sh.tex, sizeof B->tex); memcpy(B->smp, g_sh.smp, sizeof B->smp); B->prog = prog;
+            vsm_append(g_vsm.nb, nverts);
+            g_vsm.nb++;
+            return;
+        }
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         { VP_T0(t); vgl_draw_elements(GL_TRIANGLES, (GLsizei)g_nidx, GL_UNSIGNED_INT, g_idx); VP_ADD(VP_DRAW, t); g_vp_draws++; g_cap_cpu++; }
         if (g_cur_ds) vgl_depth_keep();
@@ -4311,9 +6094,22 @@ cpu_verts_ready:
  * (D3D draws a quad for it; a GL clear honours the scissor and colour mask
  * the same way); depth and stencil clear the whole view, as D3D's
  * ClearDepthStencilView does. */
+#if defined(__vita__)
+static void gpu_clear_impl(uint32_t param);
+static void gpu_clear(uint32_t param) { BK_T0(); gpu_clear_impl(param); BK_END(BK_CLEAR); }
+static void gpu_clear_impl(uint32_t param)
+#else
 static void gpu_clear(uint32_t param)
+#endif
 {
     int need_depth = (param & 3) != 0;
+#if defined(__vita__)
+    vsm_flush(); jn_flush();
+#endif
+    fr_add(7, param & 0xFF, g_cur_rt ? g_cur_rt->base : 0, g_cur_ds ? g_cur_ds->base : 0, s_cb_scratch[0], s_gpu.clear_color);
+    cap_note_text("CLEAR param %02X colour %08X target %08X %ux%u scissor %d,%d %dx%d", param & 0xFF, s_gpu.clear_color,
+                  g_cur_rt ? g_cur_rt->base : 0, g_cur_rt ? g_cur_rt->w : 0, g_cur_rt ? g_cur_rt->h : 0,
+                  g_cur_sc[0], g_cur_sc[1], g_cur_sc[2], g_cur_sc[3]);
     if (!gpu_bind_targets(need_depth)) return;
     if ((param & 3) && g_cur_ds) {
         uint32_t zv = s_cb_scratch[0];
@@ -4328,6 +6124,14 @@ static void gpu_clear(uint32_t param)
         glScissor(g_cur_sc[0], g_cur_sc[1], g_cur_sc[2], g_cur_sc[3]);
         g_sh.sc_ok = 0;
         glColorMask((param & 0x10) != 0, (param & 0x20) != 0, (param & 0x40) != 0, (param & 0x80) != 0);
+#if defined(__vita__)
+        if ((param & 0xF0) != 0xF0) {
+            vgl_cclear_quad(((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f,
+                            (param & 0x10) != 0, (param & 0x20) != 0, (param & 0x40) != 0, (param & 0x80) != 0);
+            gpu_sh_reset();
+            return;
+        }
+#endif
         glClearColor(((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         g_sh.bs_ok = 0;                 /* the colour mask */
@@ -4337,11 +6141,35 @@ static void gpu_clear(uint32_t param)
 /* CopyRects between surfaces the GPU owns (the heat-haze copy of the back
  * buffer). 0 when the source is not a GPU surface: the caller copies guest
  * memory as before. */
+#if defined(__vita__)
+static int gpu_blit_impl(uint32_t sb, uint32_t db, uint32_t ix, uint32_t iy, uint32_t ox, uint32_t oy,
+                    uint32_t w, uint32_t h, uint32_t dp, uint32_t bpp);
 static int gpu_blit(uint32_t sb, uint32_t db, uint32_t ix, uint32_t iy, uint32_t ox, uint32_t oy,
                     uint32_t w, uint32_t h, uint32_t dp, uint32_t bpp)
+{ int r; BK_T0(); r = gpu_blit_impl(sb, db, ix, iy, ox, oy, w, h, dp, bpp); BK_END(BK_BLIT); return r; }
+static int gpu_blit_impl(uint32_t sb, uint32_t db, uint32_t ix, uint32_t iy, uint32_t ox, uint32_t oy,
+                    uint32_t w, uint32_t h, uint32_t dp, uint32_t bpp)
+#else
+static int gpu_blit(uint32_t sb, uint32_t db, uint32_t ix, uint32_t iy, uint32_t ox, uint32_t oy,
+                    uint32_t w, uint32_t h, uint32_t dp, uint32_t bpp)
+#endif
 {
-    GSurf *src = gsurf_find(sb, 0), *dst;
+    GSurf *src, *dst;
     uint32_t dw;
+#if defined(__vita__)
+    vsm_flush(); jn_flush();
+    {   static int lite = -1;
+        if (lite < 0) { const char *e = getenv("RECOMP_VGL_LITE"); lite = e && e[0] == '1';   /* (v106: off -- no gain, the game thread is the limit; black squares) */ }
+        if (lite && !g_cap_on && gsurf_find(sb, 0)) {   /* (v105: the haze's copies of the frame) */
+            int q;
+            for (q = 0; q < 8; q++) if (g_lite_dst[q] == db) return 1;
+            for (q = 0; q < 8; q++) if (!g_lite_dst[q]) { g_lite_dst[q] = db; break; }
+            return 1;
+        }
+    }
+#endif
+    src = gsurf_find(sb, 0);
+    cap_note_text("BLIT %08X (%s) -> %08X src %u,%u dst %u,%u %ux%u pitch %u bpp %u", sb, src ? "gpu" : "guest", db, ix, iy, ox, oy, w, h, dp, bpp);
     if (!src || bpp != 4) return 0;
     dw = dp / bpp;
     if (dw < ox + w) dw = ox + w;
@@ -4357,7 +6185,19 @@ static int gpu_blit(uint32_t sb, uint32_t db, uint32_t ix, uint32_t iy, uint32_t
     if (!w || !h) return 1;
     gsurf_resolve(src); gsurf_resolve(dst);   /* (MSAA: copies are between the textures) */
     if (dst->mrb) dst->ss_new = 1;
+#if defined(__vita__)
+    /* (v88) not vitaGL's glBlitFramebuffer: in the v87 capture (and the
+     * v78-v86 ones), right after the heat haze's three copies 80004000 ->
+     * 82BF0000 nothing more reached the frame -- the haze, the HUD, the copies
+     * of the HUD bar, even a glClear: the frames whose HUD is missing all
+     * have the blits just before. The region is drawn instead (the path
+     * below for surfaces of different scales). RECOMP_VGL_BLIT=1: vitaGL's. */
+    static int use_blit = -1;
+    if (use_blit < 0) { const char *e = getenv("RECOMP_VGL_BLIT"); use_blit = !(e && e[0] == '0'); }   /* (v89: back to vitaGL's -- v88 changed nothing) */
+    if (use_blit && src->pw * dst->w == dst->pw * src->w && src->ph * dst->h == dst->ph * src->h) {
+#else
     if (src->pw * dst->w == dst->pw * src->w && src->ph * dst->h == dst->ph * src->h) {
+#endif
         uint32_t l = SX(src, ix), t = SY(src, iy), r = SX(src, ix + w), b = SY(src, iy + h);
         if (r > src->pw) r = src->pw;
         if (b > src->ph) b = src->ph;
@@ -4365,8 +6205,22 @@ static int gpu_blit(uint32_t sb, uint32_t db, uint32_t ix, uint32_t iy, uint32_t
         glBindFramebuffer(GL_READ_FRAMEBUFFER, gpu_fbo(src->tex, 0));
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gpu_fbo(dst->tex, 0));
         glDisable(GL_SCISSOR_TEST);
+#if defined(__vita__)
+        /* (PS Vita) vitaGL's blit counts rows from the bottom of the memory,
+         * the surfaces keep the guest's top row first: the v61 capture -- the
+         * heat haze's copies of the fire landed mirrored, and the haze then
+         * drew the copy texture's stale contents (the dark rectangles over
+         * the fire). Both rectangles turned upside down. */
+        {
+            GLint dy0 = (GLint)SY(dst, oy), dy1 = dy0 + (GLint)(b - t);
+            glBlitFramebuffer((GLint)l, (GLint)(src->ph - b), (GLint)r, (GLint)(src->ph - t),
+                              (GLint)SX(dst, ox), (GLint)dst->ph - dy1, (GLint)(SX(dst, ox) + (r - l)), (GLint)dst->ph - dy0,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+#else
         glBlitFramebuffer((GLint)l, (GLint)t, (GLint)r, (GLint)b, (GLint)SX(dst, ox), (GLint)SY(dst, oy),
                           (GLint)(SX(dst, ox) + (r - l)), (GLint)(SY(dst, oy) + (b - t)), GL_COLOR_BUFFER_BIT, GL_NEAREST);
+#endif
         gpu_sh_reset();
     } else {
         /* different scales: draw the region */
@@ -4392,6 +6246,10 @@ static int gpu_blit(uint32_t sb, uint32_t db, uint32_t ix, uint32_t iy, uint32_t
         glDrawArrays(GL_TRIANGLES, 0, 3);
         gpu_sh_reset();
     }
+#if defined(__vita__)
+    if (g_cap_on) { cap_note_text("BLIT done: %s path, dst %08X %ux%u", use_blit && src->pw * dst->w == dst->pw * src->w ? "glBlitFramebuffer" : "drawn", dst->base, dst->w, dst->h);
+                    cap_save(dst, "blitdst"); }
+#endif
     return 1;
 }
 
@@ -4401,6 +6259,9 @@ static void gpu_readback(uint32_t base, uint32_t pitch)
     GSurf *s = gsurf_find(base, 0);
     uint8_t *m = XR_PTR(base);
     if (!s) return;
+#if defined(__vita__)
+    jn_flush();
+#endif
     gsurf_resolve(s);
     if (!pitch) pitch = s->w * 4;
 #if defined(__vita__)
@@ -4501,6 +6362,10 @@ static void gpu_draw_menu_at(int slot, const uint32_t *px, int w, int h, unsigne
     }
     left = ox >= 0 ? ox : (g_sc_w - w) / 2; top = oy >= 0 ? oy : (g_sc_h - h) / 2;
     glViewport(left, g_sc_h - top - h, w, h);
+#if defined(__vita__)
+    glEnable(GL_SCISSOR_TEST);   /* (the triangle past the viewport: gpu_present) */
+    glScissor(left, g_sc_h - top - h, w, h);
+#endif
     gpu_ub(UB_CLC, cb, 16);
     gpu_set_alpha_blend();
     glBindVertexArray(g_vao_empty);
@@ -4525,9 +6390,21 @@ static void gpu_apply_settings(void)
     g_post[0] = xbox_GfxGetF(GFX_BRIGHT); g_post[1] = xbox_GfxGetF(GFX_SHARP); g_post[2] = xbox_GfxGetF(GFX_COLOR);
     if (g_post[0] < 0.5f) g_post[0] = 1.0f;
     if (g_post[2] <= 0.0f) g_post[2] = 1.0f;
+#if defined(__vita__)
+    {   /* (v167) the present sharpens by default on the Vita (the 85% picture stretched to the screen looked soft):
+         * TT_SHARP=0..2 (0 off; default 0.8) */
+        const char *e = getenv("TT_SHARP");
+        if (e) g_post[1] = (float)atof(e); else if (g_post[1] <= 0.0f) g_post[1] = 0.8f;
+        if (g_post[1] < 0.0f) g_post[1] = 0.0f;
+        if (g_post[1] > 2.0f) g_post[1] = 2.0f;
+    }
+#endif
     gpu_filter_opts();
     aniso = xbox_GfxGet(GFX_ANISO);
     mips = xbox_GfxGet(GFX_MIPS);
+#if defined(__vita__)
+    mips = g_mips; aniso = g_aniso;   /* (v198: the Vita's own choice, gpu_filter_opts) */
+#endif
     if (aniso != g_aniso || mips != g_mips) {
         gpu_samplers_drop();
         if (mips != g_mips)
@@ -4542,7 +6419,7 @@ static void gpu_apply_settings(void)
     rs = xbox_GfxGet(GFX_SCALE);
     rsf = xbox_GfxScaleF();
 #if defined(__vita__)
-    rs = 1; rsf = 1.0f;   /* (PS Vita: 1x only -- a larger scale remade every surface and crashed) */
+    rs = 1; rsf = vita_res_scale();   /* (PS Vita: 1x or under -- a larger scale remade every surface and crashed) */
 #endif
     asp = xbox_GfxAspect();
     if (asp < 1.34f) asp = 4.0f / 3.0f;
@@ -4589,7 +6466,9 @@ static void gpu_draw_overlays(GSurf *s, int wide)
     float k = wide ? g_aspect / (4.0f / 3.0f) : 1.0f;
     if (!xbox_overlay_cb || !s || s->is_depth) return;
     memset(q, 0, sizeof q);
+    VWHERE("present: the HUD's overlays made");   /* (v160) */
     n = xbox_overlay_cb(q, OVL_MAX);
+    VWHERE("present: the HUD's overlays drawn");
     if (n <= 0) return;
     glBindFramebuffer(GL_FRAMEBUFFER, gpu_fbo(s->tex, 0));
     glDisable(GL_SCISSOR_TEST);
@@ -4673,11 +6552,149 @@ static void gpu_dump_window(const char *nm)
 
 /* The flip: the finished surface onto the window. */
 #if defined(__vita__)
+/* (the flight recorder, at each present: see fr_add) */
+static void fr_dump(GSurf *s, float mean, float avg)
+{
+    static int nd;
+    char path[96];
+    FILE *f;
+    uint32_t k, i;
+    if (nd >= 3) return;
+    sceIoMkdir("ux0:data/twotowers/cap", 0777);
+    snprintf(path, sizeof path, "ux0:data/twotowers/cap/flash_%d.txt", nd);
+    f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "frame mean %.1f, the frames before %.1f; surface %08X; the last 4 frames, oldest first\n"
+               "kinds: 1 hw draw, 2 direct draw, 6 cpu draw (prog idx target zeta flags[dt,dm,func<<2,blend<<6,stencil<<7,rgba mask<<8,stfunc<<12,prim<<16])\n"
+               "       7 CLEAR (param target zeta zvalue colour), 3 depth-clear quad (which z*1e6 stencil viewport w h),\n"
+               "       4 zeta clear carried (fbo which z*1e6 st), 5 clear viewport (fbo surface w h)\n", mean, avg, s->base);
+    for (k = 1; k <= 4; k++) {
+        uint32_t fi = (g_fr_cur + k) & 3;
+        fprintf(f, "\n=== frame -%u: %u records, mean %.1f\n", 4 - k, g_fr_n[fi], g_fr_mean[fi]);
+        for (i = 0; i < g_fr_n[fi]; i++) {
+            const FrRec *r = &g_fr[fi][i];
+            fprintf(f, "%4u k%u %08X %u %08X %08X %08X\n", i, r->kind, r->a, r->b, r->c, r->d, r->e);
+        }
+    }
+    fclose(f);
+    {   /* the picture as it is in memory (the frame the GPU finished last) */
+        const uint8_t *px;
+        uint8_t hd[18];
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s->tex);
+        px = (const uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+        snprintf(path, sizeof path, "ux0:data/twotowers/cap/flash_%d_%08X.tga", nd, s->base);
+        if (px && (f = fopen(path, "wb")) != NULL) {
+            memset(hd, 0, sizeof hd);
+            hd[2] = 2; hd[12] = s->pw & 0xFF; hd[13] = s->pw >> 8; hd[14] = s->ph & 0xFF; hd[15] = s->ph >> 8; hd[16] = 32; hd[17] = 8;
+            fwrite(hd, 1, 18, f);
+            cap_write_bgra(f, px, s->pw * s->ph);
+            fclose(f);
+        }
+        gpu_sh_reset();
+    }
+    fprintf(stderr, "  [FLASH] a dark frame (mean %.1f, before %.1f): ux0:data/twotowers/cap/flash_%d.txt\n", mean, avg, nd);
+    fflush(stderr);
+    nd++;
+}
+static void fr_frame_end(GSurf *s)
+{
+    static float avg;
+    static int warm;
+    float mean = -1.0f;
+    /* (v67: off -- reading the picture each frame (vglGetTexDataPointer)
+     * waited for the GPU in the present; RECOMP_VGL_FLASH=1 turns it on) */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_VGL_FLASH"); on = e && e[0] == '1'; }
+    if (on && s && s->tex && !s->is_depth && s->pw >= 640 && g_fr_n[g_fr_cur] > 600) {
+        const uint8_t *px;
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s->tex);
+        px = (const uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+        g_sh.tex_ok = 0;
+        if (px) {
+            uint32_t x, y, sum = 0, n = 0;
+            for (y = 24; y < s->ph; y += 24)
+                for (x = 16; x < s->pw; x += 16) {
+                    const uint8_t *q = px + ((size_t)y * s->pw + x) * 4;
+                    sum += (uint32_t)q[0] + q[1] + q[2]; n++;
+                }
+            mean = n ? (float)sum / (3.0f * (float)n) : -1.0f;
+        }
+    }
+    g_fr_mean[g_fr_cur] = mean;
+    if (mean >= 0.0f) {
+        if (warm > 30 && avg > 15.0f && mean < avg * 0.4f) fr_dump(s, mean, avg);
+        else { avg = warm ? avg * 0.9f + mean * 0.1f : mean; warm++; }
+    }
+    g_fr_cur = (g_fr_cur + 1) & 3;
+    g_fr_n[g_fr_cur] = 0;
+}
 static void gpu_present_impl(uint32_t base, uint32_t pitch);
+#if defined(__vita__)
+/* (v161, PS Vita) the dynamic resolution. Where the GPU (the SGX) is the limit -- the screen's clear at the
+ * present waits for it, 25-40% of the render thread in some places (v160) -- the internal resolution steps down
+ * from TT_RES (0.85: 544x408) to 0.72 (461x346); where it waits no more, back up. Measured each second: the
+ * clear's wait against the frame time. Down after 2 seconds over 15%, up after 8 seconds under 3%, never
+ * twice within 10 s. Only in 3D play (no movie, no menu). A step makes the surfaces again (their content comes
+ * back from memory; a frame may lose a shadow or a glow). TT_DYNRES=0: TT_RES always; TT_DYNRES=0.65..0.84:
+ * the lower step. */
+float g_vgl_dynres;
+long long g_vgl_clear_ticks;
+static void vgl_dynres_set(float f)
+{
+    int i;
+    g_vgl_dynres = f;
+    for (i = 0; i < GSURF_MAX; i++)
+        if (g_surf[i].tex) gsurf_free(&g_surf[i]);
+    g_cur_rt = g_cur_ds = NULL;
+    g_rsf = vita_res_scale();
+    g_rsx = g_rsf * (g_aspect / (4.0f / 3.0f));
+    g_rsy = g_rsf;
+    rs_fit();
+    gpu_sh_reset();
+    fprintf(stderr, "  [DYNRES] internal resolution now %.0f x %.0f (%.2f)\n", 640.0f * g_rsf, 480.0f * g_rsf, (double)g_rsf);
+}
+static void vgl_dynres(void)
+{
+    static int on = -1, hot, cool;
+    static float low = 0.72f;
+    static long long fq, t_last, t_sw, frame_sum, clear0;
+    extern int xbox_MoviePlaying(void);
+    extern volatile int xbox_frontend_hint;
+    LARGE_INTEGER now;
+    if (on < 0) {
+        const char *e = getenv("TT_DYNRES");
+        /* (v162: off unless asked -- v161 on the console: after the step down, every other frame drew no figures, the
+         * two screen surfaces made again with one zeta surface between them; TT_DYNRES=1 or a step: on) */
+        on = e && (e[0] == '1' || atof(e) >= 0.5f);
+        if (e && atof(e) >= 0.5f && atof(e) < 0.85f) low = (float)atof(e);
+        { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fq = f.QuadPart; }
+    }
+    QueryPerformanceCounter(&now);
+    if (!on) return;
+    if (!t_last) { t_last = now.QuadPart; t_sw = now.QuadPart; clear0 = g_vgl_clear_ticks; return; }
+    frame_sum = now.QuadPart - t_last;
+    if (frame_sum < fq) return;   /* (once a second) */
+    {
+        double r = (double)(g_vgl_clear_ticks - clear0) / (double)frame_sum;
+        int play = !xbox_MoviePlaying() && xbox_frontend_hint != 1;
+        t_last = now.QuadPart; clear0 = g_vgl_clear_ticks;
+        if (!play) { hot = cool = 0; return; }
+        if (r > 0.15) { hot++; cool = 0; } else if (r < 0.03) { cool++; hot = 0; } else hot = cool = 0;
+        if (now.QuadPart - t_sw < fq * 10) return;
+        if (g_vgl_dynres == 0.0f && hot >= 2 && low < vita_res_scale()) { vgl_dynres_set(low); t_sw = now.QuadPart; hot = cool = 0; }
+        else if (g_vgl_dynres > 0.0f && cool >= 8) { vgl_dynres_set(0.0f); t_sw = now.QuadPart; hot = cool = 0; }
+    }
+}
+#else
+static void vgl_dynres(void) {}
+#endif
 static void gpu_present(uint32_t base, uint32_t pitch)
 {
     VP_T0(t);
-    gpu_present_impl(base, pitch);
+    vsm_flush(); jn_flush();
+    { BK_T0(); gpu_present_impl(base, pitch); BK_END(BK_PRESENT); }
     VP_ADD(VP_PRESENT, t);
     vgl_perf_frame();
 }
@@ -4696,15 +6713,34 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         GSurf *pr = gsurf_find(base, 0);
         cap_save(pr, "present");
         if (!g_cap_mode)
-            for (i = 0; i < GSURF_MAX; i++) if (g_surf[i].tex && &g_surf[i] != pr && !g_surf[i].is_depth) cap_save(&g_surf[i], "atpresent");
-        g_cap_on = 0;
+            for (i = 0; i < GSURF_MAX; i++) if (g_surf[i].tex && &g_surf[i] != pr && !g_surf[i].is_depth && g_surf[i].w >= 640) cap_save(&g_surf[i], "atpresent");
+        g_cap_on = 0; g_cap_screen = 1;
         g_cap_wait = -3;   /* (one capture, as drawn) */
         if (g_cap_list) { fclose(g_cap_list); g_cap_list = NULL; }
         gpu_sh_reset();
     }
     if (g_cap_wait > 0 && g_cap_fdraws > 1000 && --g_cap_wait == 0) g_cap_wait = -11;   /* (the n-th frame of over 1000 draws: the battle, not the cut-scene) */
+    {   /* (v69) L + R + SELECT held: a capture of the next frame, when the
+         * fault is on the screen (the black HUD panels, the frame in negative) */
+        SceCtrlData pad;
+        static int held;
+        memset(&pad, 0, sizeof pad);
+        if (sceCtrlPeekBufferPositive(0, &pad, 1) > 0) {
+            int combo = (pad.buttons & (SCE_CTRL_SELECT | SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER))
+                        == (SCE_CTRL_SELECT | SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER);
+            if (combo && !held && !g_cap_on && g_cap_wait <= -3 && g_cap_wait != -2) {
+                g_cap_wait = -11; g_cap_n = 0; g_cap_ndraw = 0;
+                snprintf(g_cap_dir, sizeof g_cap_dir, "ux0:data/twotowers/cap/%d", ++g_cap_idx);
+                if (g_cap_list) { fclose(g_cap_list); g_cap_list = NULL; }
+                sceIoMkdir("ux0:data/twotowers/cap", 0777);
+                fprintf(stderr, "  [CAP] L+R+SELECT: capturing the next frame\n"); fflush(stderr);
+            }
+            held = combo;
+        }
+    }
+    g_cap_last = g_cap_fdraws;
     g_cap_fdraws = 0;
-    if (g_cap_wait < -10) { if (++g_cap_wait == -10) { g_cap_on = 1; g_cap_hw = g_cap_cpu = 0; fprintf(stderr, "  [CAP] capturing this frame\n"); } }
+    if (g_cap_wait < -10) { if (++g_cap_wait == -10) { g_cap_on = 1; g_cap_marked = 0; g_cap_hw = g_cap_cpu = 0; fprintf(stderr, "  [CAP] capturing this frame\n"); } }
 #endif
     GSurf *s = gsurf_find(base, 0);
     int wide;
@@ -4727,14 +6763,23 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         if (k++ % every == 0) gpu_readback(base, pitch);
     }
     if (!g_win || !s) return;
+    VWHERE("present: surface");
     gsurf_sync_from_mem(s);
     gsurf_resolve(s);   /* (MSAA: the picture from its samples) */
+#if defined(__vita__)
+    VWHERE("present: flight recorder");
+    fr_frame_end(s);
+    VWHERE("present: overlays");
+#endif
     {
         extern int xbox_MoviePlaying(void);
         wide = g_aspect > 1.34f && g_frame_3d && !xbox_MoviePlaying() && g_ws_cam_tick != 0;
         gpu_draw_overlays(s, wide);
     }
-    g_fhash_cur ^= 1; g_fhash_n[g_fhash_cur] = 0;
+#if defined(__vita__)
+    VWHERE("present: after the overlays");   /* (v160: finer zones) */
+#endif
+    g_fhash_cur ^= 1; g_fhash_n[g_fhash_cur] = 0; g_fh_cur_gen++; if (!g_fh_cur_gen) { memset(g_fh_gen, 0, sizeof g_fh_gen); g_fh_cur_gen = 1; }
 #if defined(__vita__)
     g_sc_w = 960; g_sc_h = 544;
 #else
@@ -4750,8 +6795,23 @@ static void gpu_present(uint32_t base, uint32_t pitch)
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glViewport(0, 0, g_sc_w, g_sc_h);
+#if defined(__vita__)
+    VWHERE("present: clear the screen");
+#endif
     glClearColor(0, 0, 0, 1);
+#if defined(__vita__)
+    {   /* (v161) how long the screen's clear waits for the GPU: the dynamic resolution's measure */
+        extern long long g_vgl_clear_ticks;
+        LARGE_INTEGER c0, c1;
+        QueryPerformanceCounter(&c0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        QueryPerformanceCounter(&c1);
+        g_vgl_clear_ticks += c1.QuadPart - c0.QuadPart;
+    }
+    VWHERE("present: the picture to the screen");
+#else
     glClear(GL_COLOR_BUFFER_BIT);
+#endif
     {
         /* the picture's shape: g_aspect (4:3 unless widescreen), movies 4:3,
          * black bars round it; stretch fills the window */
@@ -4760,7 +6820,11 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         float mz;
         a = wide ? g_aspect : 4.0f / 3.0f;
         { extern int xbox_MoviePlaying(void); extern volatile int xbox_frontend_hint; mz = menu_fill_zoom((!g_frame_3d || xbox_frontend_hint == 1) && !xbox_MoviePlaying()); }
-        g_wide_prev = wide; g_frame_3d = 0; g_present_n++;
+        g_wide_prev = wide; g_frame_3d = 0; g_present_n++; s_texc_vframe++;
+#if defined(__vita__)
+        xbox_VitaUniPoolFrame();
+        vbs_frame();
+#endif
         if (g_stretch_on < 0) g_stretch_on = getenv("RECOMP_PRESENT_STRETCH") != NULL;
         if (g_stretch_on) { pw = ww; ph = wh; }
         else if (ww / wh > a) { ph = wh; pw = wh * a; }
@@ -4769,6 +6833,14 @@ static void gpu_present(uint32_t base, uint32_t pitch)
         { extern int xbox_MoviePlaying(void); movie_fill(xbox_MoviePlaying(), ww, wh, &pw, &ph); }
         vx = (int)((ww - pw) * 0.5f); vy = (int)((wh - ph) * 0.5f);
         glViewport(vx, g_sc_h - vy - (int)ph, (GLsizei)pw, (GLsizei)ph);
+#if defined(__vita__)
+        /* (PS Vita) the viewport does not clip on the GXM: the full-screen
+         * triangle (twice the viewport) went on past the picture into the
+         * right-hand black bar -- the picture's last column stretched over
+         * it, cut by the triangle's diagonal (the v61 screen capture) */
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(vx, g_sc_h - vy - (int)ph, (GLsizei)pw, (GLsizei)ph);
+#endif
         present_map_set(vx / ww, vy / wh, pw / ww, ph / wh, wide ? g_aspect / (4.0f / 3.0f) : 1.0f);
         uvs[0] = 640.0f / (float)s->w; uvs[1] = 480.0f / (float)s->h;
         uvs[2] = 1.0f / (float)s->pw; uvs[3] = 1.0f / (float)s->ph;
@@ -4786,6 +6858,7 @@ static void gpu_present(uint32_t base, uint32_t pitch)
     {
         const uint32_t *mpx; int mw, mh; unsigned mver;
         xbox_GfxMenuSetAvailable(1);
+        VWHERE("present: menus, toasts, banners");
         if (xbox_GfxMenuRender(g_sc_w, g_sc_h, &mpx, &mw, &mh, &mver)) gpu_draw_menu_at(0, mpx, mw, mh, mver, -1, -1);
         { int tx, ty; if (xbox_ToastRender(g_sc_w, g_sc_h, &mpx, &mw, &mh, &mver, &tx, &ty)) gpu_draw_menu_at(1, mpx, mw, mh, mver, tx, ty); }
         { int tx, ty; if (xbox_BannerRender(g_sc_w, g_sc_h, &mpx, &mw, &mh, &mver, &tx, &ty)) gpu_draw_menu_at(2, mpx, mw, mh, mver, tx, ty); }
@@ -4805,15 +6878,81 @@ static void gpu_present(uint32_t base, uint32_t pitch)
             gpu_dump_window(nm);
         }
     }
-    if (g_vsync_on < 0) { const char *v = getenv("RECOMP_VSYNC"); g_vsync_on = v && v[0] == '1'; }
+    if (g_vsync_on < 0) {
+        const char *v = getenv("RECOMP_VSYNC");
+        g_vsync_on = v && v[0] == '1';
+#if defined(__vita__)
+        /* (v148: the paced picture shown at a refresh, not torn mid-screen.) (v197) Not any more unless
+         * TT_PACE_VSYNC=1: with the swap waiting for a refresh a frame of 52-55 ms went out at 66.7 (15 fps)
+         * and one of 68 at 83 (12 fps) -- v196 log: 25-37% of the render thread in vglSwapBuffers, the game
+         * waiting on it. The pace itself already waits for the refresh when the frame is early; a late one
+         * now goes out at once. */
+        { extern int vita_pace_on(void); const char *pv = getenv("TT_PACE_VSYNC"); if (!v && vita_pace_on() && pv && pv[0] == '1') g_vsync_on = 1; }
+#endif
+    }
 #if defined(__vita__)
     if (g_vsync_applied != g_vsync_on) {
         vglWaitVblankStart(g_vsync_on ? GL_TRUE : GL_FALSE);
         g_vsync_applied = g_vsync_on;
     }
+    VWHERE("present: frame limit");
     frame_limit();
+    if (g_cap_screen) {
+        /* (v60, the capture: the Vita's screen itself, what is seen) */
+        /* (16 rows at a time through the fixed buffer: no big malloc) */
+        static uint8_t strip[960 * 16 * 4];
+        FILE *f;
+        uint8_t hd[18];
+        int y;
+        g_cap_screen = 0;
+        glFinish();
+        { char p2[96]; snprintf(p2, sizeof p2, "%s/99_screen_960x544.tga", g_cap_dir); f = fopen(p2, "wb"); }
+        if (f) {
+            int ok = 1;
+            memset(hd, 0, sizeof hd);
+            hd[2] = 2; hd[12] = 960 & 0xFF; hd[13] = 960 >> 8; hd[14] = 544 & 0xFF; hd[15] = 544 >> 8; hd[16] = 32; hd[17] = 8;
+            fwrite(hd, 1, 18, f);
+            for (y = 0; y < 544 && ok; y += 16) {
+                memset(strip, 0, sizeof strip);
+                glReadPixels(0, y, 960, 16, GL_RGBA, GL_UNSIGNED_BYTE, strip);
+                ok = cap_write_bgra(f, strip, 960 * 16);
+            }
+            fclose(f);
+            fprintf(stderr, "  [CAP] the screen: ux0:data/twotowers/cap/99_screen_960x544.tga%s\n", ok ? "" : " (write failed)");
+        }
+        if (g_cap_list) { fclose(g_cap_list); g_cap_list = NULL; }
+        fprintf(stderr, "  [CAP] done: the game goes on\n"); fflush(stderr);
+    }
+    VWHERE("present: vglSwapBuffers");
+#if defined(__vita__)
+    vgl_tgt_frame();
+#endif
+#if defined(__vita__)
+    {   /* (v206) [AB2]: 8 s turns of the alpha test dropped where it cannot fail / kept everywhere as before --
+         * the picture is the same in both; each turn's frame time and the swap's wait. TT_AB2=0: no turns. */
+        static int ab = -1;
+        static unsigned long long t_ph, sw_us;
+        static unsigned nfr;
+        unsigned long long t0 = sceKernelGetProcessTimeWide(), t1;
+        if (ab < 0) { const char *e = getenv("TT_AB2"); ab = e && e[0] == '1'; t_ph = t0; }   /* (v207: turns only with TT_AB2=1) */
+        vglSwapBuffers(GL_FALSE);
+        t1 = sceKernelGetProcessTimeWide();
+        sw_us += t1 - t0; nfr++;
+        if (t1 - t_ph > 8000000ull) {
+            double f = nfr ? nfr : 1;
+            fprintf(stderr, "  [AB2] alpha test %s: %u frames, %.1f ms each, %.1f ms of it the swap waiting for the GPU; stage setups with the test dropped %.0f, kept %.0f a frame\n",
+                    g_ab2_ph ? "kept everywhere (as before)" : "dropped where it cannot fail", nfr, (t1 - t_ph) / 1000.0 / f, sw_us / 1000.0 / f, g_ab2_drop / f, g_ab2_keep / f);
+            if (ab) { g_ab2_ph ^= 1; gpu_sh_reset(); }
+            t_ph = t1; nfr = 0; sw_us = 0; g_ab2_drop = g_ab2_keep = 0;
+        }
+    }
+#else
     vglSwapBuffers(GL_FALSE);
-    vgl_frame_done();   /* (deletions three frames old: nv2a_gl_vita.inc) */
+#endif
+    VWHERE("present: deletions");
+    vgl_frame_done();
+    vgl_dynres();
+    VWHERE("after the present");   /* (deletions three frames old: nv2a_gl_vita.inc) */
     {   /* (the first frames: say it works) */
         static unsigned shown;
         if (shown < 3 || (shown % 1800) == 0)

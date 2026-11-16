@@ -330,8 +330,29 @@ static volatile LONG s_ring_head, s_ring_tail;   /* consumer, producer (entries,
 static LONG s_ring_tail_local, s_ring_room;
 static HANDLE s_ring_wake, s_ring_space;
 static int s_async = -1;
+volatile unsigned g_rt_spin_hits, g_rt_spin_miss, g_rt_wakes;   /* (v179) */
 static volatile LONG s_rt_sleeping, s_pb_waiting;   /* (1.9.3) events signalled only to a waiting thread */
 static int s_mark_pending;   /* a run began; its marker not yet in the ring */
+volatile unsigned g_perf_native_n[8];
+/* (v108, [CPU]) the threads whose processor time the frame report shows */
+volatile int g_thid_render, g_thid_sound, g_thid_game, g_thid_timer;
+volatile long long g_timer_lock_ticks; volatile unsigned g_timer_lock_n;   /* (v128) */
+/* (v128) the GPU released a D3D time: a game thread waiting for one
+ * (BlockOnTime, xbox_PbWaitProgress) looks again now, not up to 1 ms later */
+void xbox_PbKickWaiter(void) { if (s_pb_waiting && s_ring_space) SetEvent(s_ring_space); }
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+/* the processor time a thread has had, in microseconds (0: unknown) */
+long long xbox_thread_run_us(int thid)
+{
+    SceKernelThreadInfo ti;
+    if (!thid) return 0;
+    memset(&ti, 0, sizeof ti);
+    ti.size = sizeof ti;
+    if (sceKernelGetThreadInfo(thid, &ti) < 0) return 0;
+    return (long long)ti.runClocks;
+}
+#endif   /* (v107, [PERFG]) calls of the game functions rewritten by hand */
 volatile long long g_perf_rt_ticks;   /* the render thread's time executing, for [PERF] */
 static DWORD WINAPI pb_render_thread(LPVOID p)
 {
@@ -339,10 +360,42 @@ static DWORD WINAPI pb_render_thread(LPVOID p)
     (void)p;
     xbox_UnpinServiceThread();
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#if defined(__vita__)
+    {   /* (v72) the render thread on core 1 alone (the frame thread: core 0) */
+        extern int sceKernelChangeThreadCpuAffinityMask(int thid, int mask);
+        extern int sceKernelGetThreadId(void);
+        int r = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), 0x20000);
+        { extern volatile int g_thid_render; g_thid_render = sceKernelGetThreadId(); }   /* (v108, [CPU]) */
+        fprintf(stderr, "  [NV2A] the render thread on core 1 (%08X)\n", (unsigned)r);
+        {   /* (v182) above the sound thread (which may use core 1 too) and the game's: SetThreadPriority is only
+             * tracked, every thread was at 159. TT_RT_PRIO (0: left). */
+            extern int sceKernelChangeThreadPriority(int thid, int prio);
+            const char *e = getenv("TT_RT_PRIO");
+            int pr = e ? atoi(e) : 128;
+            if (pr) fprintf(stderr, "  [NV2A] the render thread at priority %d (%d)\n", pr, sceKernelChangeThreadPriority(sceKernelGetThreadId(), pr));
+        }
+    }
+#endif
     for (;;) {
         LONG h = s_ring_head, t = s_ring_tail, done = 0;
         LARGE_INTEGER a, b;
         if (h == t) {
+#if defined(__vita__)
+            { extern volatile const char *g_vgl_where; g_vgl_where = "idle: no commands from the game"; }
+#endif
+#if defined(__vita__)
+            {   /* (v179) a moment awake before sleeping: the game kicks after every draw, ~60 us apart while it
+                 * draws, and a kick that finds this thread asleep wakes it (SetEvent, a system call on the
+                 * game thread: KickOff was 5-7% of it, v178). Spinning here, on its own core, the kicks of a
+                 * draw run find it awake. TT_RT_SPIN=iterations (0: sleep at once as before). */
+                static int spin = -1;
+                int k;
+                if (spin < 0) { const char *e = getenv("TT_RT_SPIN"); spin = e ? atoi(e) : 0;   /* (v180: off by default -- v179 log: 1-3 wake-ups a frame, the kicks never found it asleep) */ }
+                for (k = 0; k < spin && s_ring_tail == h; k++) __asm__ volatile("yield" ::: "memory");
+                if (s_ring_tail != h) { g_rt_spin_hits++; continue; }
+                g_rt_spin_miss++;
+            }
+#endif
             InterlockedExchange(&s_rt_sleeping, 1);
             if (s_ring_tail == h) WaitForSingleObject(s_ring_wake, 2);
             InterlockedExchange(&s_rt_sleeping, 0);
@@ -355,7 +408,12 @@ static DWORD WINAPI pb_render_thread(LPVOID p)
              * them (memory the CPU wrote is looked at again once a run);
              * counted per wake-up instead, textures were hashed again many
              * times a frame */
-            if (sm == 0xFFFFFFFFu) g_pb_runs++;
+            if (sm == 0xFFFFFFFFu) {
+                g_pb_runs++;
+#if defined(__vita__)
+                { extern void nv2a_pb_exec_settle(void); nv2a_pb_exec_settle(); }   /* (v117: a draw kept back goes out with its kick) */
+#endif
+            }
             else if (sm >= PB_METH_HDR && sm < 0xFFFE0000u) {
                 extern void nv2a_pb_exec_block(uint32_t hdr, const uint32_t *w, uint32_t n, uint32_t at);
                 uint32_t n = pr, ent = (n + 1) / 2;
@@ -406,6 +464,9 @@ static DWORD WINAPI pb_render_thread(LPVOID p)
             h = (h + 1) & (PB_RING - 1);
             if (++done >= 1024) { done = 0; InterlockedExchange(&s_ring_head, h); if (s_pb_waiting) SetEvent(s_ring_space); }
         }
+#if defined(__vita__)
+        { extern void nv2a_pb_exec_settle(void); nv2a_pb_exec_settle(); }   /* (v117: before the game sees its commands done) */
+#endif
         InterlockedExchange(&s_ring_head, h);
         if (s_pb_waiting) SetEvent(s_ring_space);
         QueryPerformanceCounter(&b);
@@ -437,7 +498,7 @@ static int pb_async(void)
 static void pb_publish(void)
 {
     InterlockedExchange(&s_ring_tail, s_ring_tail_local);
-    if (s_rt_sleeping) SetEvent(s_ring_wake);   /* (it re-checks the tail after saying it sleeps) */
+    if (s_rt_sleeping) { g_rt_wakes++; SetEvent(s_ring_wake); }   /* (it re-checks the tail after saying it sleeps) */
 }
 static void pb_emit(uint32_t subch, uint32_t method, uint32_t param)
 {

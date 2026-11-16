@@ -31,6 +31,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>   /* (v181: [THREADS]) */
+#endif
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
@@ -1540,6 +1543,7 @@ static void draw_primitive(void)
         }
     }
 
+    { extern volatile const char *g_vgl_where; g_vgl_where = "draw_primitive"; }
     raster_batch();
 
     if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
@@ -1831,6 +1835,23 @@ void xbox_PerfWaitNote(int inwait)
                 uint32_t tp;
                 __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(tp));
                 if (&g_prof_tp) { g_prof_tp = tp; g_prof_fn_reset(); }
+                {   /* (v154) the profiler follows this thread's own frame chain */
+                    extern void *volatile g_prof_ctx __attribute__((weak));
+                    extern void *recomp_ctx_slow(void);
+                    if (&g_prof_ctx) g_prof_ctx = recomp_ctx_slow();
+                }
+            }
+            {   /* (v72) the frame thread on core 0 alone; the render thread is
+                 * on core 1 (nv2a_pb_scan.c), the other threads on 0 and 2:
+                 * before, nothing said where threads ran */
+                extern int sceKernelChangeThreadCpuAffinityMask(int thid, int mask);
+                extern int sceKernelGetThreadId(void);
+                /* (v73: on cores 0 and 2 like the other threads -- pinned to
+                 * core 0 alone, the loading screen's thread spun there and the
+                 * thread it waited for never ran: v72 stuck loading) */
+                int r = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), 0x50000);
+                { extern volatile int g_thid_game; g_thid_game = sceKernelGetThreadId(); }   /* (v120, [CPU]) */
+                fprintf(stderr, "  [PERF] the frame thread on cores 0 and 2 (%08X)\n", (unsigned)r);
             }
 #endif
             if (n++ < 8) fprintf(stderr, "  [PERF] the game's frame thread: %lu\n", (unsigned long)t);
@@ -2085,8 +2106,9 @@ int xbox_HudWidePlace(float cx, float cy, float *k)
 #include <psp2/kernel/processmgr.h>
 static uint64_t g_tx_us[6];
 static unsigned g_tx_sums, g_tx_binds;
-#define TX_T0(v) SceUInt64 v = sceKernelGetProcessTimeWide()
-#define TX_ADD(k, v) (g_tx_us[k] += sceKernelGetProcessTimeWide() - (v))
+int g_vgl_timers;   /* (v98: RECOMP_VGL_TIMERS=1) */
+#define TX_T0(v) SceUInt64 v = g_vgl_timers ? sceKernelGetProcessTimeWide() : 0
+#define TX_ADD(k, v) (g_vgl_timers ? (void)(g_tx_us[k] += sceKernelGetProcessTimeWide() - (v)) : (void)0)
 #endif
 #include "nv2a_sw3d.inc"
 #if defined(_WIN32)
@@ -2094,6 +2116,10 @@ static unsigned g_tx_sums, g_tx_binds;
 #else
 #include "nv2a_gl.inc"
 static void gpu_mb_flush(void) { }
+#if defined(__vita__)
+/* (v117) the draw the GL renderer keeps back (jn_flush, nv2a_gl.inc) drawn */
+void nv2a_pb_exec_settle(void) { if (gpu_on()) jn_flush(); }
+#endif
 /* (co-op) the head markers' depth probe is answered by the Direct3D 11
  * renderer only (nv2a_d3d11.inc): here no results come (xbox_zprobe_seq
  * stays 0) and the markers are drawn undimmed */
@@ -2158,6 +2184,63 @@ static int blit_method(uint32_t subch, uint32_t method, uint32_t param)
  * no frame goes out sooner than the limit's period after the last, in
  * menus and play alike; the title sets the rate (0: no limit). */
 volatile int xbox_frame_cap_hz;
+#if defined(__vita__)
+/* (v148) Steady frame pacing on the Vita: a picture goes out on a fixed
+ * grid of screen refreshes -- every 3rd (20 fps) while the game keeps up,
+ * every 4th (15 fps) where it does not, chosen over the last second; films
+ * every 2nd (their 29.97 fps). The rate jumping between 12 and 25 frame by
+ * frame showed more than the average. TT_PACE=30/20/15 fixes it, TT_PACE=0
+ * leaves it free as before. [PACE] says when it changes. */
+extern int sceDisplayGetVcount(void);
+extern int sceDisplayWaitVblankStart(void);
+int vita_pace_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TT_PACE"); on = e && *e && *e != '0'; }   /* (v226: off again unless TT_PACE=1 -- v225's log: it went 20 <-> 15 119 times and held the gains under 15) (v225: on unless TT_PACE=0 -- the user: a steady rate over a jumping one) (v151: off unless asked -- in a crowd neither 20 nor 15 held) */   /* (v150: TT_PACE -- TT_FPS is the game's own 30/60 mode, v149 read it as "30 fixed") */
+    return on;
+}
+static int vita_pace(void)
+{
+    extern int hwm_active(void) __attribute__((weak));
+    static int fixed = -1, n = 3, win, late, fit3, s_pace15;
+    static unsigned last;
+    unsigned vc, d;
+    int target;
+    if (fixed < 0) {
+        const char *e = getenv("TT_PACE");
+        int f = e ? atoi(e) : -1;
+        fixed = f >= 28 ? 2 : f >= 18 ? 3 : f >= 2 ? 4 : 0;   /* (TT_PACE=1: the automatic 20/15) */
+        if (fixed) n = fixed;
+        { const char *q = getenv("TT_PACE_15"); s_pace15 = !(q && q[0] == '0'); }   /* (v225: on unless TT_PACE_15=0) */
+        fprintf(stderr, "  [PACE] %s\n", fixed ? (fixed == 2 ? "30 fps fixed" : fixed == 3 ? "20 fps fixed" : "15 fps fixed") : s_pace15 ? "20 fps, 15 where the game cannot keep up" : "20 fps at most, late frames shown at once");
+    }
+    if (!vita_pace_on()) return 0;
+    {   /* (v225) only in play (the HUD up): loads, menus and scenes as before */
+        extern int tt_in_play(void) __attribute__((weak));
+        if (tt_in_play && !tt_in_play() && !fixed) { last = (unsigned)sceDisplayGetVcount(); return 0; }
+    }
+    vc = (unsigned)sceDisplayGetVcount();
+    d = vc - last;
+    target = (hwm_active && hwm_active()) ? 2 : n;
+    if (d < (unsigned)target) {
+        while ((unsigned)sceDisplayGetVcount() - last < (unsigned)target) sceDisplayWaitVblankStart();
+        last += target;
+    } else last = vc;   /* (late: a new grid from now) */
+    if (!fixed && target == n) {
+        win++;
+        if (d > 3) late++;
+        if (d <= 3) fit3++;
+        if (win >= 20) {
+            int was = n;
+            if (n == 3 && late > 5 && s_pace15) n = 4;  /* (more than a quarter missed 20 fps: 15) (v197: only with TT_PACE_15=1 -- late frames go out at once now, 17-19 fps beats a held 15) */
+            else if (n == 4 && fit3 >= 18) n = 3;       /* (nine in ten would make 20 fps again) */
+            if (n != was) fprintf(stderr, "  [PACE] now %s\n", n == 3 ? "20 fps" : "15 fps");
+            win = late = fit3 = 0;
+        }
+    }
+    return 1;
+}
+#endif
 static void frame_limit(void)
 {
     extern void xbox_precise_wait_until(LONGLONG deadline);
@@ -2168,6 +2251,9 @@ static void frame_limit(void)
     static int force = -1;   /* testing: RECOMP_FRAME_CAP=<n> */
     if (force < 0) { const char *e = getenv("RECOMP_FRAME_CAP"); force = e ? atoi(e) : 0; }
     if (force > 0) hz = force;
+#if defined(__vita__)
+    if (vita_pace()) { next = 0; return; }
+#endif
     if (hz <= 0) { next = 0; return; }
     if (!f.QuadPart) QueryPerformanceFrequency(&f);
     period = f.QuadPart / hz;
@@ -2201,7 +2287,7 @@ static int pb_note_change1(uint32_t subch, uint32_t method, uint32_t param)
     default: break;
     }
     if (method >= 0x0B80 && method < 0x0C00) {                          /* a constant's component */
-        if (s_3d.c_load >= VP_CONSTS || memcmp(&s_3d.c[s_3d.c_load][s_3d.c_comp], &param, 4)) { s_chg |= CHG_CONST; s_vpc_dirty = 1; }
+        if (s_3d.c_load >= VP_CONSTS || memcmp(&s_3d.c[s_3d.c_load][s_3d.c_comp], &param, 4)) { s_chg |= CHG_CONST; if (s_3d.c_load < VP_CONSTS) VPC_MARK(s_3d.c_load); else s_vpc_dirty = 1; }
         return 0;
     }
     if (method >= 0x0B00 && method < 0x0B80) {                          /* a program word */
@@ -2265,6 +2351,9 @@ static int s_mhist_on = -1;
 #define PB_METH_HDR_ 0xFFF00000u
 void nv2a_pb_exec_block(uint32_t hdr, const uint32_t *w, uint32_t n, uint32_t at)
 {
+#if defined(__vita__)
+    g_rt_meth = hdr & 0xFFFFu; g_vgl_where = g_vw_block;
+#endif
     uint32_t subch = (hdr >> 16) & 7u, method = hdr & 0xFFFFu, i;
     if ((hdr & 0x00080000u) && subch == 0 && method == NV097_ARRAY_ELEMENT16 && !s_cap_fp && s_mhist_on == 0) {
         /* (1.9.5) a draw's 16-bit indices, two to a word -- most of the
@@ -2304,7 +2393,17 @@ static void nv2a_pb_exec_consts_(const uint32_t *w, uint32_t n)
         uint32_t at = (uint32_t)s_3d.c_load * 4 + (uint32_t)s_3d.c_comp, m = VP_CONSTS * 4 - at;
         float *c = &s_3d.c[0][0] + at;
         if (m > n) m = n;
-        if (memcmp(c, w, (size_t)m * 4)) { rt_copy(c, w, (size_t)m * 4); s_chg |= CHG_CONST; s_vpc_dirty = 1; }
+        if (m) {   /* (v183) only the words that differ (one pass, not memcmp then a copy of all), and only their rows marked */
+            typedef uint32_t __attribute__((may_alias)) u32a;
+            u32a *cu = (u32a *)c; uint32_t f = 0, l;
+            while (f < m && cu[f] == w[f]) f++;
+            if (f < m) {
+                l = m - 1;
+                while (l > f && cu[l] == w[l]) l--;
+                memcpy(cu + f, w + f, (size_t)(l - f + 1) * 4);
+                s_chg |= CHG_CONST; VPC_MARK((at + f) / 4); VPC_MARK((at + l) / 4);
+            }
+        }
         at += m;
         s_3d.c_load = at / 4; s_3d.c_comp = at % 4;
     }
@@ -2335,10 +2434,17 @@ void nv2a_pb_exec_raw(const uint32_t *w, uint32_t n)
     }
 }
 /* (1.9.5) timed for the log's [PERFRT] line */
-void nv2a_pb_exec_inline(const uint32_t *w, uint32_t n) { PT_T0(t0); nv2a_pb_exec_inline_(w, n); PT_ADD(PT_INLINE, t0); }
-void nv2a_pb_exec_consts(const uint32_t *w, uint32_t n) { PT_T0(t0); nv2a_pb_exec_consts_(w, n); PT_ADD(PT_CONSTS, t0); }
+#if defined(__vita__)
+#define RTZ_METH(m) (g_rt_meth = (m), g_vgl_where = g_vw_method)
+#else
+#define RTZ_METH(m) ((void)0)
+#define VWHERE(x) ((void)0)
+#endif
+void nv2a_pb_exec_inline(const uint32_t *w, uint32_t n) { PT_T0(t0); VWHERE("inline vertices run"); nv2a_pb_exec_inline_(w, n); PT_ADD(PT_INLINE, t0); }
+void nv2a_pb_exec_consts(const uint32_t *w, uint32_t n) { PT_T0(t0); VWHERE("vertex constants run"); nv2a_pb_exec_consts_(w, n); PT_ADD(PT_CONSTS, t0); }
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
+    RTZ_METH(method);
 #if defined(_WIN32)
     g_cnt_rt++;
 #endif
@@ -2348,7 +2454,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (subch == 0 && (method & ~0x7Fu) == 0x0B80 && !s_cap_fp && s_mhist_on == 0) {
         if (s_3d.c_load < VP_CONSTS) {
             float *c = &s_3d.c[s_3d.c_load][s_3d.c_comp];
-            if (memcmp(c, &param, 4)) { memcpy(c, &param, 4); s_chg |= CHG_CONST; s_vpc_dirty = 1; }
+            if (memcmp(c, &param, 4)) { memcpy(c, &param, 4); s_chg |= CHG_CONST; VPC_MARK(s_3d.c_load); }
             if (++s_3d.c_comp == 4) { s_3d.c_comp = 0; s_3d.c_load++; }
         } else s_chg |= CHG_CONST;
         return;
@@ -2550,12 +2656,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              * the CPU sleeps on that event. Queued like a callback; the
              * kernel side knows where the event is. */
             pb_queue_callback(0xFFFFFFFFu, 5);
-            if (getenv("RECOMP_PB_EXEC_VERBOSE"))
+            if (verbose)
                 fprintf(stderr, "  [GPU] NOP 5 (D3D idle trap) queued\n");
         }
         if (param == 6 || param == 7) {
             pb_queue_callback(s_cb_scratch[0], s_cb_scratch[1]);
-            if (getenv("RECOMP_PB_EXEC_VERBOSE"))
+            if (verbose)
                 fprintf(stderr, "  [GPU] D3D callback 0x%08X(0x%08X) queued\n",
                         s_cb_scratch[0], s_cb_scratch[1]);
         }
@@ -2573,9 +2679,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* (compact guest: mem uses go through XR_PTR) */
         if (va && !surface_hits_image(va, 4))
             *(volatile uint32_t *)(XR_PTR(va)) = param;
-        if (getenv("RECOMP_PB_EXEC_VERBOSE") || getenv("RECOMP_SEM_TRACE"))
+        { extern void xbox_PbKickWaiter(void); xbox_PbKickWaiter(); }   /* (v128) */
+        { static int vb = -1; if (vb < 0) vb = getenv("RECOMP_PB_EXEC_VERBOSE") || getenv("RECOMP_SEM_TRACE"); if (vb)
             fprintf(stderr, "  [GPU] semaphore release 0x%08X -> 0x%08X (dma 0x%X base 0x%08X + 0x%08X)\n",
-                    param, va, s_semaphore_dma, dma_object_base(s_semaphore_dma), s_semaphore_offset);
+                    param, va, s_semaphore_dma, dma_object_base(s_semaphore_dma), s_semaphore_offset); }
         break;
     }
 
@@ -2679,6 +2786,75 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                         }
                         memset(g_pt, 0, sizeof g_pt); g_pt_raw_n = g_pt_old_n = 0; memset(s_chg_n, 0, sizeof s_chg_n); g_stg_kept = g_stg_made = 0; g_mb_joined = g_mb_sent = 0;
                         tsc0 = tsc; q0 = qn.QuadPart;
+                    }
+#endif
+                    {   /* (v107) [PERFG]: what the game's thread meets outside its own code */
+                        extern volatile unsigned g_apu_wr_n, g_apu_wr_held_n, g_perf_rd_n, g_perf_rd_kb;
+                        extern volatile long long g_apu_wr_held_ticks, g_perf_rd_ticks;
+                        extern volatile int g_apu_busy_permille;
+                        extern volatile unsigned g_perf_native_n[8];
+                        static unsigned w0, h0, r0, k0, nn0[8]; static long long ht0, rdt0;
+                        double q = nf ? 1000.0 / (double)qf.QuadPart / nf : 0;
+                        if (nf) fprintf(stderr, "  [PERFG] per frame: %u sound-chip writes, %u held by the sound thread for %.2f ms; sound thread busy %d%%; %u file reads, %u KB, %.2f ms; native: %u ray tests, %u shadow faces, %u shadow edges, %u bone sets\n",
+                                (g_apu_wr_n - w0) / nf, (g_apu_wr_held_n - h0) / nf, (g_apu_wr_held_ticks - ht0) * q, g_apu_busy_permille / 10,
+                                (g_perf_rd_n - r0) / nf, (g_perf_rd_kb - k0) / nf, (g_perf_rd_ticks - rdt0) * q,
+                                (g_perf_native_n[0] - nn0[0]) / nf, (g_perf_native_n[1] - nn0[1]) / nf, (g_perf_native_n[2] - nn0[2]) / nf, (g_perf_native_n[3] - nn0[3]) / nf);
+                        w0 = g_apu_wr_n; h0 = g_apu_wr_held_n; ht0 = g_apu_wr_held_ticks; r0 = g_perf_rd_n; k0 = g_perf_rd_kb; rdt0 = g_perf_rd_ticks;
+                        { int z; for (z = 0; z < 8; z++) nn0[z] = g_perf_native_n[z]; }
+                        {   /* (v214) [MESHCULL] */
+                            extern unsigned g_nh_cull_n[3] __attribute__((weak));
+                            static unsigned c0, c1, c2;
+                            if (g_nh_cull_n && nf) {
+                                fprintf(stderr, "  [MESHCULL] per frame: %u mesh tests, %u skipped as out of reach (%u triangles not tested)\n",
+                                        (g_nh_cull_n[0] - c0) / nf, (g_nh_cull_n[1] - c1) / nf, (g_nh_cull_n[2] - c2) / nf);
+                                c0 = g_nh_cull_n[0]; c1 = g_nh_cull_n[1]; c2 = g_nh_cull_n[2];
+                            }
+                        }
+                    }
+#if defined(__vita__)
+                    {   /* (v108) [CPU]: the processor time each thread really had --
+                         * the [RTPROF] zones count wall time, a thread the system
+                         * has put aside included */
+                        extern volatile int g_thid_render, g_thid_sound, g_thid_game, g_thid_timer;
+                        extern volatile long long g_timer_lock_ticks; extern volatile unsigned g_timer_lock_n;
+                        extern long long xbox_thread_run_us(int thid);
+                        extern int sceKernelGetThreadId(void);
+                        extern volatile unsigned g_gxm_fc; extern volatile long long g_gxm_fc_us;
+                        static long long r0c, g0c, s0c, w0c, fp0us; static unsigned fp0;
+                        long long rc = xbox_thread_run_us(g_thid_render), gc = xbox_thread_run_us(g_thid_game),
+                                  sc = xbox_thread_run_us(g_thid_sound), wc = (long long)(now) * 1000;
+                        if (nf && w0c) fprintf(stderr, "  [CPU] per frame: render thread ran %.1f ms, game thread %.1f ms, sound thread %.1f ms, in %.1f ms; fragment programs %u made, %.2f ms\n",
+                                (rc - r0c) / 1000.0 / nf, (gc - g0c) / 1000.0 / nf, (sc - s0c) / 1000.0 / nf, (wc - w0c) / 1000.0 / nf,
+                                (g_gxm_fc - fp0) / nf, (g_gxm_fc_us - fp0us) / 1000.0 / nf);
+                        {   /* (v128) the kernel's clock thread: vblank, sound IRQ, D3D callbacks */
+                            static long long t0c, tl0; static unsigned tn0; static LARGE_INTEGER tfq;
+                            long long tc = xbox_thread_run_us(g_thid_timer);
+                            if (!tfq.QuadPart) QueryPerformanceFrequency(&tfq);
+                            extern volatile unsigned g_cpu_lock_n, g_cpu_lock_busy_n; extern volatile long long g_cpu_lock_busy_ticks;
+                            static unsigned cl0, cb0; static long long cw0;
+                            if (nf && w0c) fprintf(stderr, "  [CPU] timer thread ran %.1f ms per frame; %u ticks, %.2f ms waiting for the dispatch lock; the lock per frame: taken %u times, %u found it held, %.2f ms waited (all threads)\n",
+                                    (tc - t0c) / 1000.0 / nf, (g_timer_lock_n - tn0) / nf, (double)(g_timer_lock_ticks - tl0) * 1000.0 / tfq.QuadPart / nf,
+                                    (g_cpu_lock_n - cl0) / nf, (g_cpu_lock_busy_n - cb0) / nf, (double)(g_cpu_lock_busy_ticks - cw0) * 1000.0 / tfq.QuadPart / nf);
+                            t0c = tc; tl0 = g_timer_lock_ticks; tn0 = g_timer_lock_n; cl0 = g_cpu_lock_n; cb0 = g_cpu_lock_busy_n; cw0 = g_cpu_lock_busy_ticks;
+                        }
+                        {   /* (v181) [THREADS]: where each thread runs, its priority, how often others put it aside */
+                            static unsigned pre0[4], mv0[4];
+                            const int ids[4] = { g_thid_render, g_thid_game, g_thid_sound, g_thid_timer };
+                            static const char *nm[4] = { "render", "game", "sound", "timer" };
+                            char b[400]; int q = 0, z;
+                            for (z = 0; z < 4; z++) {
+                                SceKernelThreadInfo ti;
+                                if (!ids[z]) continue;
+                                memset(&ti, 0, sizeof ti); ti.size = sizeof ti;
+                                if (sceKernelGetThreadInfo(ids[z], &ti) < 0) continue;
+                                if (nf && w0c) q += snprintf(b + q, sizeof b - q, " %s: cpu %d mask %X prio %d, put aside %.1f/frame, moved %.1f/frame;", nm[z],
+                                    (int)ti.lastExecutedCpuId, (unsigned)ti.currentCpuAffinityMask, (int)ti.currentPriority,
+                                    (ti.threadPreemptCount - pre0[z]) / nf, (ti.changeCpuCount - mv0[z]) / nf);
+                                pre0[z] = ti.threadPreemptCount; mv0[z] = (unsigned)ti.changeCpuCount;
+                            }
+                            if (q) fprintf(stderr, "  [THREADS]%s\n", b);
+                        }
+                        r0c = rc; g0c = gc; s0c = sc; w0c = wc; fp0 = g_gxm_fc; fp0us = g_gxm_fc_us;
                     }
 #endif
                     pb0 = g_perf_pb_ticks; pr0 = pr; wt0 = xbox_perf_wait_ticks; rt0 = g_perf_rt_ticks; b0 = s_3d.batches;

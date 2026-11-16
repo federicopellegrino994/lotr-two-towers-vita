@@ -1576,6 +1576,15 @@ static DWORD input_get_raw(DWORD dwPort, XBOX_INPUT_STATE *pState)
         prevb = hp.buttons;
     }
 
+#if defined(__vita__)
+    /* (v84) the Vita has no triggers: its R is the Xbox right trigger
+     * (before: the White button) */
+    if (hp.buttons & XINPUT_GAMEPAD_RIGHT_SHOULDER) { hp.rt = 255; hp.buttons &= (WORD)~XINPUT_GAMEPAD_RIGHT_SHOULDER; }
+    /* (v114) and its L the left trigger (the bow); what L did (the step
+     * back) is now the right stick pushed down */
+    if (hp.buttons & XINPUT_GAMEPAD_LEFT_SHOULDER) { hp.lt = 255; hp.buttons &= (WORD)~XINPUT_GAMEPAD_LEFT_SHOULDER; }
+    if (hp.ry < -20000) hp.buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+#endif
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
     pState->dwPacketNumber = hp.packet;
     {

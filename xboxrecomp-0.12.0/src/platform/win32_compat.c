@@ -407,6 +407,9 @@ static void obj_release(w32_object *o)
 /* ---- fd-backed file handle (for the file-I/O HLE) -------------------- */
 HANDLE w32_open_handle(int fd, const char *host_path)
 {
+#if defined(__vita__)
+    { extern void xbox_ra_forget_fd(int fd); xbox_ra_forget_fd(fd); }   /* (the read-ahead: kernel_file.c) */
+#endif
     w32_object *o = obj_alloc(K_FILE);
     o->fd        = fd;
     o->file_path = host_path ? strdup(host_path) : NULL;
@@ -758,6 +761,13 @@ static void *thread_trampoline(void *arg)
     t_self_obj = o;
     t_tid      = o->tid;
     if (w32_thread_start_hook) w32_thread_start_hook();
+#if defined(__vita__)
+    {   /* (v72) cores 0 and 2: core 1 is the render thread's (nv2a_pb_scan.c) */
+        extern int sceKernelChangeThreadCpuAffinityMask(int thid, int mask);
+        extern int sceKernelGetThreadId(void);
+        sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), 0x50000);
+    }
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -818,7 +828,13 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
         return NULL;
     }
     pthread_attr_destroy(&attr);
-    o->thread_joinable = 1;
+    /* (v112) detached: nothing ever joins a thread (WaitForSingleObject waits
+     * on the object), and a joinable thread that ended kept its stack. On the
+     * Vita each guest worker's 4 MB stayed taken: two per Bink movie, and by
+     * the third level the movie's threads could not be made (error 8) and the
+     * game waited on them for ever. */
+    pthread_detach(o->thread);
+    o->thread_joinable = 0;
 
     if (threadId) *threadId = o->tid;
     return (HANDLE)o;
@@ -878,7 +894,7 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = obj_get(h);
     if (!o || o->kind != K_THREAD) return FALSE;
-    pthread_cancel(o->thread);
+    if (!o->exited) pthread_cancel(o->thread);   /* (v112: detached -- an ended one's id is gone) */
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
     o->exited    = 1;

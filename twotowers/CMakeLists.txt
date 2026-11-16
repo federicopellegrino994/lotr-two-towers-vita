@@ -21,6 +21,9 @@ get_filename_component(TT_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 if(MINGW OR CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     add_compile_options("-ffile-prefix-map=${TT_REPO_ROOT}=." "-ffile-prefix-map=${CMAKE_BINARY_DIR}=build")
 endif()
+if(VITA)
+    add_compile_options(-mtune=cortex-a9)   # (v74: the Vita's own processor)
+endif()
 if(MINGW)
     add_link_options(-Wl,--no-insert-timestamp)
 elseif(MSVC)
@@ -155,28 +158,74 @@ elseif(VITA)
         SDL2main SDL2
         vitaGL vitashark SceShaccCgExt mathneon taihen_stub
         SceShaccCg_stub SceKernelDmacMgr_stub
-        SceDisplay_stub SceCtrl_stub SceAudio_stub SceAudioIn_stub
+        SceDisplay_stub SceCtrl_stub SceAudio_stub SceAudioIn_stub SceAvPlayer_stub
         SceSysmodule_stub SceGxm_stub SceCommonDialog_stub SceAppMgr_stub
         SceAppUtil_stub SceTouch_stub SceHid_stub SceMotion_stub SceIme_stub
         ScePower_stub SceRtc_stub SceLibKernel_stub SceNet_stub SceNetCtl_stub
         pthread m)
     target_compile_options(${PROJECT_NAME} PRIVATE -Wno-incompatible-pointer-types
         -Wno-int-conversion -Wno-format)
+    option(TT_PROFILE "the game thread's frame chain for [PROF] (a cost on every call)" ON)
+    if(TT_PROFILE)
+        set(TT_PROF_DEF ";RECOMP_PROFILE")
+    else()
+        set(TT_PROF_DEF "")
+        target_compile_definitions(${PROJECT_NAME} PRIVATE TT_NO_PROF)   # (no sampler, no hand-written frames)
+    endif()
     set(TT_GUEST_RENAMES "close=tt_guest_close;write=tt_guest_write;lseek=tt_guest_lseek;isatty=tt_guest_isatty")
     set_source_files_properties(${RECOMP_GEN_SOURCES}
-        PROPERTIES COMPILE_DEFINITIONS "${TT_GUEST_RENAMES};RECOMP_PROFILE;RECOMP_FAST_REGS")
+        PROPERTIES COMPILE_DEFINITIONS "${TT_GUEST_RENAMES};RECOMP_FAST_REGS${TT_PROF_DEF}")   # (v129: the game thread profiled; v177: -DTT_PROFILE=OFF builds it without)
+    # (v188) the generated code's optimisation level: TT_GEN_OPT (e.g. -O2, -Os); empty keeps -O3. 13.7 MB of
+    # code at -O3: the game thread's working set may miss the 32 KB instruction cache more than it gains.
+    set(TT_GEN_OPT "-O2" CACHE STRING "optimisation flags for the generated code")
+    # (v194) profile-guided optimisation of the generated code: TT_PGO=gen counts it while the game runs
+    # (the .gcda files dumped every 3 minutes under ux0:data/twotowers/pgo), TT_PGO=use builds from them
+    # (TT_PGO_DIR: where they were copied; the code never run keeps its usual optimisation).
+    set(TT_PGO "" CACHE STRING "profile-guided optimisation: gen, use, or empty")
+    set(TT_PGO_DIR "/home/claude/pgo" CACHE STRING "the .gcda files for TT_PGO=use")
+    set(TT_GEN_FLAGS "${TT_GEN_OPT}")
+    if(TT_PGO STREQUAL "gen")
+        # (the Vita toolchain's libgcov is the freestanding one: no file writing, no value profiling, no
+        #  constructors -- the counts' descriptions in a section, gcov_info, and twotowers_manual.c writes
+        #  the files itself with __gcov_info_to_gcda)
+        list(APPEND TT_GEN_FLAGS -fprofile-generate=/pgo -fprofile-update=single -fno-profile-values -fprofile-info-section=gcov_info)
+        target_link_libraries(${PROJECT_NAME} PRIVATE gcov)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE TT_PGO_GEN)
+    elseif(TT_PGO STREQUAL "use")
+        list(APPEND TT_GEN_FLAGS -fprofile-use=${TT_PGO_DIR} -fprofile-partial-training -Wno-missing-profile -Wno-coverage-mismatch)
+    endif()
+    if(TT_GEN_FLAGS)
+        set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "${TT_GEN_FLAGS}")
+    endif()
+    # (v113) the sampling profiler on the Bink movie code only (sections BINK*, 0x13A1A0-0x14F800)
+    # (v127: off again)
+    #set_source_files_properties(src/recomp/gen/recomp_0032.c src/recomp/gen/recomp_0033.c
+    #    PROPERTIES COMPILE_DEFINITIONS "${TT_GUEST_RENAMES};RECOMP_FAST_REGS;RECOMP_PROFILE")
     set_source_files_properties(src/twotowers_manual.c src/recomp_manual.c
         PROPERTIES COMPILE_DEFINITIONS "${TT_GUEST_RENAMES}")
     # (sampling profiler: postproc_prof.py's hooks, src/prof_vita.c)
     target_sources(${PROJECT_NAME} PRIVATE src/prof_vita.c)
+    # (v132) the films on the video decoder
+    target_sources(${PROJECT_NAME} PRIVATE src/hwmovie.c)
+    # (v107) the hottest game functions written by hand, compiled like the
+    # generated code
+    target_sources(${PROJECT_NAME} PRIVATE src/native_hot.c)
+    set_source_files_properties(src/native_hot.c
+        PROPERTIES COMPILE_DEFINITIONS "${TT_GUEST_RENAMES};RECOMP_FAST_REGS")
     target_link_options(${PROJECT_NAME} PRIVATE -Wl,-q)
+    # (v79) vitaGL's 2 MB uniform pool replaced by a bigger one (video/fb_present.c)
+    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--wrap=vglSetupUniformCircularPool -Wl,--wrap=vglReserveUniformCircularPoolBuffer -Wl,--wrap=vgl_reserve_data_pool -Wl,--wrap=sceGxmShaderPatcherCreateVertexProgram -Wl,--wrap=sceGxmShaderPatcherCreateFragmentProgram -Wl,--wrap=sceGxmSetVertexProgram -Wl,--wrap=sceGxmSetFragmentProgram -Wl,--wrap=sceGxmDraw -Wl,--wrap=vglCreateVertexProgram -Wl,--wrap=sceClibMemcpy -Wl,--wrap=sceGxmSetVertexStream -Wl,--wrap=sceGxmSetFragmentTexture -Wl,--wrap=sceGxmSetVertexUniformBuffer -Wl,--wrap=sceGxmSetFragmentUniformBuffer -Wl,--wrap=sceGxmSetVertexDefaultUniformBuffer -Wl,--wrap=sceGxmSetFragmentDefaultUniformBuffer -Wl,--wrap=scene_reset -Wl,--wrap=sceGxmBeginScene -Wl,--wrap=sceGxmEndScene -Wl,--wrap=sceGxmCreateRenderTarget)
     set(VITA_APP_NAME "The Two Towers")
     set(VITA_TITLEID  "TTWR00001")
     set(VITA_VERSION  "01.00")
     vita_create_self(eboot.bin ${PROJECT_NAME} UNSAFE)
     vita_create_vpk(TwoTowers.vpk ${VITA_TITLEID} eboot.bin
         VERSION ${VITA_VERSION}
-        NAME ${VITA_APP_NAME})
+        NAME ${VITA_APP_NAME}
+        FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png sce_sys/icon0.png
+        FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
+        FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+        FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml)
 else()
     # Linux: SDL2 (window, OpenGL context, sound, controllers); OpenGL itself
     # is loaded at run time through SDL.

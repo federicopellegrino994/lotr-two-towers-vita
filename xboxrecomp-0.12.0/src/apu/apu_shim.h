@@ -109,20 +109,37 @@ extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
  * play cursor the title read from the real array never moved -- so a
  * streaming sound looped its first buffer forever. */
 extern int xbox_PhysIsIdentity(uint32_t pa);
+/* (v193) a page's answer remembered in a shared table of 1024 (one word each:
+ * page, which block, valid -- no torn entry between threads), started over when
+ * the kernel names a new identity page (g_id_phys_gen). The old one-page cache
+ * was __thread: on the Vita two emulated-TLS calls at every access, and the
+ * voice struct, its scatter list and its samples on three pages took turns in
+ * it -- the sound thread's 32-sample frame cost ~28 us a voice, 600 us of the
+ * 667 us of sound in a crowd (v192 [APUPROF]): crackle. */
+extern volatile uint32_t g_id_phys_gen;
+extern volatile uint32_t g_apu_pcache[1024];
+extern volatile uint32_t g_apu_pcache_gen;
+extern uint8_t *g_apu_base[2];
 static inline uint8_t *apu_phys_ptr(hwaddr addr)
 {
-    static __thread uint32_t last_page = 0xFFFFFFFFu;
-    static __thread uint8_t *last_base;
     uint32_t pa = (uint32_t)addr & 0x03FFFFFFu;
-    uint32_t page = pa >> 12;
-    if (page != last_page) {
-        last_page = page;
+    uint32_t page = pa >> 12, e, want;
+    if (__builtin_expect(g_apu_pcache_gen != g_id_phys_gen, 0)) {
+        uint32_t i, g = g_id_phys_gen;
+        for (i = 0; i < 1024; i++) g_apu_pcache[i] = 0;
+        g_apu_pcache_gen = g;
+    }
+    if (__builtin_expect(!g_apu_base[1], 0)) { g_apu_base[0] = XR_PTR(0x80000000u); g_apu_base[1] = XR_PTR(0u); }
+    e = g_apu_pcache[page & 1023u];
+    want = 0x80000000u | (page << 1);
+    if (__builtin_expect((e & ~1u) != want, 0)) {
         /* RAM, or the contiguous window: each one block of 64 MB, found
          * through the guest map (the flat sum only holds for RAM once the
          * guest is compact) */
-        last_base = XR_PTR(xbox_PhysIsIdentity(pa) ? 0u : 0x80000000u);
+        e = want | (xbox_PhysIsIdentity(pa) ? 1u : 0u);
+        g_apu_pcache[page & 1023u] = e;
     }
-    return last_base + pa;
+    return g_apu_base[e & 1u] + pa;
 }
 
 /* Little-endian physical memory reads */

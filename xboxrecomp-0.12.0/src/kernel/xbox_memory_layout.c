@@ -85,6 +85,7 @@ static void *g_tiled_view = NULL;
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
  * the same numbers for MmClaimGpuInstanceMemory. */
 static void *g_contig_memory = NULL;
+void *g_xbox_contig_block = NULL;   /* (v123, Vita: the contiguous window when it is a memory block of its own) */
 
 /* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
  * that D3D8 code linked into the title can poke it without faulting. */
@@ -1171,6 +1172,15 @@ ptrdiff_t g_xbox_mem_offset = 0;
  * ------------------------------------------------------------------------- */
 uintptr_t g_xbox_region_base[256];
 uint32_t  g_xbox_region_mask[256];
+/* (v93) the same table folded for the generated code: host = lin[va >> 24]
+ * + va, one load and one add (the base + mask form was two loads, a shift,
+ * an AND and an add on every guest access -- about a third of the lifted
+ * code's instructions). Exact for every slice whose wrap is at least 16 MB
+ * (RAM and its mirrors, the contiguous window, the tiled window, NV2A,
+ * MCPX); the 1 MB flash, which repeats inside its slice, gets its top MB
+ * (where the BIOS image is read, 0xFFF00000 up). Unbacked slices give a host
+ * address under 16 MB, which faults like the base-0 entry did. */
+uintptr_t g_xbox_region_lin[256];
 
 uint32_t xbox_GuestVa(const void *host)
 {
@@ -1240,6 +1250,10 @@ static void compact_map(uint32_t va, uint64_t span, void *host, uint64_t wrap)
          * byte: folded into the base so the lookup is one AND and one ADD. */
         g_xbox_region_base[i] = (uintptr_t)host - (uintptr_t)(va & mask);
         g_xbox_region_mask[i] = mask;
+        if (mask >= 0x00FFFFFFu)
+            g_xbox_region_lin[i] = g_xbox_region_base[i] + (uintptr_t)((i << 24) & mask) - ((uintptr_t)i << 24);
+        else   /* (a wrap under a slice: its last block) */
+            g_xbox_region_lin[i] = g_xbox_region_base[i] - (uintptr_t)(((uint64_t)(i + 1) << 24) - ((uint64_t)mask + 1u));
     }
 }
 
@@ -1919,6 +1933,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
     memset(g_xbox_region_base, 0, sizeof g_xbox_region_base);
     memset(g_xbox_region_mask, 0, sizeof g_xbox_region_mask);
+    {   uint32_t i;
+        for (i = 0; i < 256; i++) g_xbox_region_lin[i] = (uintptr_t)0 - ((uintptr_t)i << 24);
+    }
     /* Guest 0 up to the contiguous window: RAM and its wrap mirrors. */
     compact_map(0, (uint64_t)XBOX_CONTIG_BASE, g_memory_base, g_memory_size);
     fprintf(stderr, "  Compact guest: %zu MB RAM at host %p, mirrored by"
@@ -2468,7 +2485,28 @@ compact_ram_ready:
      */
     {
 #if defined(RECOMP_COMPACT_GUEST)
+#if defined(__vita__)
+        {   /* (v123) a memory block of its own, not a piece of the C heap:
+             * the GPU can then read the vertex buffers in it in place
+             * (sceGxmMapMemory refused a piece of the heap, 805B0017 --
+             * nv2a_gl_vita.inc ip_slice). The heap is 64 MB smaller for it
+             * (main.c). */
+            extern int sceKernelAllocMemBlock(const char *name, unsigned int type, unsigned int size, void *opt);
+            extern int sceKernelGetMemBlockBase(int uid, void **base);
+            int uid = sceKernelAllocMemBlock("xbox_contig", 0x0C20D060u /* USER_RW */, XBOX_CONTIG_SIZE, NULL);
+            void *b = NULL;
+            if (uid >= 0 && sceKernelGetMemBlockBase(uid, &b) >= 0 && b) {
+                memset(b, 0, XBOX_CONTIG_SIZE);
+                g_contig_memory = b;
+                g_xbox_contig_block = b;
+            } else {
+                fprintf(stderr, "  [MEM] no memory block for the contiguous window (%08X): from the heap\n", (unsigned)uid);
+                g_contig_memory = compact_alloc(XBOX_CONTIG_SIZE);
+            }
+        }
+#else
         g_contig_memory = compact_alloc(XBOX_CONTIG_SIZE);
+#endif
         if (g_contig_memory)
             compact_map(XBOX_CONTIG_BASE, XBOX_CONTIG_SIZE, g_contig_memory,
                         XBOX_CONTIG_SIZE);

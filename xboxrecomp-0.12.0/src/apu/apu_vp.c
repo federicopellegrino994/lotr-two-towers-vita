@@ -97,8 +97,13 @@ static float clampf(float v, float mn, float mx)
 
 static float attenuate(uint16_t vol)
 {
-    vol &= 0xFFF;
-    return (vol == 0xFFF) ? 0.0f : powf(10.0f, vol / (64.0f * -20.0f));
+    /* (v123) from a table: it was a powf at every call, eight and more a
+     * voice a frame, 1500 frames a second -- the sound thread took 80-95 ms
+     * of processor a game frame on the Vita (the same values, kept) */
+    static float lut[4096];
+    static int ok;
+    if (!ok) { int i; for (i = 0; i < 4096; i++) lut[i] = (i == 0xFFF) ? 0.0f : powf(10.0f, i / (64.0f * -20.0f)); ok = 1; }
+    return lut[vol & 0xFFF];
 }
 
 /* ============================================================
@@ -653,7 +658,23 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
         static int nolock = -1;
         if (nolock < 0) nolock = getenv("RECOMP_APU_NOPIOLOCK") != NULL;
         if (nolock) { fe_method(d, (uint32_t)addr, (uint32_t)val); return; }
-        qemu_mutex_lock(&d->lock);
+        {   /* (v107) how often the title's write finds the sound thread
+             * holding the lock, and how long it waits ([PERFG]) */
+            extern volatile unsigned g_apu_wr_n, g_apu_wr_held_n;
+            extern volatile long long g_apu_wr_held_ticks;
+            g_apu_wr_n++;
+            if (!TryEnterCriticalSection(&d->lock.cs)) {
+                extern volatile int g_apu_waiters;
+                LARGE_INTEGER t0, t1;
+                QueryPerformanceCounter(&t0);
+                __sync_fetch_and_add(&g_apu_waiters, 1);   /* (v110: the sound thread lets go between frames) */
+                qemu_mutex_lock(&d->lock);
+                __sync_fetch_and_sub(&g_apu_waiters, 1);
+                QueryPerformanceCounter(&t1);
+                g_apu_wr_held_n++;
+                g_apu_wr_held_ticks += t1.QuadPart - t0.QuadPart;
+            }
+        }
         fe_method(d, (uint32_t)addr, (uint32_t)val);
         qemu_mutex_unlock(&d->lock);
     }
@@ -854,14 +875,17 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     uint32_t segment_length = 0;
     size_t block_size;
 
-    int adpcm_block_index = -1;
+    int adpcm_block_index = -1, pcm_entry = -1;
+    uint32_t pcm_prd = 0;
     uint32_t adpcm_block[36 * 2 / 4];
     int16_t adpcm_decoded[65 * 2];
 
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_NEW_VOICE, 0);
 
-    if (getenv("RECOMP_APU_TRACE")) {
+    static int s_trace = -1;   /* (v192: once -- this ran getenv at every call) */
+    if (s_trace < 0) s_trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (s_trace) {
         static uint32_t last_ms[MCPX_HW_MAX_VOICES];
         uint32_t now = (uint32_t)GetTickCount();
         if (now - last_ms[v] > 1500) {
@@ -980,8 +1004,12 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 addr = segment_offset + cbo * block_size;
             } else {
                 uint32_t linear_addr = ba + cbo * (uint32_t)block_size;
-                addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
-                                    linear_addr);
+                unsigned int entry = linear_addr / TARGET_PAGE_SIZE;   /* (v193) get_data_ptr's scatter entry read once a page */
+                if ((int)entry != pcm_entry) {
+                    pcm_entry = (int)entry;
+                    pcm_prd = ldl_le_phys(address_space_memory, d->regs[NV_PAPU_VPSGEADDR] + entry * 4 * 2);
+                }
+                addr = pcm_prd + linear_addr % TARGET_PAGE_SIZE;
             }
 
             for (unsigned int channel = 0; channel < channels; channel++) {
@@ -1101,19 +1129,37 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
         s_rs[v].frac = 0.0;
         s_rs[v].primed = 1;
     }
-    for (i = 0; i < requested_num; i++) {
-        float f = (float)s_rs[v].frac;
-        samples[i][0] = s_rs[v].a[0] + (s_rs[v].b[0] - s_rs[v].a[0]) * f;
-        samples[i][1] = s_rs[v].a[1] + (s_rs[v].b[1] - s_rs[v].a[1]) * f;
-        s_rs[v].frac += step;
-        while (s_rs[v].frac >= 1.0) {
-            s_rs[v].a[0] = s_rs[v].b[0]; s_rs[v].a[1] = s_rs[v].b[1];
-            if (rs_fetch(d, v, s_rs[v].b) <= 0) {
-                s_rs[v].primed = 0;
-                return i + 1;
+    {   /* (v193) the state in locals: the stores to samples[] could have been to
+         * s_rs (both float), so every step reloaded it; and the next source
+         * sample straight from the chunk while it lasts (rs_fetch at its end) */
+        float a0 = s_rs[v].a[0], a1 = s_rs[v].a[1], b0 = s_rs[v].b[0], b1 = s_rs[v].b[1];
+        double frac = s_rs[v].frac;
+        for (i = 0; i < requested_num; i++) {
+            float f = (float)frac;
+            samples[i][0] = a0 + (b0 - a0) * f;
+            samples[i][1] = a1 + (b1 - a1) * f;
+            frac += step;
+            while (frac >= 1.0) {
+                a0 = b0; a1 = b1;
+                if (s_rs[v].pos < s_rs[v].len) {
+                    b0 = s_rs[v].buf[s_rs[v].pos][0];
+                    b1 = s_rs[v].buf[s_rs[v].pos][1];
+                    s_rs[v].pos++;
+                } else {
+                    float nb[2];
+                    if (rs_fetch(d, v, nb) <= 0) {
+                        s_rs[v].a[0] = a0; s_rs[v].a[1] = a1; s_rs[v].b[0] = b0; s_rs[v].b[1] = b1;
+                        s_rs[v].frac = frac;
+                        s_rs[v].primed = 0;
+                        return i + 1;
+                    }
+                    b0 = nb[0]; b1 = nb[1];
+                }
+                frac -= 1.0;
             }
-            s_rs[v].frac -= 1.0;
         }
+        s_rs[v].a[0] = a0; s_rs[v].a[1] = a1; s_rs[v].b[0] = b0; s_rs[v].b[1] = b1;
+        s_rs[v].frac = frac;
     }
     return requested_num;
 }
@@ -1122,6 +1168,16 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
  * Voice processing (main per-voice function)
  * ============================================================ */
 
+volatile uint32_t g_apu_pcache[1024], g_apu_pcache_gen;   /* (v193, apu_shim.h apu_phys_ptr) */
+uint8_t *g_apu_base[2];
+volatile uint32_t g_apuprof_on = 1, g_apuprof_n, g_apuprof_vp, g_apuprof_dsp, g_apuprof_mon, g_apuprof_rs, g_apuprof_lpf, g_apuprof_mix, g_apuprof_voices, g_apuprof_maxv, g_apuprof_tot, g_apuprof_curv = 0xFFFFFFFFu;
+#if defined(__vita__)
+extern unsigned int sceKernelGetProcessTimeLow(void);
+uint32_t apu_prof_us(void) { return sceKernelGetProcessTimeLow(); }
+#else
+#include <time.h>
+uint32_t apu_prof_us(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint32_t)(ts.tv_sec * 1000000u + ts.tv_nsec / 1000u); }
+#endif
 volatile float xbox_apu_stream_gain = 1.0f, xbox_apu_3d_gain = 1.0f;
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
@@ -1156,7 +1212,13 @@ static void voice_process(MCPXAPUState *d,
                                          NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH);
     int8_t ps = (int8_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_ENV0,
                                         NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
-    float rate = 1.0f / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
+    float rate;
+    {   /* (v123) the pitch's powf only when the pitch changed */
+        static struct { float x, rate; uint8_t ok; } rc[MCPX_HW_MAX_VOICES];
+        float x = (p + ps * 32 * ef_value) / 4096.0f;
+        if (!rc[v].ok || rc[v].x != x) { rc[v].x = x; rc[v].rate = 1.0f / powf(2.0f, x); rc[v].ok = 1; }
+        rate = rc[v].rate;
+    }
     dbg->rate = rate;
 
     /* Step amplitude envelope */
@@ -1190,6 +1252,9 @@ static void voice_process(MCPXAPUState *d,
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
         }
     } else {
+        const int timed = g_apuprof_curv != 0xFFFFFFFFu;
+        const uint32_t tr0 = timed ? apu_prof_us() : 0;
+        if (timed) g_apuprof_curv++;
         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
@@ -1199,6 +1264,7 @@ static void voice_process(MCPXAPUState *d,
             if (count < 0) break;
             sample_count += count;
         }
+        if (timed) g_apuprof_rs += apu_prof_us() - tr0;
     }
 
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
@@ -1253,12 +1319,17 @@ static void voice_process(MCPXAPUState *d,
     } else {
         lpf = stereo ? (fmode == 1) : (fmode & 1) != 0;
     }
+    const uint32_t tl0 = (g_apuprof_curv != 0xFFFFFFFFu) ? apu_prof_us() : 0;
     if (lpf) {
         for (int ch = 0; ch < 2; ch++) {
             int16_t fc = (int16_t)voice_get_mask(
                 d, v, NV_PAVS_VOICE_TAR_FCA + (ch % channels) * 4,
                 NV_PAVS_VOICE_TAR_FCA_FC0);
-            float fc_f = clampf(powf(2, fc / 4096.0f), 0.003906f, 1.0f);
+            float fc_f;
+            {   static struct { int16_t fc; float f; uint8_t ok; } fcc[MCPX_HW_MAX_VOICES][2];   /* (v123: as the pitch) */
+                if (!fcc[v][ch].ok || fcc[v][ch].fc != fc) { fcc[v][ch].fc = fc; fcc[v][ch].f = clampf(powf(2, fc / 4096.0f), 0.003906f, 1.0f); fcc[v][ch].ok = 1; }
+                fc_f = fcc[v][ch].f;
+            }
             uint16_t q = (uint16_t)voice_get_mask(
                 d, v, NV_PAVS_VOICE_TAR_FCA + (ch % channels) * 4,
                 NV_PAVS_VOICE_TAR_FCA_FC1);
@@ -1272,6 +1343,7 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    if (g_apuprof_curv != 0xFFFFFFFFu) g_apuprof_lpf += apu_prof_us() - tl0;
     /* HRTF processing for 3D voices */
     if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
         uint16_t hrtf_handle =
@@ -1338,6 +1410,7 @@ static void voice_process(MCPXAPUState *d,
             lf[v] = now; if (g > pk[v]) pk[v] = g; if (ng[v] < 2048) gl[v][ng[v]++] = g;
         }
     }
+    const uint32_t tm0 = (g_apuprof_curv != 0xFFFFFFFFu) ? apu_prof_us() : 0;
     static float s_lastg[MCPX_HW_MAX_VOICES][8];
     static uint8_t s_lastbin[MCPX_HW_MAX_VOICES][8];
     static uint32_t s_lastframe[MCPX_HW_MAX_VOICES];
@@ -1371,6 +1444,7 @@ static void voice_process(MCPXAPUState *d,
         g *= attenuate(vol[b]) / hr;
         float g0 = (cont && s_lastbin[v][b] == (uint8_t)bin[b]) ? s_lastg[v][b] : g;
         s_lastg[v][b] = g; s_lastbin[v][b] = (uint8_t)bin[b];
+        if (g0 == 0.0f && g == 0.0f) continue;   /* (v123: a silent bin adds nothing) */
         if (g0 == g) {
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                 mixbins[bin[b]][i] += g * samples[i][b % channels];
@@ -1383,6 +1457,7 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    if (g_apuprof_curv != 0xFFFFFFFFu) g_apuprof_mix += apu_prof_us() - tm0;
     /* VP monitor mix */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
         float g = 0.0f;

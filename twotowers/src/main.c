@@ -578,6 +578,16 @@ static void wd_dump(void)
 {
     extern void tt_dump_dev(void);
     fprintf(stderr, "[HANG] no new frame for a while\n");
+#if defined(__vita__)
+    {   /* (v66) where the render thread is: its last GL call (nv2a_gl_vita.inc) */
+        extern volatile const char *g_vgl_last_fn;
+        extern volatile int g_vgl_last_line;
+        extern volatile unsigned g_vgl_seq;
+        extern volatile const char *g_vgl_where;
+        fprintf(stderr, "[HANG] render thread: last GL call %s at nv2a_gl.inc line %d (call %u); in %s\n",
+                (const char *)g_vgl_last_fn, g_vgl_last_line, g_vgl_seq, (const char *)g_vgl_where);
+    }
+#endif
     tt_dump_dev();
     fflush(stderr);
 }
@@ -1293,12 +1303,13 @@ static void *tt_main_thread(void *p)
 /* PS Vita: the guest needs ~161 MB in one heap (64 MB RAM + 64 MB contiguous
  * window + device apertures, RECOMP_COMPACT_GUEST) on top of the runtime's
  * own buffers; the SDL renderer's textures live in GPU memory outside it. */
-int _newlib_heap_size_user = 240 * 1024 * 1024;
+int _newlib_heap_size_user = 176 * 1024 * 1024;   /* (v123: 240 less the 64 MB contiguous window, now a memory block of its own -- xbox_memory_layout.c) */
 unsigned int sceUserMainThreadStackSize = 1 * 1024 * 1024;
 #include <psp2/io/stat.h>
 #include <psp2/power.h>
 #endif
 
+char s_envlog[600]; int s_envlog_n;   /* (v200) env.txt as read, for the renderer's log line */
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -1312,6 +1323,43 @@ int main(int argc, char **argv)
         sceIoMkdir(d, 0777);
         snprintf(sub, sizeof sub, "%s/saves", d);
         sceIoMkdir(sub, 0777);
+        {   /* (v109) test switches without a new build: env.txt in the data
+             * folder, one NAME=VALUE a line (# starts a comment), e.g.
+             * TT_NATIVE_HOT=0 for the lifted game functions */
+            FILE *ef;
+            snprintf(sub, sizeof sub, "%s/env.txt", d);
+            ef = fopen(sub, "r");
+            if (ef) {
+                char ln[256];
+                while (fgets(ln, sizeof ln, ef)) {
+                    char *eq, *e = ln + strlen(ln);
+                    while (e > ln && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+                    if (!ln[0] || ln[0] == '#' || !(eq = strchr(ln, '='))) continue;
+                    *eq = 0;
+                    {   /* (v200) spaces around the name and the value let go ("TT_WIDE = 1") */
+                        char *nm = ln, *vl = eq + 1, *q = eq;
+                        while (*nm == ' ' || *nm == '\t' || (unsigned char)*nm >= 0x80) nm++;   /* (and a UTF-8 mark at the file's start) */
+                        while (q > nm && (q[-1] == ' ' || q[-1] == '\t')) *--q = 0;
+                        while (*vl == ' ' || *vl == '\t') vl++;
+                        setenv(nm, vl, 1);
+                        fprintf(stderr, "  [ENV] %s=%s (env.txt)\n", nm, vl);
+                        if (s_envlog_n < (int)sizeof s_envlog - 80) s_envlog_n += snprintf(s_envlog + s_envlog_n, sizeof s_envlog - s_envlog_n, " %s=%s;", nm, vl);
+                    }
+                }
+                fclose(ef);
+            }
+        }
+#ifdef TT_PGO_GEN
+        /* (v194) the generated code's counts, under ux0:data/twotowers/pgo (twotowers_manual.c dumps them) */
+        sceIoMkdir("ux0:data/twotowers/pgo", 0777);
+#endif
+        {   /* (v201) 16:9 on the Vita unless TT_WIDE=0: the same switches the PC's ini sets ([Display] aspect), before anyone reads them */
+            const char *w = getenv("TT_WIDE");
+            if (w && w[0] == '1') {   /* (v203: on again unless TT_WIDE=0, the cameras' widening fixed; v202 had it off. v219: 4:3 again unless TT_WIDE=1 -- the wider view draws more, Balin's tomb 43 -> 55 ms render) */
+                if (!getenv("RECOMP_ASPECT")) setenv("RECOMP_ASPECT", "1.7778", 1);
+                if (!getenv("TT_ASPECT")) setenv("TT_ASPECT", "1.7778", 1);
+            }
+        }
         scePowerSetArmClockFrequency(444);
         scePowerSetBusClockFrequency(222);
         scePowerSetGpuClockFrequency(222);
@@ -1321,6 +1369,9 @@ int main(int argc, char **argv)
         if (!getenv("RECOMP_FULLSCREEN")) setenv("RECOMP_FULLSCREEN", "1", 1);
         if (!getenv("RECOMP_WINDOW_SIZE")) setenv("RECOMP_WINDOW_SIZE", "960x544", 1);
         if (!getenv("RECOMP_FB_WINDOW")) setenv("RECOMP_FB_WINDOW", "1", 1);
+        /* (v97 TEST) the game's clock at a quarter of real time: does its work per frame fall with it? */
+        /* (v97 was the test at 0.25: the game's own work per frame halved, and it then waited for the renderer) */
+        /* (v99 capped the game's clock at 67 ms a frame: 112 ms of game work instead of 120, slower than real time -- not kept) */
     }
     { extern void prof_start(void); prof_start(); }
 #endif

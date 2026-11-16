@@ -59,6 +59,17 @@ void mcpx_debug_end_frame(void) {}
  * ============================================================ */
 
 volatile int g_apu_irq_line;
+/* (v107, [PERFG]) the title's writes to the voice processor, those that found
+ * the sound thread holding the lock and the time they waited; the sound
+ * thread's share of a core */
+volatile unsigned g_apu_wr_n, g_apu_wr_held_n;
+volatile long long g_apu_wr_held_ticks;
+/* (v110) a write of the title's waiting for the lock: the sound thread, which
+ * holds it from one 32-sample frame to the next (and runs frames back to back
+ * when behind), lets go after the frame it is on. The v109 log: 3-6 writes a
+ * frame waited, 10-20 ms of the game thread's frame in all. RECOMP_APU_HANDOFF=0: as before. */
+volatile int g_apu_waiters;
+volatile int g_apu_busy_permille;
 
 static void update_irq(MCPXAPUState *d)
 {
@@ -440,6 +451,7 @@ static void throttle(MCPXAPUState *d)
             return;
         }
     }
+    int64_t wait_from_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);   /* (v107: the whole wait, not its last part) */
     while (!d->pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
@@ -451,7 +463,7 @@ static void throttle(MCPXAPUState *d)
     }
     d->next_frame_time_us += EP_FRAME_US;
 
-    d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
+    d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - wait_from_us);
 }
 
 /* ============================================================
@@ -469,10 +481,23 @@ static void se_frame(MCPXAPUState *d)
     int64_t elapsed_ms = now_ms - d->frame_count_time_ms;
     if (elapsed_ms >= 1000) {
         g_dbg.utilization = 1.0f - d->sleep_acc_us / (elapsed_ms * 1000.0f);
+        { extern volatile int g_apu_busy_permille; g_apu_busy_permille = (int)(g_dbg.utilization * 1000.0f); }
         g_dbg.frames_processed = (int)(d->frame_count * 1000.0 / elapsed_ms + 0.5);
         d->frame_count_time_ms = now_ms;
         d->frame_count = 0;
         d->sleep_acc_us = 0;
+        {   /* (v192) [APUPROF] every 10 s */
+            extern volatile uint32_t g_apuprof_on, g_apuprof_n, g_apuprof_vp, g_apuprof_dsp, g_apuprof_mon, g_apuprof_rs, g_apuprof_lpf, g_apuprof_mix, g_apuprof_voices, g_apuprof_maxv, g_apuprof_tot;
+            static int sec;
+            if (g_apuprof_on && ++sec >= 10) {
+                double n = g_apuprof_n ? (double)g_apuprof_n : 1.0;
+                sec = 0;
+                fprintf(stderr, "  [APUPROF] per sound frame (32 samples, 667 us of sound; %u timed): %.0f us in all -- voices %.0f us (%.1f voices, at most %u: fetch+resample %.0f, filter %.0f, mix %.0f), effects %.0f us, output %.0f us\n",
+                        g_apuprof_n, g_apuprof_tot / n, g_apuprof_vp / n, g_apuprof_voices / n, g_apuprof_maxv,
+                        g_apuprof_rs / n, g_apuprof_lpf / n, g_apuprof_mix / n, g_apuprof_dsp / n, g_apuprof_mon / n);
+                g_apuprof_n = g_apuprof_tot = g_apuprof_vp = g_apuprof_dsp = g_apuprof_mon = g_apuprof_rs = g_apuprof_lpf = g_apuprof_mix = g_apuprof_voices = g_apuprof_maxv = 0;
+            }
+        }
     }
     d->frame_count++;
 
@@ -480,9 +505,28 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
-    mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
-    mcpx_apu_monitor_frame(d);
+    {   /* (v192) [APUPROF] every 10 s: where the sound chip's frame goes -- one frame in 4 timed */
+        extern uint32_t apu_prof_us(void);
+        extern volatile uint32_t g_apuprof_on, g_apuprof_n, g_apuprof_vp, g_apuprof_dsp, g_apuprof_mon, g_apuprof_rs, g_apuprof_lpf, g_apuprof_mix, g_apuprof_voices, g_apuprof_maxv, g_apuprof_tot, g_apuprof_curv;
+        if (g_apuprof_on && (d->ep_frame_div & 3u) == 0) {
+            uint32_t t0 = apu_prof_us(), t1, t2, t3;
+            g_apuprof_curv = 0;
+            mcpx_apu_vp_frame(d, mixbins);
+            t1 = apu_prof_us();
+            mcpx_apu_dsp_frame(d, mixbins);
+            t2 = apu_prof_us();
+            mcpx_apu_monitor_frame(d);
+            t3 = apu_prof_us();
+            g_apuprof_vp += t1 - t0; g_apuprof_dsp += t2 - t1; g_apuprof_mon += t3 - t2; g_apuprof_tot += t3 - t0;
+            g_apuprof_voices += g_apuprof_curv; if (g_apuprof_curv > g_apuprof_maxv) g_apuprof_maxv = g_apuprof_curv;
+            g_apuprof_n++;
+            g_apuprof_curv = 0xFFFFFFFFu;   /* (not timing: voice_process skips its own) */
+        } else {
+            mcpx_apu_vp_frame(d, mixbins);
+            mcpx_apu_dsp_frame(d, mixbins);
+            mcpx_apu_monitor_frame(d);
+        }
+    }
     if (d->set_irq) {
         d->set_irq = false;
         update_irq(d);
@@ -497,9 +541,42 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+volatile int g_core3_ok = -1;   /* (v210) -1 not known yet, 0 no, 1 the sound chip runs on core 3 */
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(__vita__)
+    { extern volatile int g_thid_sound; extern int sceKernelGetThreadId(void); g_thid_sound = sceKernelGetThreadId(); }   /* (v108, [CPU]) */
+    {   /* (v181) the sound chip's thread (~half a core in a crowd) off the render thread's core 1: made with
+         * pthread's defaults, nothing said where it ran, and the render thread (core 1 alone) ran ~75 of a
+         * Moria frame's ~100 ms -- not waiting for commands, not in the GPU: put aside. Core 2 (the game's
+         * thread is on 0 and 2, the render thread on 1). TT_SND_CORE=mask in hex (0: left alone). */
+        extern int sceKernelChangeThreadCpuAffinityMask(int thid, int mask);
+        extern int sceKernelGetThreadId(void);
+        /* (v182) core 2 alone starved it (v181: 18-100 sound periods a second of ~190, crackle): the game's
+         * thread is on 0 and 2 at the same priority. Now cores 1 and 2 and a priority above the game's
+         * (the render thread's is above it in turn, nv2a_pb_scan.c): it takes core 2 when the render
+         * thread has core 1 and moves the game's thread to core 0 when they meet. TT_SND_PRIO (0: left). */
+        extern int sceKernelChangeThreadPriority(int thid, int prio);
+        const char *e = getenv("TT_SND_CORE"), *ep = getenv("TT_SND_PRIO");
+        int m = e ? (int)strtoul(e, NULL, 16) : 0x60000, pr = ep ? atoi(ep) : 140;
+        extern volatile int g_core3_ok;
+        const char *e3 = getenv("TT_SND_CORE3");
+        if (!e && e3 && e3[0] == '1') {   /* (v211: only with TT_SND_CORE3=1 -- v210 had it by default: threads made with the
+                     * default affinity (the game's loader and film threads, vitaGL's garbage collector) could be
+                     * placed on core 3 too and wait there behind the sound chip: loads slowed, scenes froze, an 11.7 s
+                     * stall at a new render target.) (v210) the fourth core (the system's, given to games by the CapUnlocker plugin): the sound
+                     * chip there alone, cores 1 and 2 left to the render thread and the rest. Refused: as before. */
+            int r = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), 0x80000);
+            g_core3_ok = r >= 0;
+            fprintf(stderr, "  [APU] the fourth core: %s (%08X)\n", r >= 0 ? "the sound chip's thread there" : "not ours (no CapUnlocker?), cores 1 and 2 as before", (unsigned)r);
+            if (r >= 0) m = 0;
+        } else g_core3_ok = 0;
+        if (g_core3_ok < 0) g_core3_ok = 0;
+        if (m) fprintf(stderr, "  [APU] the sound chip's thread on cpu mask %X (%d)\n", (unsigned)m, sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), m));
+        if (pr) fprintf(stderr, "  [APU] the sound chip's thread at priority %d (%d)\n", pr, sceKernelChangeThreadPriority(sceKernelGetThreadId(), pr));
+    }
+#endif
 #ifdef _WIN32
     /* The sound chip must run every 5 ms. The process is pinned to one core
      * (the Xbox has one CPU), and at normal priority Windows would let a busy
@@ -552,6 +629,16 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
+        }
+        {
+            static int handoff = -1;
+            if (handoff < 0) { const char *e = getenv("RECOMP_APU_HANDOFF"); handoff = !(e && e[0] == '0'); }
+            if (handoff && g_apu_waiters) {
+                int i;
+                qemu_mutex_unlock(&d->lock);
+                for (i = 0; i < 200 && g_apu_waiters; i++) Sleep(0);
+                qemu_mutex_lock(&d->lock);
+            }
         }
     }
 

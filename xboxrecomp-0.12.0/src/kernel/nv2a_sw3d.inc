@@ -64,6 +64,10 @@ static uint32_t s_last_chg = CHG_STATE;   /* (s_chg as the current draw found it
 static uint32_t s_mlast[0x800], s_mseen[0x800 / 32];
 static uint32_t s_chg_n[3];   /* draws: nothing changed, only constants, more */
 static int s_vpc_dirty = 1;   /* (1.9.5) a vertex-program constant changed since they were last sent */
+/* (v109) and which rows: the GL renderer sends only those (it compared and
+ * copied all 192 rows, 3 KB, on every draw: 11-12% of the render thread) */
+static int s_vpc_lo = 0, s_vpc_hi = 191;
+#define VPC_MARK(row) do { int _r = (int)(row); s_vpc_dirty = 1; if (_r < s_vpc_lo) s_vpc_lo = _r; if (_r > s_vpc_hi) s_vpc_hi = _r; } while (0)
 static uint32_t s_vp_gen = 1; /* (1.9.5) bumped when the program, its start or the mode changes */
 /* (1.9.5) which kinds of state changed since the textures and combiners were
  * last bound (gpu_bind_stages may then keep what it bound) */
@@ -270,6 +274,7 @@ static int sw3d_method(uint32_t method, uint32_t param)
     if (method >= NV097_SET_TRANSFORM_CONSTANT && method < NV097_SET_TRANSFORM_CONSTANT + 0x80) {
         if (s_3d.c_load < VP_CONSTS) {
             s_3d.c[s_3d.c_load][s_3d.c_comp] = f;
+            VPC_MARK(s_3d.c_load);
             if (++s_3d.c_comp == 4) { s_3d.c_comp = 0; s_3d.c_load++; }
         }
         return 1;
@@ -463,6 +468,7 @@ static int vp_run(float (*in)[4], float (*out)[4])
                 if (oaddr < VP_OUTS) vp_mask_write(out[oaddr], v, o_mask);
             } else if (oaddr < VP_CONSTS) {
                 vp_mask_write(s_3d.c[oaddr], v, o_mask);
+                VPC_MARK(oaddr);
             }
         }
         if (VF(t, 3, 0, 1))
@@ -507,6 +513,9 @@ static void vp_dec_src(VpSrc *d, const uint32_t *t, uint32_t mux, uint32_t r, in
 static void vp_decode(void)
 {
     uint32_t pc, n = 0;
+    static uint32_t seen_gen;   /* (v96) nothing of the program written since: not compared again, every batch */
+    if (seen_gen == s_vp_gen && s_vpd_start == s_3d.start && s_vpd_len) return;
+    seen_gen = s_vp_gen;
     if (s_vpd_start == s_3d.start && s_vpd_len &&
         s_3d.start + s_vpd_len <= VP_SLOTS &&
         !memcmp(s_vpd_src, s_3d.prog[s_3d.start], s_vpd_len * 16))
@@ -635,6 +644,7 @@ static int vp_run_fast(float (*in)[4], float (*out)[4])
                 if (I->oaddr < VP_OUTS) vp_mask_write(out[I->oaddr], v, I->o_mask);
             } else if (I->oaddr < VP_CONSTS) {
                 vp_mask_write(s_3d.c[I->oaddr], v, I->o_mask);
+                VPC_MARK(I->oaddr);
             }
         }
         if (I->final)
@@ -768,6 +778,7 @@ typedef struct {
     int uidx;                /* its Ultra textures picture, or -1 (nv2a_ultra.inc) */
     int redec;               /* decoded again with new content (a movie's frames, streamed pictures) */
     uint32_t dec_ms;         /* (1.9.8) when it was last decoded (GetTickCount) */
+    int dropped;             /* (PS Vita, v70) decoded and given to the GPU: the copy let go */
 } TexCacheEnt;
 extern volatile uint32_t g_pb_runs;
 static TexCacheEnt s_texc[TEXC_SLOTS];
@@ -787,6 +798,7 @@ static unsigned g_slow_dec_n, g_slow_up_n, g_slow_sync_n, g_slow_sh_n, g_slow_rb
 static uint32_t g_slow_big_w, g_slow_big_h, g_slow_big_fmt, g_slow_big_off, g_slow_big_why, g_slow_big_px;
 /* the epoch a texture's content check is good for: a kick for linear ones,
  * a texture-check tick for swizzled ones (see above) */
+static uint32_t s_texc_vframe;   /* (v114: frames shown, the GL renderer) */
 static uint8_t s_tex_dyn[16384];   /* (1.9.5) 4 KB pages holding a swizzled texture the CPU changed */
 static uint32_t texc_epoch(const Texture *t)
 {
@@ -800,6 +812,17 @@ static uint32_t texc_epoch(const Texture *t)
 #if defined(__vita__)
     /* (PS Vita) a linear texture checked once a frame, not once a pushbuffer
      * run: the checksums were ~110 ms of the render thread's frame */
+    /* (v114) THE MOVIES. s_texc_frame only ever moved in the D3D11 renderer:
+     * here it stayed 0, every texture got the same epoch for good, and one
+     * the CPU rewrites -- a Bink movie's YUY2 frame -- was read once and never
+     * again (the third level's movie showed the loading screen's ring that
+     * was in that memory before). A linear texture: once a frame shown
+     * (s_texc_vframe, nv2a_gl.inc's present). The swizzled ones as before. */
+    if (!tex_size_from_format(t->color) && !per_kick) {
+        static int old = -1;
+        if (old < 0) old = getenv("RECOMP_TEX_LINEAR_ONCE") != NULL;
+        if (!old) return s_texc_vframe | 0x10000000u;
+    }
     if (!(tex_size_from_format(t->color) && s_texc_frame && !per_kick)) return per_kick ? g_pb_runs : (s_texc_frame | 0x20000000u);
 #else
     if (!(tex_size_from_format(t->color) && s_texc_frame && !per_kick)) return g_pb_runs;
@@ -1088,6 +1111,21 @@ static int texc_decode_fast(const Texture *t, uint32_t *out)
     }
 }
 
+/* (PS Vita, v70) the decoded copies of every texture (up to 2048 of them)
+ * were kept in RAM after the GPU had its own: tens of MB, the heap ran dry in
+ * the battle, a new texture's copy could not be made and drew black (the
+ * world, the HUD panels: the v69 capture). gtex_get lets each go once it is
+ * on the GPU (texc_drop_last); a texture whose pixels are wanted again is
+ * decoded again. s_texc_drop_ok: the caller takes the "dropped" answer. */
+static const uint32_t s_texc_dropped_px[1];
+static int s_texc_drop_ok;
+static TexCacheEnt *s_texc_last_ent;
+static void texc_drop_last(void)
+{
+    TexCacheEnt *e = s_texc_last_ent;
+    if (e && e->argb) { free(e->argb); e->argb = NULL; e->dropped = 1; }
+}
+static unsigned g_tq_n[8];   /* (v113: the texture lookups, [VGLPERF]) */
 static const uint32_t *texc_get_ver(const Texture *t, uint32_t *ver)
 {
     const uint32_t *r = texc_get(t);
@@ -1100,6 +1138,7 @@ static const uint32_t *texc_get(const Texture *t)
     int i;
     uint32_t sum, gen, x, y, ep;
     s_texc_last_uidx = -1;
+    s_texc_last_ent = NULL;
     if (!t->valid || t->width > 2048 || t->height > 2048) return NULL;
     (void)ultra_on();   /* (turned on or off: everything decoded again) */
     {
@@ -1116,15 +1155,17 @@ static const uint32_t *texc_get(const Texture *t)
         int q = (int)idx[k] - 1;
         if (q >= 0) {
             TexCacheEnt *c = &s_texc[q];
-            if (c->argb && c->off == t->offset && c->color == t->color && c->w == t->width
+            if ((c->argb || c->dropped) && c->off == t->offset && c->color == t->color && c->w == t->width
                 && c->h == t->height && c->pitch == t->pitch) e = c;
         }
         if (!e) {
+            g_tq_n[3]++;
             for (i = 0; i < TEXC_SLOTS; i++) {
                 TexCacheEnt *c = &s_texc[i];
-                if (c->argb && c->off == t->offset && c->color == t->color && c->w == t->width
+                if ((c->argb || c->dropped) && c->off == t->offset && c->color == t->color && c->w == t->width
                     && c->h == t->height && c->pitch == t->pitch) { e = c; break; }
-                if (!victim || (!c->argb && victim->argb) || (c->argb && victim->argb && c->last_use < victim->last_use))
+                if (!victim || (!(c->argb || c->dropped) && (victim->argb || victim->dropped))
+                    || ((c->argb || c->dropped) && (victim->argb || victim->dropped) && c->last_use < victim->last_use))
                     victim = c;
             }
             if (!e && victim) idx[k] = (uint16_t)(victim - s_texc + 1);
@@ -1135,13 +1176,22 @@ static const uint32_t *texc_get(const Texture *t)
      * run, a texture already checked is current (a texture is bound many
      * times a frame, and the checksum was most of the renderer's CPU time). */
     ep = texc_epoch(t);
-    if (e && e->run == ep && e->gen == gen && e->trev == xbox_tex_rev) { e->last_use = s_texc_clock; s_texc_last_ver = e->ver; s_texc_last_hash = e->hash; s_texc_last_uidx = e->uidx; return e->argb; }
+    if (e && e->dropped && !s_texc_drop_ok) { e->run = ep - 1; e->sum ^= 0x5A5A5A5Au; }   /* (its pixels wanted again: decoded again) */
+    if (e && e->run == ep && e->gen == gen && e->trev == xbox_tex_rev) { s_texc_last_ent = e; e->last_use = s_texc_clock; s_texc_last_ver = e->ver; s_texc_last_hash = e->hash; s_texc_last_uidx = e->uidx; return e->argb ? e->argb : s_texc_dropped_px; }
 #if defined(__vita__)
-    { TX_T0(ts); sum = texc_sum(t); TX_ADD(2, ts); g_tx_sums++; }
+    {   /* (v137) a film picture the video decoder wrote (hwmovie.c): its version
+         * stands for the checksum -- decoded once per new picture, never summed */
+        extern volatile uint32_t g_hwm_tex_addr[2], g_hwm_tex_ver[2];
+        uint32_t o = t->offset & 0x03FFFFFFu;
+        int k = (g_hwm_tex_addr[0] && o == g_hwm_tex_addr[0]) ? 0 : (g_hwm_tex_addr[1] && o == g_hwm_tex_addr[1]) ? 1 : -1;
+        if (k >= 0) sum = 0xC0DE0000u ^ g_hwm_tex_ver[k] ^ ((uint32_t)k << 15);
+        else { extern volatile const char *g_vgl_where; g_vgl_where = "tex: checksum"; TX_T0(ts); sum = texc_sum(t); TX_ADD(2, ts); g_tx_sums++; }
+    }
+    { extern volatile const char *g_vgl_where; g_vgl_where = "tex: decode"; }
 #else
     sum = texc_sum(t);
 #endif
-    if (e && e->sum == sum && e->gen == gen && e->trev == xbox_tex_rev) { e->run = ep; e->last_use = s_texc_clock; s_texc_last_ver = e->ver; s_texc_last_hash = e->hash; s_texc_last_uidx = e->uidx; return e->argb; }
+    if (e && e->sum == sum && e->gen == gen && e->trev == xbox_tex_rev) { s_texc_last_ent = e; e->run = ep; e->last_use = s_texc_clock; s_texc_last_ver = e->ver; s_texc_last_hash = e->hash; s_texc_last_uidx = e->uidx; return e->argb ? e->argb : s_texc_dropped_px; }
     {   /* (for [SLOWFRAME]: why this decode, and the biggest of the frame) */
         uint32_t why = !e ? 0 : e->gen != gen ? 2 : e->trev != xbox_tex_rev ? 3 : 1;   /* new / changed / GPU wrote / settings */
         uint32_t px = t->width * t->height;
@@ -1162,10 +1212,16 @@ static const uint32_t *texc_get(const Texture *t)
         e = victim;
         e->redec = 0;
         free(e->argb);
+        e->argb = NULL; e->dropped = 0;
         e->argb = (uint32_t *)malloc((size_t)t->width * t->height * 4);
-        if (!e->argb) return NULL;
+        if (!e->argb) { e->off = 0; return NULL; }
         e->off = t->offset; e->color = t->color; e->w = t->width; e->h = t->height; e->pitch = t->pitch;
+    } else if (!e->argb) {   /* (a dropped one decoded again) */
+        e->argb = (uint32_t *)malloc((size_t)t->width * t->height * 4);
+        if (!e->argb) { e->dropped = 0; e->off = 0; return NULL; }
     }
+    e->dropped = 0;
+    s_texc_last_ent = e;
     e->sum = sum;
     e->gen = gen;
     e->trev = xbox_tex_rev;
@@ -1179,6 +1235,16 @@ static const uint32_t *texc_get(const Texture *t)
     {
         static int slow = -1, verify = -1;
         if (slow < 0) { slow = getenv("RECOMP_TEX_SLOWDEC") != NULL; verify = getenv("RECOMP_TEX_VERIFY") != NULL; }
+        {   /* (v138) a film picture: hwmovie.c has it as ARGB already (the
+             * texel-at-a-time YUY2 path was ~57 ms a picture here) */
+            extern volatile uint32_t g_hwm_tex_addr[2]; extern uint32_t *volatile g_hwm_argb[2]; extern volatile uint32_t g_hwm_argb_w, g_hwm_argb_h;
+            uint32_t o = t->offset & 0x03FFFFFFu;
+            int k = (g_hwm_tex_addr[0] && o == g_hwm_tex_addr[0]) ? 0 : (g_hwm_tex_addr[1] && o == g_hwm_tex_addr[1]) ? 1 : -1;
+            if (k >= 0 && g_hwm_argb[k] && g_hwm_argb_w == t->width && g_hwm_argb_h == t->height) {
+                memcpy(e->argb, g_hwm_argb[k], (size_t)t->width * t->height * 4);
+                goto decoded;
+            }
+        }
         if (!slow && texc_decode_fast(t, e->argb)) {
             if (verify) {
                 static unsigned bad, checked;
@@ -1242,7 +1308,12 @@ static void sw3d_setup_stages(void)
             S->t.width  = r[7] >> 16;
             S->t.height = r[7] & 0xFFFF;
         }
-        S->t.pitch  = r[4] >> 16;
+        /* (v124) a pitch only for a linear texture: a swizzled or compressed
+         * one has no rows, and the title leaves 0 or 1024 there from draw to
+         * draw -- the same texture under two keys, the caches' slots taken
+         * from each other ~450 times a frame (each a scan of all the slots:
+         * 30% of the render thread in the fourth level's crowd). */
+        S->t.pitch  = S->normalized ? 0 : r[4] >> 16;
         S->t.addr_u = r[2] & 0xF;
         S->t.addr_v = (r[2] >> 8) & 0xF;
         S->t.valid  = S->t.offset && S->t.width && S->t.height && (S->normalized || S->t.pitch);
@@ -2249,9 +2320,13 @@ static void sw3d_blend_stats(void)
 }
 
 static int s_su_always = -1;
+static unsigned g_comb_made, g_comb_kept;   /* (v184) */
+extern volatile const char *g_vgl_where;
+#define SWW(x) (g_vgl_where = (x))   /* (v112: the render thread's zones before the GL batch) */
 static void sw3d_batch(void)
 {
     uint32_t i, n = s_gpu.idx_count;
+    SWW("sw3d: batch start");
     PT_T0(pt_setup0);
     {
         extern volatile uint32_t g_pb_runs;
@@ -2270,17 +2345,34 @@ static void sw3d_batch(void)
     if (!s_vgen) s_vgen = 1;
     if (s_vp_slow < 0) s_vp_slow = getenv("RECOMP_VP_SLOW") != NULL;
     if (s_su_always < 0) s_su_always = getenv("RECOMP_STAGES_ALWAYS") != NULL;
+    SWW("sw3d: vertex program decode");
     if (s_3d.mode == 2 && !s_vp_slow) vp_decode();
+    SWW("sw3d: stages and combiners");
     /* (1.9.5) the stages and combiners as decoded for the last draw, when no
      * texture, combiner or other register has changed since (the GPU path) */
     if (!gpu_on() || (s_grp_su & (GRP_TEX | GRP_COMB | GRP_OTHER)) || s_su_always) {
+        /* (v184) the combiners' decode (texture use, factors, the stages' program) reads only combiner
+         * registers (GRP_COMB): when only textures changed since the last draw -- most draws -- it is
+         * what it was (4.7% + of the render thread, v183). TT_COMB_ALWAYS=1: every time as before. */
+        static int comb_always = -1, comb_valid;
+        const uint32_t g = s_grp_su;
+        if (comb_always < 0) { const char *e = getenv("TT_COMB_ALWAYS"); comb_always = e && *e == '1'; }
         s_grp_su = 0;
+        SWW("sw3d: stages and combiners -- stages");   /* (v176: finer zones) */
         sw3d_setup_stages();
-        sw3d_tex_usage();
-        if (!gpu_on()) sw3d_bind_texels();
-        sw3d_comb_prepare();
-        sw3d_comb_compile();
+        if (!gpu_on() || !comb_valid || (g & (GRP_COMB | GRP_OTHER)) || s_su_always || comb_always) {
+            SWW("sw3d: stages and combiners -- texture use");
+            sw3d_tex_usage();
+            if (!gpu_on()) sw3d_bind_texels();
+            SWW("sw3d: stages and combiners -- factors");
+            sw3d_comb_prepare();
+            SWW("sw3d: stages and combiners -- combiners");
+            sw3d_comb_compile();
+            comb_valid = 1;
+            g_comb_made++;
+        } else g_comb_kept++;
     }
+    SWW("sw3d: attributes needed");
     {
         int st, k;
         memset(s_attr_need, 0, sizeof s_attr_need);

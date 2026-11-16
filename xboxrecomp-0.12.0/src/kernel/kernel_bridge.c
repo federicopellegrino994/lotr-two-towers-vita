@@ -2668,6 +2668,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         }
         g_fs_base = tib;
     }
+#if defined(__vita__)
+    { extern volatile int g_thid_timer; extern int sceKernelGetThreadId(void); g_thid_timer = sceKernelGetThreadId(); }   /* (v128, [CPU]) */
+#endif
 
     {
         /* How long a 1 ms sleep really takes on this machine: the movies'
@@ -2745,7 +2748,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         /* Interrupts and DPCs run "on the processor": not while a guest
          * thread is at DISPATCH_LEVEL (see xbox_CpuLock). */
         g_timer_phase = 2;
-        xbox_CpuLock();
+        {   /* (v128) how long the clock waits for a thread at raised IRQL ([CPU]) */
+            extern volatile long long g_timer_lock_ticks; extern volatile unsigned g_timer_lock_n;
+            LARGE_INTEGER la, lb;
+            QueryPerformanceCounter(&la);
+            xbox_CpuLock();
+            QueryPerformanceCounter(&lb);
+            g_timer_lock_ticks += lb.QuadPart - la.QuadPart; g_timer_lock_n++;
+        }
         /* DPCs, ISRs and D3D callbacks run at DISPATCH_LEVEL or above on the
          * console; code in them that saves and restores IRQL expects that. */
         old_irql = xbox_KeRaiseIrqlToDpcLevel();
@@ -3626,7 +3636,11 @@ static void bridge_NtReadFile(void)
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
      * identical from inside the title -- the first bytes settle it. */
-    {
+    /* (v68) off unless RECOMP_READ_LOG: a line and a flush to the memory card
+     * for every read, on the game's own thread (the PS Vita: several a frame) */
+    static int rlog = -1;
+    if (rlog < 0) rlog = getenv("RECOMP_READ_LOG") != NULL;
+    if (rlog) {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
         /* The offset matters as much as the length. A title streaming a pack

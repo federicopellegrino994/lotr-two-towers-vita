@@ -11,16 +11,14 @@ nothing. Run last."""
 import re, sys, glob, os
 MARK = '/* postproc_prof */'
 DECL = MARK + '''
-#if defined(RECOMP_PROFILE)
-/* (only the game's frame thread records: g_prof_tp is its TPIDRURO) */
-extern volatile uint32_t g_prof_fn, g_prof_tp;
-typedef struct { uint32_t prev; int on; } recomp_prof_t;
-static inline uint32_t recomp_tp_(void) { uint32_t v; __asm__("mrc p15, 0, %0, c13, c0, 3" : "=r"(v)); return v; }
-static inline void recomp_prof_leave_(recomp_prof_t *p) { if (p->on) g_prof_fn = p->prev; }
-#ifndef RECOMP_CTX_DECL
-#define RECOMP_CTX_DECL (void)0
-#endif
-#define RECOMP_PROF_ENTER(va) RECOMP_CTX_DECL; recomp_prof_t _prof __attribute__((cleanup(recomp_prof_leave_))) = { g_prof_fn, recomp_tp_() == g_prof_tp }; if (_prof.on) g_prof_fn = (va)
+#if defined(RECOMP_PROFILE) && defined(__vita__) && defined(RECOMP_FAST_REGS)
+/* (v154) the chain of frames each thread is in, kept in its own register
+ * struct (r_prof_top): no thread test, no shared globals. prof_vita.c walks
+ * the game thread's chain: own time its first frame, inclusive time every
+ * frame in it. */
+typedef struct recomp_prof_s { uint32_t fn; struct recomp_prof_s *up; void *ctx; } recomp_prof_t;
+static inline void recomp_prof_leave_(volatile recomp_prof_t *p) { *(void *volatile *)&((RecompRegs *)p->ctx)->r_prof_top = p->up; }
+#define RECOMP_PROF_ENTER(va) RECOMP_CTX_DECL; volatile recomp_prof_t _prof __attribute__((cleanup(recomp_prof_leave_))); _prof.fn = (va); _prof.up = (recomp_prof_t *)_rctx->r_prof_top; _prof.ctx = _rctx; *(void *volatile *)&_rctx->r_prof_top = (void *)&_prof
 #else
 #ifndef RECOMP_CTX_DECL
 #define RECOMP_CTX_DECL (void)0

@@ -1,3 +1,7 @@
+#if defined(__vita__)
+#include <pthread.h>
+#include <time.h>
+#endif
 /*
  * kernel_hal.c - Hardware Abstraction Layer
  *
@@ -169,6 +173,8 @@ static CRITICAL_SECTION g_cpu_lock;
 static INIT_ONCE g_cpu_lock_once = INIT_ONCE_STATIC_INIT;
 static XBOX_THREAD_LOCAL int g_cpu_lock_held;
 static int g_cpu_lock_mode = -1;
+/* (v130, [CPU]) takings of the dispatch lock, those that found it held, and the wait */
+volatile unsigned g_cpu_lock_n, g_cpu_lock_busy_n; volatile long long g_cpu_lock_busy_ticks;
 
 static BOOL CALLBACK cpu_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
@@ -188,6 +194,50 @@ void xbox_CpuLock(void)
     if (!g_cpu_lock_mode)
         return;
     InitOnceExecuteOnce(&g_cpu_lock_once, cpu_lock_init, NULL, NULL);
+    g_cpu_lock_n++;
+    if (TryEnterCriticalSection(&g_cpu_lock)) { g_cpu_lock_held++; return; }
+#if defined(__vita__)
+    {   /* (v130) Taken by another thread: a short spin, then a real blocking
+         * wait (woken the moment the holder lets go) where the loop below
+         * slept a millisecond at a time -- the game thread raises IRQL
+         * thousands of times a frame around DirectSound, and the DSound
+         * interrupt work on the clock thread holds the same lock. Bounded at
+         * 2 s as before. RECOMP_CPU_LOCK_POLL=1: the old polling. */
+        static int poll = -1;
+        LARGE_INTEGER a, b;
+        if (poll < 0) poll = getenv("RECOMP_CPU_LOCK_POLL") != NULL;
+        QueryPerformanceCounter(&a);
+        g_cpu_lock_busy_n++;
+        if (!poll) {
+            int k;
+            for (k = 0; k < 200; k++) {
+                __asm__ volatile("yield" ::: "memory");
+                if (TryEnterCriticalSection(&g_cpu_lock)) goto got;
+            }
+            {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += 2;
+                if (pthread_mutex_timedlock((pthread_mutex_t *)g_cpu_lock.LockSemaphore, &ts) == 0) {
+                    g_cpu_lock.RecursionCount++;
+                    goto got;
+                }
+            }
+            goto timeout;
+        }
+        for (i = 0; i < 2000; i++) {
+            if (TryEnterCriticalSection(&g_cpu_lock)) goto got;
+            Sleep(i < 50 ? 0 : 1);
+        }
+        goto timeout;
+    got:
+        QueryPerformanceCounter(&b);
+        g_cpu_lock_busy_ticks += b.QuadPart - a.QuadPart;
+        g_cpu_lock_held++;
+        return;
+    }
+timeout:
+#endif
     for (i = 0; i < 2000; i++) {                 /* ~2 s */
         if (TryEnterCriticalSection(&g_cpu_lock)) {
             g_cpu_lock_held++;
@@ -270,7 +320,15 @@ extern XBOX_THREAD_LOCAL uint32_t g_esp;
 static XBOX_THREAD_LOCAL unsigned s_ih_n;
 static void irql_hist(KIRQL o, KIRQL n)
 {
-    unsigned i = s_ih_n++ % IRQL_HIST;
+    /* (v127) only with RECOMP_IRQL_HIST=1: a clock read and a walk of up to
+     * 96 words of the guest stack at every raise and lower -- the game's
+     * lock around its objects (sub_0012C3AD/0012C3E0) was the game thread's
+     * biggest own time in a crowded frame (7%, v126 profile) */
+    static int on = -1;
+    unsigned i;
+    if (on < 0) on = getenv("RECOMP_IRQL_HIST") != NULL;
+    if (!on) return;
+    i = s_ih_n++ % IRQL_HIST;
     s_ih[i].t = GetTickCount(); s_ih[i].o = o; s_ih[i].n = n; s_ih[i].ra = g_kernel_host_ra;
     {   /* guest return addresses on the guest stack: the calls that led here */
         /* (compact guest: m uses go through XR_PTR) */
@@ -1187,6 +1245,31 @@ uint64_t xbox_ReadTimeStampCounter(void)
 
     {
         uint64_t ticks = (uint64_t)(now.QuadPart - origin.QuadPart);
+        {   /* (v99) RECOMP_TSC_FRAMECAP_MS=n: the guest's clock moves at most n
+             * ms from one frame shown to the next. The Two Towers steps its
+             * world by the time a frame took: at 8 frames a second it did
+             * several steps' work each frame (the v97 test: with a slower
+             * clock its work per frame halved). Capped, a slow frame costs
+             * the game no more than a 1000/n fps one -- and the game runs
+             * slower than real time by as much as the frame went over. */
+            static int cap_ms = -1;
+            static volatile int lk;
+            static uint64_t vt, real_at_flip, vt_at_flip; static unsigned flips_seen;
+            if (cap_ms < 0) { const char *e = getenv("RECOMP_TSC_FRAMECAP_MS"); cap_ms = e ? atoi(e) : 0; if (cap_ms < 0) cap_ms = 0; }
+            if (cap_ms > 0) {
+                extern volatile unsigned g_nv2a_flips;
+                uint64_t cap = (uint64_t)freq.QuadPart * (uint64_t)cap_ms / 1000u, d, v;
+                while (__sync_lock_test_and_set(&lk, 1)) { }
+                if (!real_at_flip) { real_at_flip = ticks; vt_at_flip = ticks; flips_seen = g_nv2a_flips; }
+                d = ticks - real_at_flip; if (d > cap) d = cap;
+                v = vt_at_flip + d;
+                if (g_nv2a_flips != flips_seen) { flips_seen = g_nv2a_flips; real_at_flip = ticks; vt_at_flip = v; }
+                if (v < vt) v = vt;
+                vt = v;
+                __sync_lock_release(&lk);
+                ticks = v;
+            }
+        }
         {   /* testing: RECOMP_TSC_SCALE=f -- the guest's clock at f times real time
              * (below 1: each slow frame here is a short one to the game, as on a
              * fast PC) */

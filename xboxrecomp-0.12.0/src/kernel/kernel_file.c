@@ -976,7 +976,243 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
+#if defined(__vita__)
+/* (v68, PS Vita) read-ahead for the game's small reads at an offset: the
+ * battle streams two files in 18 KB pieces, each a trip to the memory card on
+ * the game's own thread. 128 KB at a time is read and the pieces served from
+ * it. An entry is forgotten when its descriptor is opened again or written. */
+#define RA_N 6   /* (v163: 6 -- two streams, each its piece and the next, and room) */
+#define RA_SIZE (128 * 1024)
+/* (v157) and the next 128 KB of a file being read in order is fetched on a
+ * thread of its own while the game uses this piece (state 1 while it is
+ * read, then 2): a stream's next read finds it ready instead of waiting on the
+ * memory card -- the game thread's 2-3 ms stalls in the battles. pread, so
+ * the descriptor's position (the game's own reads) is not touched; an entry
+ * forgotten meanwhile (gen) drops what the fetch brings. RECOMP_PREFETCH=0:
+ * the v68 read-ahead alone. */
+static struct { int fd; long long base; uint32_t len; uint32_t used; int state; uint32_t gen; } g_ra[RA_N];
+static uint8_t g_ra_buf[RA_N][RA_SIZE];
+static uint32_t g_ra_clock;
+#include <pthread.h>
+static pthread_mutex_t g_ra_mx = PTHREAD_MUTEX_INITIALIZER;
+/* (v169) the descriptor's position after a read served here, kept rather than set at once: lseek on a file whose
+ * next piece the fetch thread is reading waits for that read (the memory card takes one call on a file at a time) --
+ * v168's log, 1.4 ms a read served from memory. Set on the descriptor only when something needs it (a read or write
+ * without an offset, a position asked or set); dropped when the descriptor is let go or made again. */
+#define RA_FDMAX 256
+static long long g_ra_vpos[RA_FDMAX];
+static unsigned char g_ra_vdirty[RA_FDMAX];
+static void ra_setpos(int fd, long long pos)
+{
+    if (fd >= 0 && fd < RA_FDMAX) { g_ra_vpos[fd] = pos; g_ra_vdirty[fd] = 1; }
+    else lseek(fd, (off_t)pos, SEEK_SET);
+}
+void xbox_ra_sync_pos(int fd)
+{
+    if (fd >= 0 && fd < RA_FDMAX && g_ra_vdirty[fd]) {
+        pthread_mutex_lock(&g_ra_mx);
+        if (g_ra_vdirty[fd]) { g_ra_vdirty[fd] = 0; lseek(fd, (off_t)g_ra_vpos[fd], SEEK_SET); }
+        pthread_mutex_unlock(&g_ra_mx);
+    }
+}
+static void ra_drop_pos(int fd) { if (fd >= 0 && fd < RA_FDMAX) g_ra_vdirty[fd] = 0; }
+static pthread_cond_t g_ra_cv = PTHREAD_COND_INITIALIZER;    /* a fetch asked for */
+static pthread_cond_t g_ra_done = PTHREAD_COND_INITIALIZER;  /* a fetch finished */
+static int g_ra_req = -1, g_ra_thr = 0, g_ra_pf = -1;
+static volatile unsigned g_ra_pf_n, g_ra_pf_hit;
+void xbox_ra_forget_fd(int fd)
+{
+    int i;
+    pthread_mutex_lock(&g_ra_mx);
+    ra_drop_pos(fd);
+    for (i = 0; i < RA_N; i++) if (g_ra[i].state && g_ra[i].fd == fd) {
+        /* (v161) a slot being read into stays its reader's (state 1, the generation changed: what it brings is
+         * dropped, and the slot freed, by that reader) -- freed here, another read could be put into the same buffer
+         * while the first was still writing it */
+        g_ra[i].len = 0; g_ra[i].gen++;
+        if (g_ra[i].state == 2) g_ra[i].state = 0;
+        else g_ra[i].fd = -1;   /* (no reader waits for a forgotten one) */
+    }
+    pthread_cond_broadcast(&g_ra_done);
+    pthread_mutex_unlock(&g_ra_mx);
+}
+static void *ra_thread(void *arg)
+{
+    (void)arg;
+#if defined(__vita__)
+    { extern int sceKernelChangeThreadCpuAffinityMask(int, int); extern int sceKernelGetThreadId(void); sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), 0x50000); }   /* (v181: not on the render thread's core) */
+#endif
+    pthread_mutex_lock(&g_ra_mx);
+    for (;;) {
+        int v, fd; long long base; uint32_t gen, have = 0;
+        while (g_ra_req < 0) pthread_cond_wait(&g_ra_cv, &g_ra_mx);
+        v = g_ra_req; g_ra_req = -1;
+        if (g_ra[v].state != 1) continue;
+        fd = g_ra[v].fd; base = g_ra[v].base; gen = g_ra[v].gen;
+        pthread_mutex_unlock(&g_ra_mx);
+        while (have < RA_SIZE) {   /* (the slot is this thread's while state 1) */
+            ssize_t n = pread(fd, g_ra_buf[v] + have, RA_SIZE - have, (off_t)(base + have));
+            if (n < 0) { if (errno == EINTR) continue; break; }
+            if (n == 0) break;
+            have += (uint32_t)n;
+        }
+        pthread_mutex_lock(&g_ra_mx);
+        if (g_ra[v].gen == gen && have) { g_ra[v].len = have; g_ra[v].state = 2; g_ra_pf_n++; }
+        else { g_ra[v].len = 0; g_ra[v].state = 0; }   /* (nothing, or forgotten meanwhile) */
+        pthread_cond_broadcast(&g_ra_done);
+    }
+    return NULL;
+}
+/* (under g_ra_mx) the next piece after slot c, unless it is there or coming */
+static void ra_prefetch_after(int c)
+{
+    int i, v = -1, fd = g_ra[c].fd;
+    long long nb = g_ra[c].base + g_ra[c].len;
+    if (g_ra_pf < 0) { const char *e = getenv("RECOMP_PREFETCH"); g_ra_pf = !(e && e[0] == '0'); }
+    if (!g_ra_pf || g_ra[c].len < RA_SIZE || g_ra_req >= 0) return;
+    for (i = 0; i < RA_N; i++)
+        if (g_ra[i].state && g_ra[i].fd == fd && g_ra[i].base <= nb && nb < g_ra[i].base + (g_ra[i].state == 1 ? RA_SIZE : g_ra[i].len)) return;
+    for (i = 0; i < RA_N; i++) {
+        if (i == c || g_ra[i].state == 1) continue;
+        if (!g_ra[i].state) { v = i; break; }
+        if (v < 0 || g_ra[i].used < g_ra[v].used) v = i;
+    }
+    if (v < 0) return;
+    if (!g_ra_thr) {
+        pthread_t t;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 64 * 1024);
+        if (pthread_create(&t, &at, ra_thread, NULL) != 0) { g_ra_pf = 0; return; }
+        g_ra_thr = 1;
+    }
+    g_ra[v].fd = fd; g_ra[v].base = nb; g_ra[v].len = 0; g_ra[v].state = 1; g_ra[v].gen++; g_ra[v].used = ++g_ra_clock;
+    g_ra_req = v;
+    pthread_cond_signal(&g_ra_cv);
+}
+/* 1 served (*got set), 0 not: read the usual way (under g_ra_mx) */
+static int ra_read(int fd, long long off, void *dst, uint32_t want, uint32_t *got)
+{
+    int i, v = 0;
+    if (want == 0 || want > RA_SIZE / 2) return 0;
+    for (;;) {
+        int busy = 0, k;
+        for (i = 0; i < RA_N; i++)
+            if (g_ra[i].state == 2 && g_ra[i].fd == fd && off >= g_ra[i].base && off < g_ra[i].base + g_ra[i].len) break;
+        if (i < RA_N) {
+            const long long end = g_ra[i].base + g_ra[i].len;
+            if (off + want <= end) {
+                memcpy(dst, g_ra_buf[i] + (off - g_ra[i].base), want);
+                g_ra[i].used = ++g_ra_clock;
+                *got = want;
+                ra_setpos(fd, off + want);
+                g_ra_pf_hit++;
+                ra_prefetch_after(i);   /* (v163: the next piece asked for at once) */
+                return 1;
+            }
+            /* (v164) a read across the end of a piece: the rest from the next piece -- v163's log, every piece's seam was
+             * a miss (reads of ~18 KB at any place, the pieces 128 KB): a 128 KB read on the game's thread each time */
+            if (g_ra[i].len == RA_SIZE) {
+                for (k = 0; k < RA_N; k++)
+                    if (g_ra[k].fd == fd && g_ra[k].base == end && g_ra[k].state) break;
+                if (k < RA_N && g_ra[k].state == 2 && off + want <= end + g_ra[k].len) {
+                    const uint32_t first = (uint32_t)(end - off);
+                    memcpy(dst, g_ra_buf[i] + (off - g_ra[i].base), first);
+                    memcpy((uint8_t *)dst + first, g_ra_buf[k], want - first);
+                    g_ra[i].used = g_ra[k].used = ++g_ra_clock;
+                    *got = want;
+                    ra_setpos(fd, off + want);
+                    g_ra_pf_hit++;
+                    ra_prefetch_after(k);
+                    return 1;
+                }
+                if (k < RA_N && g_ra[k].state == 1) busy = 1;   /* (the next piece on its way: wait for it) */
+                else if (k == RA_N) { ra_prefetch_after(i); for (k = 0; k < RA_N; k++) if (g_ra[k].state == 1 && g_ra[k].fd == fd && g_ra[k].base == end) busy = 1; }
+            }
+        }
+        for (i = 0; i < RA_N && !busy; i++)   /* (a fetch of this place under way: wait for it) */
+            if (g_ra[i].state == 1 && g_ra[i].fd == fd && off >= g_ra[i].base && off < g_ra[i].base + RA_SIZE) busy = 1;
+        if (!busy) break;
+        pthread_cond_wait(&g_ra_done, &g_ra_mx);
+    }
+    for (i = 0; i < RA_N && g_ra[i].state; i++) ;
+    if (i < RA_N) v = i;
+    else {
+        v = -1;
+        for (i = 0; i < RA_N; i++) if (g_ra[i].state != 1 && (v < 0 || g_ra[i].used < g_ra[v].used)) v = i;
+        if (v < 0) return 0;
+    }
+    {
+        ssize_t n;
+        uint32_t have = 0, gen;
+        /* (v161) the memory card read with the lock let go: the slot is this reader's while state 1 (other readers of
+         * the same place wait for it; the rest -- the other streams, other threads -- go on). v157-v160 read with the
+         * lock held: a hit waited behind someone else's miss. */
+        g_ra[v].fd = fd; g_ra[v].base = off; g_ra[v].len = 0; g_ra[v].state = 1; gen = ++g_ra[v].gen; g_ra[v].used = ++g_ra_clock;
+        pthread_mutex_unlock(&g_ra_mx);
+        while (have < RA_SIZE) {
+            n = pread(fd, g_ra_buf[v] + have, RA_SIZE - have, (off_t)(off + have));
+            if (n < 0) { if (errno == EINTR) continue; break; }
+            if (n == 0) break;
+            have += (uint32_t)n;
+        }
+        pthread_mutex_lock(&g_ra_mx);
+        pthread_cond_broadcast(&g_ra_done);
+        if (g_ra[v].gen != gen) {   /* (forgotten meanwhile: the bytes are still this read's, the slot freed) */
+            g_ra[v].state = 0; g_ra[v].len = 0;
+            if (have == 0) return 0;
+            *got = want < have ? want : have;
+            memcpy(dst, g_ra_buf[v], *got);   /* (nobody else writes a slot that is not theirs: copied before it is reused) */
+            ra_setpos(fd, off + *got);
+            return 1;
+        }
+        if (have == 0) { g_ra[v].state = 0; return 0; }
+        g_ra[v].len = have; g_ra[v].state = 2;
+        *got = want < have ? want : have;
+        memcpy(dst, g_ra_buf[v], *got);
+        ra_setpos(fd, off + *got);
+        ra_prefetch_after(v);
+        return 1;
+    }
+}
+#endif
+
+/* (v107, [PERFG]) file reads: how many, how long, how much (all threads) */
+volatile unsigned g_perf_rd_n, g_perf_rd_kb;
+volatile long long g_perf_rd_ticks;
+static NTSTATUS xbox_NtReadFile_do(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset);
 NTSTATUS __stdcall xbox_NtReadFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset)
+{
+    LARGE_INTEGER t0, t1; NTSTATUS r;
+    QueryPerformanceCounter(&t0);
+    r = xbox_NtReadFile_do(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer, Length, ByteOffset);
+    QueryPerformanceCounter(&t1);
+    g_perf_rd_n++; g_perf_rd_kb += (Length + 1023u) >> 10; g_perf_rd_ticks += t1.QuadPart - t0.QuadPart;
+#if defined(__vita__)
+    {   /* (v160, [READS] every 10 s) what the reads are: at an offset or not, how large, how long */
+        static unsigned n[4], kb[4]; static long long tk[4], last, fq;
+        int c = !ByteOffset || ByteOffset->QuadPart < 0 ? 0 : Length > RA_SIZE / 2 ? 1 : 2;
+        LARGE_INTEGER now;
+        n[c]++; kb[c] += (Length + 1023u) >> 10; tk[c] += t1.QuadPart - t0.QuadPart;
+        if (!fq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fq = f.QuadPart; last = t1.QuadPart; }
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - last > fq * 10) {
+            fprintf(stderr, "  [READS] in 10 s: %u without an offset (%u KB, %.1f ms), %u large (%u KB, %.1f ms), %u small at an offset (%u KB, %.1f ms; %u from the read-ahead, %u fetched ahead)\n",
+                    n[0], kb[0], tk[0] * 1000.0 / fq, n[1], kb[1], tk[1] * 1000.0 / fq, n[2], kb[2], tk[2] * 1000.0 / fq, g_ra_pf_hit, g_ra_pf_n);
+            memset(n, 0, sizeof n); memset(kb, 0, sizeof kb); memset(tk, 0, sizeof tk); last = now.QuadPart;
+            g_ra_pf_hit = 0; g_ra_pf_n = 0;
+        }
+    }
+#endif
+    return r;
+}
+static NTSTATUS xbox_NtReadFile_do(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)
@@ -994,6 +1230,31 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_INVALID_HANDLE;
     }
 
+#if defined(__vita__)
+    if (ByteOffset && ByteOffset->QuadPart >= 0) {
+        uint32_t got = 0;
+        static int ra_on = -1;
+        if (ra_on < 0) { const char *e = getenv("RECOMP_READAHEAD"); ra_on = !(e && e[0] == '0'); }
+        int ok = 0;
+        if (ra_on) {
+            pthread_mutex_lock(&g_ra_mx);
+            ok = ra_read(fd, (long long)ByteOffset->QuadPart, Buffer, Length, &got);
+            pthread_mutex_unlock(&g_ra_mx);
+        }
+        if (ok) {
+            IoStatusBlock->Information = (ULONG_PTR)got;
+            if (got == 0 && Length > 0) { IoStatusBlock->Status = STATUS_END_OF_FILE; return STATUS_END_OF_FILE; }
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            if (Event) SetEvent(Event);
+            return STATUS_SUCCESS;
+        }
+    }
+#endif
+
+#if defined(__vita__)
+    if (ByteOffset && ByteOffset->QuadPart >= 0) { pthread_mutex_lock(&g_ra_mx); ra_drop_pos(fd); pthread_mutex_unlock(&g_ra_mx); }
+    else xbox_ra_sync_pos(fd);
+#endif
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
@@ -1035,6 +1296,9 @@ NTSTATUS __stdcall xbox_NtWriteFile(
         return STATUS_INVALID_PARAMETER;
 
     fd = w32_handle_fd(FileHandle);
+#if defined(__vita__)
+    if (fd >= 0) { xbox_ra_sync_pos(fd); xbox_ra_forget_fd(fd); }
+#endif
     if (fd < 0) {
         IoStatusBlock->Status = STATUS_INVALID_HANDLE;
         return STATUS_INVALID_HANDLE;
@@ -1138,6 +1402,9 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
         }
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
+#if defined(__vita__)
+            xbox_ra_sync_pos(fd);
+#endif
             off_t pos = lseek(fd, 0, SEEK_CUR);
             if (pos < 0) return STATUS_UNSUCCESSFUL;
             info->CurrentByteOffset.QuadPart = pos;
@@ -1180,6 +1447,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
+#if defined(__vita__)
+            xbox_ra_sync_pos(fd);
+#endif
             if (lseek(fd, (off_t)info->CurrentByteOffset.QuadPart, SEEK_SET) < 0) {
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "SetFilePosition failed: offset=%lld errno=%d",
                          (long long)info->CurrentByteOffset.QuadPart, errno);
@@ -1190,6 +1460,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         }
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+#if defined(__vita__)
+            xbox_ra_sync_pos(fd);
+#endif
             off_t cur = lseek(fd, 0, SEEK_CUR);
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0) {
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "SetEndOfFile failed: size=%lld errno=%d",

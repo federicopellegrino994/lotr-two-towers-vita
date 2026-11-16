@@ -90,9 +90,9 @@ static inline void d3dn_copy(uint32_t dst, uint32_t src, uint32_t n)
 }
 
 /* ---- the check (TT_D3D_NATIVE=2) ---- */
-typedef struct { uint32_t eax, ebx, ecx, edx, esi, edi, esp; } d3dn_regs;
-static void d3dn_get(d3dn_regs *r) { r->eax = eax; r->ebx = ebx; r->ecx = ecx; r->edx = edx; r->esi = esi; r->edi = edi; r->esp = esp; }
-static void d3dn_set(const d3dn_regs *r) { eax = r->eax; ebx = r->ebx; ecx = r->ecx; edx = r->edx; esi = r->esi; edi = r->edi; esp = r->esp; }
+typedef struct { uint32_t r_eax, r_ebx, r_ecx, r_edx, r_esi, r_edi, r_esp; } d3dn_regs;
+static void d3dn_get(d3dn_regs *r) { r->r_eax = eax; r->r_ebx = ebx; r->r_ecx = ecx; r->r_edx = edx; r->r_esi = esi; r->r_edi = edi; r->r_esp = esp; }
+static void d3dn_set(const d3dn_regs *r) { eax = r->r_eax; ebx = r->r_ebx; ecx = r->r_ecx; edx = r->r_edx; esi = r->r_esi; edi = r->r_edi; esp = r->r_esp; }
 static uint8_t d3dn_s0[D3DN_DATA_HI - D3DN_DATA_LO], d3dn_s1[D3DN_DATA_HI - D3DN_DATA_LO];
 static uint8_t d3dn_p1[0x40000];
 static uint32_t d3dn_checked, d3dn_skipped, d3dn_bad;
@@ -106,7 +106,7 @@ static void d3dn_check(const char *name, void (*nat)(void), void (*gen)(void), i
     uint32_t put0, put1, put2, ms;
     uint8_t stk0[64], stk1[64];   /* the arguments: lifted code reuses their slots */
     d3dn_get(&r0);
-    memcpy(stk0, XBOX_PTR(r0.esp), 64);
+    memcpy(stk0, XBOX_PTR(r0.r_esp), 64);
     memcpy(d3dn_s0, data, sz);
     put0 = MEM32(dev);
     ms = d3dn_makespace_n;
@@ -121,9 +121,9 @@ static void d3dn_check(const char *name, void (*nat)(void), void (*gen)(void), i
     }
     memcpy(d3dn_s1, data, sz);
     memcpy(d3dn_p1, XBOX_PTR(put0), put1 - put0);
-    memcpy(stk1, XBOX_PTR(r0.esp), 64);
+    memcpy(stk1, XBOX_PTR(r0.r_esp), 64);
     memcpy(data, d3dn_s0, sz);
-    memcpy(XBOX_PTR(r0.esp), stk0, 64);
+    memcpy(XBOX_PTR(r0.r_esp), stk0, 64);
     d3dn_set(&r0);
     d3dn_in = 2;
     nat();
@@ -132,8 +132,8 @@ static void d3dn_check(const char *name, void (*nat)(void), void (*gen)(void), i
     put2 = MEM32(dev);
     d3dn_checked++;
     {
-        int bad = put2 != put1 || r2.esp != r1.esp || r2.ebx != r1.ebx || r2.esi != r1.esi || r2.edi != r1.edi
-                  || (cmp_eax && r2.eax != r1.eax) || d3dn_makespace_n != ms;
+        int bad = put2 != put1 || r2.r_esp != r1.r_esp || r2.r_ebx != r1.r_ebx || r2.r_esi != r1.r_esi || r2.r_edi != r1.r_edi
+                  || (cmp_eax && r2.r_eax != r1.r_eax) || d3dn_makespace_n != ms;
         uint32_t at = 0, i;
         if (!bad && memcmp(d3dn_p1, XBOX_PTR(put0), put1 - put0)) {
             for (i = 0; i < put1 - put0; i++) if (d3dn_p1[i] != ((uint8_t *)XBOX_PTR(put0))[i]) break;
@@ -147,7 +147,7 @@ static void d3dn_check(const char *name, void (*nat)(void), void (*gen)(void), i
             if (++d3dn_bad <= 40)
                 tt_dbg("[D3D] %s differs (%s at %08X): put %08X/%08X esp %08X/%08X eax %08X/%08X\n", name,
                        bad == 2 ? "pushbuffer" : bad == 3 ? "library data" : "registers", at,
-                       put1, put2, r1.esp, r2.esp, r1.eax, r2.eax);
+                       put1, put2, r1.r_esp, r2.r_esp, r1.r_eax, r2.r_eax);
 #if !defined(_WIN32)
             if (d3dn_bad == 1 && getenv("TT_D3D_DUMP")) {
                 extern void *fopen(const char *, const char *); extern size_t fwrite(const void *, size_t, size_t, void *); extern int fclose(void *);
@@ -160,7 +160,7 @@ static void d3dn_check(const char *name, void (*nat)(void), void (*gen)(void), i
 #endif
             memcpy(data, d3dn_s1, sz);   /* the lifted result stands */
             memcpy(XBOX_PTR(put0), d3dn_p1, put1 - put0);
-            memcpy(XBOX_PTR(r0.esp), stk1, 64);
+            memcpy(XBOX_PTR(r0.r_esp), stk1, 64);
             d3dn_set(&r1);
         }
     }
@@ -172,6 +172,7 @@ static void d3dn_check(const char *name, void (*nat)(void), void (*gen)(void), i
     extern void sub_##addr##_gen(void); \
     static void d3dn_##addr(void); \
     void sub_##addr(void) { \
+        TT_PROF_NATIVE(0xF2000000u | 0x##addr##u); \
         int m = d3dn(); \
         if (m == 1 || d3dn_in == 2) d3dn_##addr(); \
         else if (d3dn_in == 1) sub_##addr##_gen(); \
@@ -397,4 +398,61 @@ static void d3dn_001184E0(void)
     MEM32(dev + 8) = fl;
     eax = fl;
     esp = ret_esp;
+}
+
+/* (v156) 0x0011A830 (arg: flags 1 / 2; stdcall): the fence after a draw --
+ * four dwords of "set the reference" into the pushbuffer, the draw's number
+ * ([dev+0x30], +2 each) noted in the 64-slot ring at dev+0x50 and, with
+ * flag 1, the 12-byte record list at [dev+0x4C]; without flag 2 the kickoff
+ * (0x11A740). After every draw: 3-4% of the game thread lifted. */
+extern void sub_0011A740(void);
+D3DN_ENTRY(0011A830, 1)
+static void d3dn_0011A830(void)
+{
+    const uint32_t e0 = esp, arg = MEM8(e0 + 4), si0 = esi, di0 = edi;
+    const uint32_t S = MEM32(0x124180u);
+    uint32_t p = MEM32(S), d, sl, bx, dx, c;
+    MEM32(e0 - 4) = si0; MEM32(e0 - 8) = di0;   /* (push esi, push edi) */
+    if (!(p < MEM32(S + 4))) {
+        const uint32_t n = MEM32(0x127564u);
+        esp = e0 - 8;
+        PUSH32(esp, n); PUSH32(esp, n >> 1);
+        PUSH32(esp, 0x0011A84Du);
+        eax = n >> 1; esi = S;
+        sub_0011AA20();
+        p = eax;
+    }
+    d = MEM32(S + 0x30);
+    MEM32(p + 0xC) = 0; MEM32(p + 0x14) = 0;
+    MEM32(p) = 0x41D70u; MEM32(p + 4) = d;
+    MEM32(p + 8) = 0x41D90u; MEM32(p + 0x10) = 0x41D90u;
+    MEM32(S) = p + 0x18u;
+    sl = (d >> 1) & 0x3Fu;
+    dx = S + sl * 12u;
+    MEM32(e0 - 12) = ebx;   /* (push ebx) */
+    bx = MEM32(S + 0x40);
+    MEM32(dx + 0x50) = d; MEM32(dx + 0x58) = bx;
+    dx = (dx & 0xFFFFFF00u) | arg;
+    MEM32(S + (sl * 3u + 0x15u) * 4u) = p;
+    eax = p;
+    if (arg & 1u) {
+        c = (MEM32(S + 0x38) + 1u) & MEM32(S + 0x3C);
+        MEM32(S + 0x38) = c;
+        c *= 12u;
+        MEM32(c + MEM32(S + 0x4C)) = d;
+        MEM32(c + MEM32(S + 0x4C) + 4) = p;
+        eax = MEM32(S + 0x4C);
+        MEM32(c + eax + 8) = bx;
+    }
+    c = MEM32(S + 0x30) + 2u;
+    MEM32(S + 0x30) = c;
+    ecx = c; edx = dx;
+    if (!(arg & 2u)) {
+        esp = e0 - 8;
+        esi = S; edi = d; ecx = S;
+        PUSH32(esp, 0x0011A8D6u);
+        sub_0011A740();
+    }
+    eax = d; esi = si0; edi = di0;
+    esp = e0 + 8;
 }

@@ -172,6 +172,7 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
 #define XBOX_ID_PHYS_SLOTS 4096
 static volatile uint32_t g_id_phys[XBOX_ID_PHYS_SLOTS];
 
+volatile uint32_t g_id_phys_gen;   /* (v193) bumped at each new identity page: the APU's page cache (apu_shim.h) starts over */
 static void xbox_note_identity_phys(uint32_t va)
 {
     uint32_t page = (va >> 12) + 1, h = (page * 2654435761u) % XBOX_ID_PHYS_SLOTS, i;
@@ -179,8 +180,11 @@ static void xbox_note_identity_phys(uint32_t va)
         uint32_t *slot = (uint32_t *)&g_id_phys[(h + i) % XBOX_ID_PHYS_SLOTS];
         if (*slot == page) return;
         if (*slot == 0) {
-            if (InterlockedCompareExchange((volatile LONG *)slot, (LONG)page, 0) == 0
-                    || *slot == page)
+            if (InterlockedCompareExchange((volatile LONG *)slot, (LONG)page, 0) == 0) {
+                __atomic_add_fetch(&g_id_phys_gen, 1u, __ATOMIC_SEQ_CST);
+                return;
+            }
+            if (*slot == page)
                 return;
         }
     }

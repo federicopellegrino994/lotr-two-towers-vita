@@ -1068,7 +1068,11 @@ void xbox_FramebufferSetFullscreen(int on)
     e.user.code = on < 0 ? 0 : on > 2 ? 1 : on;
     SDL_PushEvent(&e);
 }
+#if defined(__vita__)
+int xbox_FramebufferIsFullscreen(void) { return 1; }   /* (v76: the Vita's screen: "Borderless full screen" in the options) */
+#else
 int xbox_FramebufferIsFullscreen(void) { return s_fs; }
+#endif
 int xbox_DisplayRefreshHz(void) { return 0; }   /* (unknown here: no cap) */
 void xbox_FramebufferFsModeChanged(void)
 {
@@ -1145,8 +1149,269 @@ extern void xbox_UnpinServiceThread(void);
  * a texture, 4:3 inside 960x544. Once vitaGL is up it owns the display:
  * this does not return to the SDL path. */
 #include <vitaGL.h>
+#include <psp2/gxm.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/sysmem.h>
+/* (v183) [RTPROF] zones inside vitaGL (see the wraps below) */
+extern volatile const char *g_vgl_where;
+#define VZ_IN(name) volatile const char *_vzw = g_vgl_where; g_vgl_where = (name)
+#define VZ_OUT() (g_vgl_where = _vzw)
+
+/* (v79) vitaGL copies every draw's uniforms (vertex and fragment) into ONE
+ * circular pool of a fixed 2 MB (gxm_utils.o: vglSetupUniformCircularPool,
+ * vglReserveUniformCircularPoolBuffer -- no fence: it just wraps). Our ~1500
+ * draws a frame each send their vertex constants (up to 192 rows, 3 KB) and
+ * the combiner's: in the crowded places a frame needs more than 2 MB, the
+ * pool wraps inside the frame and the last draws of the frame -- the HUD,
+ * the pause menu -- are drawn by the GPU with uniforms already overwritten
+ * (nothing on screen; the HUD "gone while you stand there").
+ * Linked with --wrap: a bigger pool of our own (RECOMP_VGL_UNIPOOL_MB,
+ * default 16), and the bytes used counted for [VGLPERF]. */
+extern void *gpu_alloc_mapped_aligned_for_cpu(uint32_t align, uint32_t size);
+void __real_vglSetupUniformCircularPool(void);
+void *__real_vglReserveUniformCircularPoolBuffer(uint32_t size);
+static uint8_t *s_upool;
+static uint32_t s_upool_sz, s_upool_off;
+static uint32_t s_upool_frame, s_upool_fmax;
+static uint64_t s_upool_total;
+static uint32_t s_upool_wraps;
+void __wrap_vglSetupUniformCircularPool(void)
+{
+    const char *e = getenv("RECOMP_VGL_UNIPOOL_MB");
+    int mb = e && atoi(e) > 0 ? atoi(e) : 4;   /* (v79 log: 430 KB in the busiest frame) */
+    if (s_upool) return;
+    while (mb >= 2 && !s_upool) {
+        s_upool = (uint8_t *)gpu_alloc_mapped_aligned_for_cpu(256, (uint32_t)mb << 20);
+        if (!s_upool) mb /= 2;
+    }
+    if (!s_upool) {
+        fprintf(stderr, "  [VGL] uniform pool: no memory for our own, vitaGL's 2 MB\n");
+        __real_vglSetupUniformCircularPool();
+        return;
+    }
+    s_upool_sz = (uint32_t)mb << 20;
+    s_upool_off = 0;
+    fprintf(stderr, "  [VGL] uniform pool %d MB (vitaGL's own: 2 MB)\n", mb);
+}
+void *__wrap_vglReserveUniformCircularPoolBuffer(uint32_t size)
+{
+    void *p;
+    if (!s_upool) return __real_vglReserveUniformCircularPoolBuffer(size);
+    size = (size + 15u) & ~15u;
+    if (s_upool_off + size > s_upool_sz) { s_upool_off = 0; s_upool_wraps++; }
+    p = s_upool + s_upool_off;
+    s_upool_off += size;
+    s_upool_frame += size;
+    return p;
+}
+/* (v82) vitaGL's per-frame vertex data pool (vgl.o): the bytes a frame
+ * takes, and how many draws found it full (fallback allocations) */
+extern void *circular_data_pool[], *circular_data_pool_ptr[], *circular_data_pool_limit[];
+extern uint32_t vgl_circular_idx;
+void *__real_vgl_reserve_data_pool(uint32_t size);
+static uint32_t s_dpool_frame, s_dpool_fmax, s_dpool_over, s_dpool_over_frames, s_dpool_over_now, s_dpool_sz;
+static uint64_t s_dpool_total;
+void *__wrap_vgl_reserve_data_pool(uint32_t size)
+{
+    uint32_t i = vgl_circular_idx;
+    if (i < 5) {
+        uint8_t *p = (uint8_t *)circular_data_pool_ptr[i], *l = (uint8_t *)circular_data_pool_limit[i];
+        if (!s_dpool_sz && circular_data_pool[i]) s_dpool_sz = (uint32_t)(l - (uint8_t *)circular_data_pool[i]);
+        if (p + size > l) { s_dpool_over++; s_dpool_over_now = 1; }
+    }
+    s_dpool_frame += size;
+    { VZ_IN("vitaGL: data pool"); void *r = __real_vgl_reserve_data_pool(size); VZ_OUT(); return r; }
+}
+/* (v87) the shader patcher: vitaGL makes a vertex program per attribute
+ * layout and a fragment program per blend state on the fly and never
+ * releases one; a create that fails leaves the draw without a program (no
+ * pixels, no error). Counted, the failures logged, and shown in the capture. */
+int __real_sceGxmShaderPatcherCreateVertexProgram(SceGxmShaderPatcher *sp, SceGxmShaderPatcherId id, const SceGxmVertexAttribute *a, unsigned int na, const SceGxmVertexStream *st, unsigned int ns, SceGxmVertexProgram **out);
+int __real_sceGxmShaderPatcherCreateFragmentProgram(SceGxmShaderPatcher *sp, SceGxmShaderPatcherId id, SceGxmOutputRegisterFormat of, SceGxmMultisampleMode ms, const SceGxmBlendInfo *bi, const SceGxmProgram *vp, SceGxmFragmentProgram **out);
+void __real_sceGxmSetVertexProgram(SceGxmContext *c, const SceGxmVertexProgram *p);
+void __real_sceGxmSetFragmentProgram(SceGxmContext *c, const SceGxmFragmentProgram *p);
+volatile unsigned g_gxm_vc, g_gxm_vf, g_gxm_fc, g_gxm_ff, g_gxm_nullv, g_gxm_nullf;
+volatile long long g_gxm_fc_us;
+volatile int g_gxm_last_err;
+int __wrap_sceGxmShaderPatcherCreateVertexProgram(SceGxmShaderPatcher *sp, SceGxmShaderPatcherId id, const SceGxmVertexAttribute *a, unsigned int na, const SceGxmVertexStream *st, unsigned int ns, SceGxmVertexProgram **out)
+{
+    int r = __real_sceGxmShaderPatcherCreateVertexProgram(sp, id, a, na, st, ns, out);
+    g_gxm_vc++;
+    if (r < 0 || !out || !*out) {
+        g_gxm_vf++; g_gxm_last_err = r;
+        if (g_gxm_vf <= 10) fprintf(stderr, "  [GXM] vertex program create FAILED %08X (%u attributes, %u streams; %u made so far)\n", (unsigned)r, na, ns, g_gxm_vc);
+    }
+    return r;
+}
+#include <psp2/kernel/processmgr.h>
+int __wrap_sceGxmShaderPatcherCreateFragmentProgram(SceGxmShaderPatcher *sp, SceGxmShaderPatcherId id, SceGxmOutputRegisterFormat of, SceGxmMultisampleMode ms, const SceGxmBlendInfo *bi, const SceGxmProgram *vp, SceGxmFragmentProgram **out)
+{
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
+    int r = __real_sceGxmShaderPatcherCreateFragmentProgram(sp, id, of, ms, bi, vp, out);
+    g_gxm_fc_us += (long long)(sceKernelGetProcessTimeWide() - t0);   /* (v108, [CPU]) */
+    g_gxm_fc++;
+    if (r < 0 || !out || !*out) {
+        g_gxm_ff++; g_gxm_last_err = r;
+        if (g_gxm_ff <= 10) fprintf(stderr, "  [GXM] fragment program create FAILED %08X (%u made so far)\n", (unsigned)r, g_gxm_fc);
+    }
+    return r;
+}
+/* (v183) zones for [RTPROF] inside vitaGL's glDrawElements (38% of the render thread in Moria, sceGxmDraw
+ * itself ~2%): each call vitaGL makes there, wrapped, says where the render thread is while in it. */
+int __real_vglCreateVertexProgram(void *a, int b, int c, int d, int e, int f);
+int __wrap_vglCreateVertexProgram(void *a, int b, int c, int d, int e, int f) { VZ_IN("vitaGL: vertex program (vglCreateVertexProgram)"); int r = __real_vglCreateVertexProgram(a, b, c, d, e, f); VZ_OUT(); return r; }
+void *__real_sceClibMemcpy(void *d, const void *s, unsigned n);
+/* (v184) [MEMCPY]: who calls it (return address) and how many bytes, per frame */
+static uintptr_t s_mc_ra[32]; static unsigned long long s_mc_bytes[32], s_mc_n[32];
+void *__wrap_sceClibMemcpy(void *d, const void *s, unsigned n)
+{
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    unsigned h = (unsigned)((ra >> 1) * 2654435761u) >> 27, k;
+    for (k = 0; k < 32; k++, h = (h + 1) & 31) if (s_mc_ra[h] == ra || !s_mc_ra[h]) { s_mc_ra[h] = ra; s_mc_bytes[h] += n; s_mc_n[h]++; break; }
+    VZ_IN("vitaGL: sceClibMemcpy"); void *r = __real_sceClibMemcpy(d, s, n); VZ_OUT(); return r;
+}
+int __real_sceGxmSetVertexStream(void *c, unsigned i, const void *p);
+int __wrap_sceGxmSetVertexStream(void *c, unsigned i, const void *p) { VZ_IN("vitaGL: sceGxmSetVertexStream"); int r = __real_sceGxmSetVertexStream(c, i, p); VZ_OUT(); return r; }
+int __real_sceGxmSetFragmentTexture(void *c, unsigned i, const void *t);
+int __wrap_sceGxmSetFragmentTexture(void *c, unsigned i, const void *t) { VZ_IN("vitaGL: sceGxmSetFragmentTexture"); int r = __real_sceGxmSetFragmentTexture(c, i, t); VZ_OUT(); return r; }
+int __real_sceGxmSetVertexUniformBuffer(void *c, unsigned i, const void *b);
+int __wrap_sceGxmSetVertexUniformBuffer(void *c, unsigned i, const void *b) { VZ_IN("vitaGL: sceGxmSetVertexUniformBuffer"); int r = __real_sceGxmSetVertexUniformBuffer(c, i, b); VZ_OUT(); return r; }
+int __real_sceGxmSetFragmentUniformBuffer(void *c, unsigned i, const void *b);
+int __wrap_sceGxmSetFragmentUniformBuffer(void *c, unsigned i, const void *b) { VZ_IN("vitaGL: sceGxmSetFragmentUniformBuffer"); int r = __real_sceGxmSetFragmentUniformBuffer(c, i, b); VZ_OUT(); return r; }
+int __real_sceGxmSetVertexDefaultUniformBuffer(void *c, const void *b);
+int __wrap_sceGxmSetVertexDefaultUniformBuffer(void *c, const void *b) { VZ_IN("vitaGL: sceGxmSetVertexDefaultUniformBuffer"); int r = __real_sceGxmSetVertexDefaultUniformBuffer(c, b); VZ_OUT(); return r; }
+int __real_sceGxmSetFragmentDefaultUniformBuffer(void *c, const void *b);
+int __wrap_sceGxmSetFragmentDefaultUniformBuffer(void *c, const void *b) { VZ_IN("vitaGL: sceGxmSetFragmentDefaultUniformBuffer"); int r = __real_sceGxmSetFragmentDefaultUniformBuffer(c, b); VZ_OUT(); return r; }
+void __real_scene_reset(void);
+void __wrap_scene_reset(void) { VZ_IN("vitaGL: scene_reset"); __real_scene_reset(); VZ_OUT(); }
+/* (v186) [GXMSCENE] scenes a frame and the time sceGxmBeginScene waits (it blocks while the GPU is too far
+ * behind: "vitaGL: scene_reset" was 32% of the render thread in Fangorn's heavy frames) */
+static unsigned long long s_bs_us, s_bs_n, s_bs_slow, s_es_n;
+int __real_sceGxmBeginScene(void *c, unsigned f, const void *rt, const void *vr, void *vs, void *fs, const void *cs, const void *ds);
+int __wrap_sceGxmBeginScene(void *c, unsigned f, const void *rt, const void *vr, void *vs, void *fs, const void *cs, const void *ds)
+{
+    VZ_IN("vitaGL: sceGxmBeginScene (waits for the GPU)");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide(), d;
+    int r = __real_sceGxmBeginScene(c, f, rt, vr, vs, fs, cs, ds);
+    d = sceKernelGetProcessTimeWide() - t0;
+    VZ_OUT();
+    s_bs_us += d; s_bs_n++; if (d > 500) s_bs_slow++;
+    return r;
+}
+/* (v196) render targets made for several scenes a frame. vitaGL asks for one
+ * (scenesPerFrame 1); the game comes back to its main target 3-5 times a
+ * frame (TGTSEQ: the glow chain and the shadow targets in between), and every
+ * further scene on a one-scene target has to wait for the GPU to finish the
+ * one before -- sceGxmEndScene 15-25 ms a frame in the heaviest places (31%
+ * of the render thread), whatever the resolution or the ring sizes. Targets
+ * 400 lines high or more get 4, the small ones 2; if the driver refuses, as
+ * vitaGL asked. TT_SCENES=<n> for all (1: as before). */
+int __real_sceGxmCreateRenderTarget(const SceGxmRenderTargetParams *p, SceGxmRenderTarget **rt);
+int __wrap_sceGxmCreateRenderTarget(const SceGxmRenderTargetParams *p, SceGxmRenderTarget **rt)
+{
+    static int s_n = -1, s_log;
+    SceGxmRenderTargetParams q = *p;
+    int r, want;
+    if (s_n < 0) { const char *e = getenv("TT_SCENES"); s_n = e && *e ? atoi(e) : 0; if (s_n > 8) s_n = 8; }
+    want = s_n > 0 ? s_n : (p->height >= 300 ? 4 : 2);   /* (v204: 300 -- the 16:9 picture is 360 lines, and v203 gave the main target 2) */
+    if (want > (int)q.scenesPerFrame) q.scenesPerFrame = (uint16_t)want;
+    r = __real_sceGxmCreateRenderTarget(&q, rt);
+    if (r < 0 && q.scenesPerFrame != p->scenesPerFrame) {
+        fprintf(stderr, "  [VGL] render target %ux%u: %u scenes a frame refused (%08X), %u as asked\n",
+                p->width, p->height, q.scenesPerFrame, (unsigned)r, p->scenesPerFrame);
+        r = __real_sceGxmCreateRenderTarget(p, rt);
+    } else if (s_log < 12) {
+        s_log++;
+        fprintf(stderr, "  [VGL] render target %ux%u: %u scenes a frame (vitaGL asked %u)\n", p->width, p->height, q.scenesPerFrame, p->scenesPerFrame);
+    }
+    return r;
+}
+int __real_sceGxmEndScene(void *c, const void *v, const void *f);
+/* (v187) [SCENEEND]: where the render thread was when a scene ended (the zone before vitaGL's), and how long
+ * the end waited (v186: 20-50 scenes a frame in the heavy Fangorn frames, 35% of the render thread in EndScene) */
+static const char *s_se_z[24]; static unsigned long long s_se_n[24], s_se_us[24];
+int __wrap_sceGxmEndScene(void *c, const void *v, const void *f)
+{
+    const char *z = (const char *)g_vgl_where;
+    VZ_IN("vitaGL: sceGxmEndScene");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide(), d;
+    int r, k;
+    s_es_n++;
+    r = __real_sceGxmEndScene(c, v, f);
+    d = sceKernelGetProcessTimeWide() - t0;
+    VZ_OUT();
+    for (k = 0; k < 24; k++) if (s_se_z[k] == z || !s_se_z[k]) { s_se_z[k] = z; s_se_n[k]++; s_se_us[k] += d; break; }
+    return r;
+}
+/* (v180) [GXMDRAW] sceGxmDraw's own time: it waits there when the GPU's command ring is full (the GPU behind) */
+static unsigned long long s_gd_us, s_gd_n, s_gd_slow, s_gd_slow_us;
+int __real_sceGxmDraw(SceGxmContext *c, SceGxmPrimitiveType pt, SceGxmIndexFormat it, const void *ix, unsigned int n);
+int __wrap_sceGxmDraw(SceGxmContext *c, SceGxmPrimitiveType pt, SceGxmIndexFormat it, const void *ix, unsigned int n)
+{
+    VZ_IN("vitaGL: sceGxmDraw");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide(), d;
+    int r = __real_sceGxmDraw(c, pt, it, ix, n);
+    d = sceKernelGetProcessTimeWide() - t0;
+    VZ_OUT();
+    s_gd_us += d; s_gd_n++;
+    if (d > 100) { s_gd_slow++; s_gd_slow_us += d; }
+    return r;
+}
+void __wrap_sceGxmSetVertexProgram(SceGxmContext *c, const SceGxmVertexProgram *p) { VZ_IN("vitaGL: sceGxmSetVertexProgram"); if (!p) g_gxm_nullv++; __real_sceGxmSetVertexProgram(c, p); VZ_OUT(); }
+void __wrap_sceGxmSetFragmentProgram(SceGxmContext *c, const SceGxmFragmentProgram *p) { VZ_IN("vitaGL: sceGxmSetFragmentProgram"); if (!p) g_gxm_nullf++; __real_sceGxmSetFragmentProgram(c, p); VZ_OUT(); }
+
+/* (the renderer, at each present / each [VGLPERF] report) */
+void xbox_VitaUniPoolFrame(void)
+{
+    if (s_dpool_frame > s_dpool_fmax) s_dpool_fmax = s_dpool_frame;
+    s_dpool_total += s_dpool_frame; s_dpool_frame = 0;
+    s_dpool_over_frames += s_dpool_over_now; s_dpool_over_now = 0;
+    if (s_upool_frame > s_upool_fmax) s_upool_fmax = s_upool_frame;
+    s_upool_total += s_upool_frame;
+    s_upool_frame = 0;
+}
+void xbox_VitaUniPoolReport(double frames)
+{
+    if (frames < 1.0) frames = 1.0;
+    fprintf(stderr, "  [VGLPERF] uniform pool: %.0f KB per frame, busiest frame %u KB, pool %u MB, wrapped %u times\n",
+            (double)s_upool_total / 1024.0 / frames, s_upool_fmax >> 10, s_upool_sz >> 20, s_upool_wraps);
+    s_upool_total = 0; s_upool_fmax = 0;
+    fprintf(stderr, "  [VGLPERF] vertex data pool: %.0f KB per frame, busiest frame %u KB, %u KB a frame available; %u frames ran out (%u draws)\n",
+            (double)s_dpool_total / 1024.0 / frames, s_dpool_fmax >> 10, s_dpool_sz >> 10, s_dpool_over_frames, s_dpool_over);
+    s_dpool_total = 0; s_dpool_fmax = 0; s_dpool_over = 0; s_dpool_over_frames = 0;
+    fprintf(stderr, "  [VGLPERF] shader patcher: %u vertex programs made (%u failed), %u fragment programs (%u failed); draws with no program: %u vertex, %u fragment\n",
+            g_gxm_vc, g_gxm_vf, g_gxm_fc, g_gxm_ff, g_gxm_nullv, g_gxm_nullf);
+    fprintf(stderr, "  [GXMDRAW] per frame: %.0f sceGxmDraw, %.2f ms in them; %.0f took over 0.1 ms (the GPU's ring full), %.2f ms in those\n",
+            (double)s_gd_n / frames, (double)s_gd_us / 1000.0 / frames, (double)s_gd_slow / frames, (double)s_gd_slow_us / 1000.0 / frames);
+    s_gd_us = s_gd_n = s_gd_slow = s_gd_slow_us = 0;
+    fprintf(stderr, "  [GXMSCENE] per frame: %.1f scenes begun (%.1f ended), %.2f ms waiting in sceGxmBeginScene, %.1f of them over 0.5 ms\n",
+            (double)s_bs_n / frames, (double)s_es_n / frames, (double)s_bs_us / 1000.0 / frames, (double)s_bs_slow / frames);
+    s_bs_us = s_bs_n = s_bs_slow = s_es_n = 0;
+    {   /* (v187) [SCENEEND] by zone, the most first */
+        char bb[900]; int q = 0, j, k;
+        for (j = 0; j < 8; j++) {
+            int bi = -1;
+            for (k = 0; k < 24; k++) if (s_se_z[k] && s_se_n[k] && (bi < 0 || s_se_n[k] > s_se_n[bi])) bi = k;
+            if (bi < 0) break;
+            q += snprintf(bb + q, sizeof bb - q, " [%s] %.1f (%.2f ms);", s_se_z[bi] ? s_se_z[bi] : "?", (double)s_se_n[bi] / frames, (double)s_se_us[bi] / 1000.0 / frames);
+            s_se_n[bi] = 0;
+        }
+        if (q) fprintf(stderr, "  [SCENEEND] per frame, scenes ended from:%s\n", bb);
+        memset(s_se_z, 0, sizeof s_se_z); memset(s_se_n, 0, sizeof s_se_n); memset(s_se_us, 0, sizeof s_se_us);
+    }
+    {   /* (v184) [MEMCPY] the callers of sceClibMemcpy, the biggest first */
+        char bb[600]; int q = 0, j, k;
+        for (j = 0; j < 6; j++) {
+            int bi = -1;
+            for (k = 0; k < 32; k++) if (s_mc_ra[k] && s_mc_n[k] && (bi < 0 || s_mc_bytes[k] > s_mc_bytes[bi])) bi = k;
+            if (bi < 0) break;
+            q += snprintf(bb + q, sizeof bb - q, " %08X: %.0f KB in %.0f calls;", (unsigned)s_mc_ra[bi], (double)s_mc_bytes[bi] / 1024.0 / frames, (double)s_mc_n[bi] / frames);
+            s_mc_n[bi] = 0;
+        }
+        if (q) fprintf(stderr, "  [MEMCPY] per frame, by caller:%s\n", bb);
+        memset(s_mc_ra, 0, sizeof s_mc_ra); memset(s_mc_bytes, 0, sizeof s_mc_bytes); memset(s_mc_n, 0, sizeof s_mc_n);
+    }
+}
 
 static const char s_vgl_vs[] =
     "void main(float2 aPos, float2 aUv,\n"
@@ -1200,6 +1465,35 @@ static void vgl_start(void)
             int mb = vr && atoi(vr) > 0 ? atoi(vr) : 4;
             vglSetVertexBufferSize((uint32_t)mb << 20);
             fprintf(stderr, "  [VGL] vertex ring buffer %d MB\n", mb);
+        }
+        {   /* (v67) the fragment ring holds every draw's fragment uniforms
+             * until the GPU shades the scene -- on the Vita's tiler that is
+             * after the whole scene: ~1400 draws of ~0.5 KB each did not fit
+             * in the default 512 KB, and the busy battle frames stalled for
+             * 10 to 24 s and came out black (v65/v66 logs). Also a larger
+             * parameter buffer (the binned geometry of the scene).
+             * RECOMP_VGL_FRAGRING_MB, RECOMP_VGL_PARAM_MB. */
+            const char *fr = getenv("RECOMP_VGL_FRAGRING_MB"), *pb = getenv("RECOMP_VGL_PARAM_MB");
+            int fmb = fr && atoi(fr) > 0 ? atoi(fr) : 4, pmb = pb && atoi(pb) > 0 ? atoi(pb) : 24;
+            vglSetFragmentBufferSize((uint32_t)fmb << 20);
+            vglSetParamBufferSize((uint32_t)pmb << 20);
+            vglSetVDMBufferSize(512 * 1024);   /* (default 128 KB: the draws' commands) */
+            fprintf(stderr, "  [VGL] fragment ring buffer %d MB, parameter buffer %d MB\n", fmb, pmb);
+        }
+        {   /* (v82) vitaGL copies every draw's vertices and indices into a
+             * per-frame "circular" pool (32 MB split across the frames in
+             * flight, ~10 MB a frame). A frame that needs more takes the rest
+             * from fallback allocations -- and in the v80/v81 captures,
+             * from some point of a busy frame on, no draw changed a pixel
+             * any more (the HUD, the hit sparks: the frame's tail).
+             * RECOMP_VGL_DATAPOOL_MB, default 48; the RAM kept back 24 MB instead of
+             * 32 so that most of it comes from RAM, not from the textures' VRAM. */
+            const char *dp = getenv("RECOMP_VGL_DATAPOOL_MB");
+            /* (v216) 26: 8.7 MB a frame (the busiest seen 5.7 MB); the 6 MB
+             * saved go to the static vertex cache (nv2a_gl.inc, TT_VCACHE_MB) */
+            int mb = dp && atoi(dp) > 0 ? atoi(dp) : 26;   /* (v82: 48 + keep 24 -- vitaGL never started; v83 back to its 32) */
+            vglSetCircularPoolSize((uint32_t)mb << 20);
+            fprintf(stderr, "  [VGL] vertex data pool %d MB (vitaGL's own: 32 MB)\n", mb);
         }
         if (vglInitExtended(0, 960, 544, keep << 20, SCE_GXM_MULTISAMPLE_NONE))
             fprintf(stderr, "  [VGL] display resolution lowered by vitaGL\n");

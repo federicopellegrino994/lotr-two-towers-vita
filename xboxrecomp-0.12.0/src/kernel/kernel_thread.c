@@ -776,6 +776,9 @@ int xbox_worker_stack_alloc(void)
     return -1;  /* all slices in use */
 }
 
+/* (v190) a slice's top, for host code that runs guest code on its own thread */
+uint32_t xbox_worker_stack_top(int slot) { return XBOX_WORKER_STACK_TOP(slot); }
+
 void xbox_worker_stack_free(int slot)
 {
     if (slot >= 0 && slot < XBOX_WORKER_STACK_COUNT)

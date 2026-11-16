@@ -207,6 +207,22 @@ static void fs_modes_list(void)
     s_items[GFX_FS_RES].n = n;
 #endif
 }
+#if defined(__vita__)
+/* (v72) on the PS Vita these stay as they are: changed in the game's own
+ * options, the picture flickered (the frame rate, the display, the
+ * resolution, the quality) -- the renderer there is made for these values */
+static const struct { int item, v; } s_vita_lock[] = {
+    { GFX_FPS, 0 }, { GFX_FULLSCREEN, 1 }, { GFX_ASPECT, 0 }, { GFX_SCALE, 0 }, { GFX_ANISO, 0 }, { GFX_AA, 0 },
+    { GFX_VSYNC, 0 }, { GFX_STRETCH, 0 }, { GFX_VP, 1 }, { GFX_SHARP, 0 }, { GFX_WINSIZE, 0 }, { GFX_ULTRA, 0 },
+    { GFX_WIDE_SCENES, 0 }, { GFX_FS_RES, 0 }, { GFX_LOOK, 0 }, { GFX_HDR, 0 }, { GFX_LOD, 0 }, { GFX_MOVIESHARP, 0 },
+};
+static int vita_locked(int item)
+{
+    int k;
+    for (k = 0; k < (int)(sizeof s_vita_lock / sizeof s_vita_lock[0]); k++) if (s_vita_lock[k].item == item) return 1;
+    return 0;
+}
+#endif
 static void gfx_init(void)
 {
     const char *e;
@@ -302,6 +318,12 @@ static void gfx_init(void)
         }
         if (!getenv("RECOMP_OPT_STICK_DEADZONE") && (e = getenv("RECOMP_STICK_DEADZONE")) && (i = find_val(GFX_DEADZONE, e)) >= 0) s_cur[GFX_DEADZONE] = i;
     }
+#if defined(__vita__)
+    {   /* (v72) the PS Vita: the picture settings kept at what it is made for */
+        int k;
+        for (k = 0; k < (int)(sizeof s_vita_lock / sizeof s_vita_lock[0]); k++) s_cur[s_vita_lock[k].item] = s_vita_lock[k].v;
+    }
+#endif
     InterlockedExchange(&s_inited, 1);
 }
 
@@ -348,6 +370,13 @@ float xbox_GfxAspect(void)
     static const float k[5] = { 4.0f / 3.0f, 16.0f / 9.0f, 16.0f / 10.0f, 21.0f / 9.0f, 32.0f / 9.0f };
     int i;
     gfx_init();
+#if defined(__vita__)
+    {   /* (v198) TT_WIDE=1: 16:9, the Vita's screen (experimental there) */
+        static int w = -1;
+        if (w < 0) { const char *e = getenv("TT_WIDE"); w = e && e[0] == '1'; }   /* (v203: on unless TT_WIDE=0; v219: off unless TT_WIDE=1) */
+        if (w) return 16.0f / 9.0f;
+    }
+#endif
     i = s_cur[GFX_ASPECT];
     return i < 5 ? k[i] : s_aspect_custom_v;
 }
@@ -368,6 +397,12 @@ static void gfx_set(int item, int v)
     const GfxItem *it = &s_items[item];
     if (v < 0) v = it->n - 1;
     if (v >= it->n) v = 0;
+#if defined(__vita__)
+    if (vita_locked(item)) {
+        fprintf(stderr, "  [GFXMENU] %s: kept as it is on the PS Vita\n", it->label);
+        return;
+    }
+#endif
     if (item == GFX_FULLSCREEN) {
         xbox_FramebufferSetFullscreen(v);
     } else {

@@ -25,6 +25,7 @@ typedef struct RecompRegs {
     double   r_fp_stack[8];
     uint64_t r_xmm[8][2];
     uint64_t r_mm[8];
+    void *volatile r_prof_top;   /* (v154) the profiler's frame chain (postproc_prof.py) */
 } RecompRegs;
 
 extern uint32_t g_recomp_ctx_off;

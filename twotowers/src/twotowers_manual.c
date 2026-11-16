@@ -17,6 +17,31 @@ typedef uint32_t tt_dword;
 #include <math.h>
 extern int sscanf(const char *s, const char *fmt, ...);   /* (the test hooks; stdio.h clashes with this file's own fopen) */
 #include "tt_env.h"   /* (1.9.3) getenv looked up once per name */
+#include "tt_prof.h"   /* (v154) hooks in the profile */
+#if defined(__vita__) && !defined(RECOMP_FAST_REGS)
+/* (v158, PS Vita speed) this file's guest registers through the thread's register struct (recomp_ctx: a coprocessor
+ * read and two loads, computed once a function -- it is a const function), not emutls: every eax / esp in a hook was
+ * a call into the emutls lookup, several a hook -- the D3D functions, the matrix helpers, the particles, the hero
+ * getter. The same storage (vita_emutls.c puts these variables in the struct). */
+#undef g_eax
+#undef g_ecx
+#undef g_edx
+#undef g_ebx
+#undef g_esi
+#undef g_edi
+#undef g_esp
+#undef g_ebp
+#undef g_seh_ebp
+#define g_eax (recomp_ctx()->r_eax)
+#define g_ecx (recomp_ctx()->r_ecx)
+#define g_edx (recomp_ctx()->r_edx)
+#define g_ebx (recomp_ctx()->r_ebx)
+#define g_esi (recomp_ctx()->r_esi)
+#define g_edi (recomp_ctx()->r_edi)
+#define g_esp (recomp_ctx()->r_esp)
+#define g_ebp (recomp_ctx()->r_ebp)
+#define g_seh_ebp (recomp_ctx()->r_seh_ebp)
+#endif
 #if !defined(_WIN32)
 /* The few host calls below are declared by hand (windows.h would clash with
  * the generated headers); on POSIX they come from win32_compat.c. */
@@ -204,6 +229,7 @@ void sub_0008FB60(void)
 extern void sub_000CCA50_gen(void);
 void sub_000CCA50(void)
 {
+    TT_PROF_NATIVE(0xF20CCA50u);
     extern void tt_e3hud_prehud(void);
     tt_e3hud_prehud();
     sub_000CCA50_gen();
@@ -242,6 +268,162 @@ void sub_00134940(void)
     eax = (uint32_t)xbox_DpcLockGuestCs(0x00139F58u, 50);
     esp += 4;   /* ret */
 }
+
+/* (v190, PS Vita speed) XACT's DoWork (0x00135CAB: XACT's lock, the engine's
+ * per-tick work -- cues, sound banks, its DirectSound voices -- and the lock let
+ * go) on a thread of its own. The game asks for it once or a few times a frame
+ * from its sound manager (0x000EEC60, 0x000EAC20) and never reads anything it
+ * returns; here the request wakes the worker and the game goes on. The worker
+ * runs the lifted function as the game would have, under the same lock
+ * (0x00134940 at PASSIVE level: XACT's critical section), so a cue the game
+ * starts or stops meets it as on the console, where the same work also runs
+ * beside the game (its DPC). Requests while it runs are folded into one more
+ * run. On core 2 (the sound chip's other core), priority 158.
+ * TT_XACTW=0: the game runs it itself, as before. [XACTW] every 10 s. */
+extern void sub_00135CAB_gen(void);
+extern __declspec(dllimport) void *__stdcall CreateEventA(void *sa, int manual, int initial, const char *name);
+extern __declspec(dllimport) int __stdcall SetEvent(void *h);
+extern __declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void *h, unsigned long ms);
+extern __declspec(dllimport) void *__stdcall CreateThread(void *sa, size_t stack, unsigned long (__stdcall *fn)(void *), void *arg, unsigned long flags, unsigned long *tid);
+extern int xbox_worker_stack_alloc(void);
+extern uint32_t xbox_worker_stack_top(int slot);
+extern uint32_t xbox_AllocThreadTib(void);
+static void *s_xw_ev;
+static volatile int s_xw_state = -1;          /* -1 not decided, 0 off, 1 on, 2 starting */
+static volatile uint32_t s_xw_req, s_xw_runs, s_xw_us, s_xw_max;
+static volatile int s_xw_thid;
+#if defined(__vita__)
+extern int sceKernelGetThreadId(void);
+extern unsigned long long sceKernelGetProcessTimeWide(void);
+#endif
+static unsigned long __stdcall xw_thread(void *arg)
+{
+    int slot = xbox_worker_stack_alloc();
+    uint32_t tib = xbox_AllocThreadTib(), seen = 0;
+    (void)arg;
+    if (slot < 0 || !tib) { tt_dbg("  [XACTW] no guest stack or TIB for the worker: the game keeps XACT's work\n"); s_xw_state = 0; return 0; }
+    g_esp = xbox_worker_stack_top(slot);
+    g_fs_base = tib;
+#if defined(__vita__)
+    {
+        extern int sceKernelChangeThreadCpuAffinityMask(int thid, int mask);
+        extern int sceKernelChangeThreadPriority(int thid, int prio);
+        const char *e = getenv("TT_XACTW_CORE"), *p = getenv("TT_XACTW_PRIO");
+        extern volatile int g_core3_ok;
+        int m = e && *e ? (int)strtol(e, NULL, 16) : 0x40000, pr = p && *p ? atoi(p) : (g_core3_ok > 0 ? 158 : 130);   /* (v210: 158 with core 2 to itself) */   /* (v191: 130, above the sound chip's 140 -- at 158 it was put aside holding XACT's and DirectSound's locks, 3-9 ms a run, and the game waited on them: 0x128C07 up to 16%, 0x134940 up to 18%) */
+        s_xw_thid = sceKernelGetThreadId();
+        if (m) sceKernelChangeThreadCpuAffinityMask(s_xw_thid, m);
+        if (pr) sceKernelChangeThreadPriority(s_xw_thid, pr);
+        tt_dbg("  [XACTW] XACT's work on its own thread (cpu mask %X, priority %d)\n", (unsigned)m, pr);
+    }
+#endif
+    s_xw_state = 1;
+    for (;;) {
+        uint32_t r;
+        WaitForSingleObject(s_xw_ev, 50);
+        r = s_xw_req;
+        if (r == seen) continue;
+        seen = r;
+        {
+#if defined(__vita__)
+            unsigned long long t0 = sceKernelGetProcessTimeWide(), dt;
+#endif
+            g_esp -= 4; MEM32(g_esp) = 0;   /* (a return address: the lifted ret takes it) */
+            sub_00135CAB_gen();
+#if defined(__vita__)
+            dt = sceKernelGetProcessTimeWide() - t0;
+            s_xw_us += (uint32_t)dt; if (dt > s_xw_max) s_xw_max = (uint32_t)dt;
+#endif
+            s_xw_runs++;
+        }
+    }
+    return 0;
+}
+static int xw_on(void)
+{
+    int st = s_xw_state;
+    if (__builtin_expect(st >= 0, 1)) return st == 1;
+    {
+        const char *e = getenv("TT_XACTW");
+        extern volatile int g_core3_ok;
+        /* (v192: off unless TT_XACTW=1 -- v191 took core 2 from the sound chip in crowds, crackle, for no clear gain.)
+         * (v210: on by itself when the sound chip has the fourth core: core 2 is then free for it.) */
+        (void)g_core3_ok;
+        if (!(e && *e == '1')) { s_xw_state = 0; return 0; }   /* (v211: off again unless TT_XACTW=1 -- cutscenes froze with it in v210) */
+        s_xw_state = 2;
+        s_xw_ev = CreateEventA(NULL, 0, 0, NULL);
+        if (!s_xw_ev || !CreateThread(NULL, 0x10000, xw_thread, NULL, 0, NULL)) { s_xw_state = 0; return 0; }
+        return 0;   /* (this request the game's own: the worker starts) */
+    }
+}
+void sub_00135CAB(void)
+{
+    if (xw_on()) {
+        s_xw_req++;
+        SetEvent(s_xw_ev);
+        {   /* ([XACTW] every 10 s) */
+            extern __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
+            static unsigned long long tl;
+            static uint32_t r0, n0, u0;
+            unsigned long long t = GetTickCount64();
+            if (t - tl > 10000u) {
+                if (tl) { uint32_t n = s_xw_runs - n0, u = s_xw_us - u0;
+                    tt_dbg("  [XACTW] in 10 s: %u requests by the game, %u runs on the worker, %.2f ms each (longest %.2f)\n",
+                           s_xw_req - r0, n, n ? u / 1000.0 / n : 0.0, s_xw_max / 1000.0); }
+                tl = t; r0 = s_xw_req; n0 = s_xw_runs; u0 = s_xw_us; s_xw_max = 0;
+            }
+        }
+        esp += 4;   /* ret */
+        return;
+    }
+    sub_00135CAB_gen();
+}
+
+/* (v207, PS Vita speed) The game's sound manager (0x000EF440 -> 0x000EEC60: every
+ * sound slot's position, volume, fades, then XACT's work) is 13.5% of the game
+ * thread in the heavy places (v206 log, the plains: 11 ms of an 87 ms frame). When
+ * the frame is slow (45 ms or more) it runs every other frame, with the time of
+ * both (the game's frame time at 0x4B8B98 / 0x4B8BA0 raised for that call, put back
+ * after), and XACT's work (0x00135CAB) still every frame, so the streams are fed.
+ * A sound's place and loudness follow 8-10 times a second there instead of 15-20.
+ * TT_SND_HALF=0: every frame as before. */
+extern void sub_000EF440_gen(void);
+uint32_t tt_gframe;   /* (v224) the game's frames (this runs once a frame) */
+void sub_000EF440(void)
+{
+    static int mode = -1, skipped;
+    tt_gframe++;
+    static float acc_s, acc_ms;
+    float dt_s, dt_ms;
+    if (mode < 0) { const char *e = getenv("TT_SND_HALF"); mode = !(e && e[0] == '0'); }
+    dt_s = MEMF(0x4B8BA0u); dt_ms = MEMF(0x4B8B98u);
+    if (mode && !skipped && MEM32(0x4AD050u) == 6 && dt_s >= 0.045f && dt_s < 0.25f) {
+        skipped = 1; acc_s = dt_s; acc_ms = dt_ms;
+        esp -= 4; MEM32(esp) = 0;   /* (a return address for it) */
+        sub_00135CAB();
+        esp += 4;                   /* ret */
+        return;
+    }
+    if (skipped) {
+        skipped = 0;
+        MEMF(0x4B8BA0u) = dt_s + acc_s; MEMF(0x4B8B98u) = dt_ms + acc_ms;
+        sub_000EF440_gen();
+        MEMF(0x4B8BA0u) = dt_s; MEMF(0x4B8B98u) = dt_ms;
+        return;
+    }
+    sub_000EF440_gen();
+}
+
+/* (v209) the rain's lines (0x0004BC20) written by hand: native_hot.c */
+extern void tt_nat_0004BC20(void);
+/* (v229) TT_RAIN=0 (the default): no rain or weather anywhere -- the system's step (0x4D270, called by 0xF2FF0 only in
+ * levels with weather; its answer unused, cdecl) never run, so its drop/splash lists stay empty, and the drops' line
+ * draw (0x4BC20) skipped too. In Helm's Deep it was ~8% of the game thread (each new drop walked across the height
+ * grid). TT_RAIN=1: as the game does it. */
+static int tt_rain_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TT_RAIN"); on = e && e[0] == '1'; } return on; }
+extern void sub_0004D270_gen(void);
+void sub_0004D270(void) { if (!tt_rain_on()) { esp += 4u; return; } sub_0004D270_gen(); }
+void sub_0004BC20(void) { if (!tt_rain_on()) { esp += 4u; return; } tt_nat_0004BC20(); }
 
 /* Test hook: TT_DEBUG_GOTO=<screen 1-11> switches the game's front end to
  * that screen once a pad script raises FLAG1 (10 = end of level, 11 =
@@ -570,6 +752,7 @@ static void tt_watch(const char *where)
 }
 void sub_0011A740(void)
 {
+    TT_PROF_NATIVE(0xF211A740u);
     tt_watch("kick");
     uint32_t dev = ecx;
     uint32_t flags = MEM32(dev + 8);
@@ -806,8 +989,23 @@ static void tt_frametime(void)
 
 extern void sub_0011A8E0_gen(void);
 static volatile uint32_t tt_bot_target, tt_bot_issued, tt_bot_done, tt_bot_flags, tt_bot_caller, tt_bot_in;
+/* (v128) [BOT] every 5 s: the game's waits for the GPU -- calls, full drains
+ * (the latest time), and the time spent in the native drains */
+static unsigned tt_bot_calls, tt_bot_full; static unsigned long long tt_bot_ms, tt_bot_t0;
+static void tt_bot_note(unsigned long long t0)
+{
+    unsigned long long now = GetTickCount64();
+    tt_bot_ms += now - t0;
+    if (!tt_bot_t0) tt_bot_t0 = now;
+    if (now - tt_bot_t0 >= 5000) {
+        tt_dbg("  [BOT] in %llu ms: %u waits for the GPU, %u for everything given (%llu ms in those)\n",
+               now - tt_bot_t0, tt_bot_calls, tt_bot_full, tt_bot_ms);
+        tt_bot_t0 = now; tt_bot_calls = tt_bot_full = 0; tt_bot_ms = 0;
+    }
+}
 void sub_0011A8E0(void)
 {
+    tt_bot_calls++;
     uint32_t dev = MEM32(0x00124180u);
     if (dev) {
         uint32_t target = MEM32(esp + 4);
@@ -856,6 +1054,47 @@ void sub_0011A8E0(void)
                 }
                 if (now - t0 > 10000) break;   /* leave it to D3D */
                 {   extern void xbox_PbWaitProgress(unsigned ms); xbox_PbWaitProgress(1); }   /* (1.9.5: not a spin) */
+            }
+        }
+        /* (v128) A wait for the very latest time -- a resource still set on
+         * the device is locked (BlockUntilNotBusy, 0x0011AC90): D3D puts that
+         * time in the pushbuffer, kicks, and sleeps on the GPU-idle event,
+         * which here is set by the kernel's clock thread once it gets the
+         * dispatch lock -- a round trip that took a whole drain in the
+         * crowded levels. The same here directly: the time in, the kick, then
+         * the game thread waits for the render thread to release it (woken
+         * by the release itself, counted as waiting in [PERF]).
+         * TT_BOT_NATIVE=0: D3D's own. */
+        else if ((int32_t)(target - done) > 0 && target == issued && !MEM32(dev + 0x21ACu)) {
+            static int on = -1;
+            if (on < 0) { const char *e = getenv("TT_BOT_NATIVE"); on = !(e && *e == '0'); }
+            if (on) {
+                extern void sub_0011A830(void);
+                extern int xbox_Nv2aDrained(void);
+                extern void xbox_PbWaitProgress(unsigned ms);
+                unsigned long long t0 = GetTickCount64(), idle_since = 0;
+                uint32_t se = esi, sd = edi, sb = ebx;
+                esp -= 4; MEM32(esp) = 0;   /* (the argument: kick now) */
+                esp -= 4; MEM32(esp) = 0;   /* (return address) */
+                sub_0011A830();             /* (pops both) */
+                esi = se; edi = sd; ebx = sb;
+                tt_bot_full++;
+                for (;;) {
+                    uint32_t d = MEM32(MEM32(dev + 0x34));
+                    unsigned long long now;
+                    if ((int32_t)(target - d) <= 0) break;
+                    now = GetTickCount64();
+                    if (xbox_Nv2aDrained()) {
+                        if (!idle_since) idle_since = now;
+                        else if (now - idle_since > 20) { MEM32(MEM32(dev + 0x34)) = MEM32(dev + 0x30); break; }
+                    } else idle_since = 0;
+                    if (now - t0 > 10000) break;
+                    xbox_PbWaitProgress(1);
+                }
+                tt_bot_note(t0);
+                tt_bot_in = 0;
+                esp += 12;   /* ret 8 */
+                return;
             }
         }
     }
@@ -937,6 +1176,16 @@ void sub_0004E890(void)
     /* the shape chosen now (the settings overlay can change it in game) */
     extern float xbox_GfxAspect(void);
     float k = xbox_GfxAspect() / (4.0f / 3.0f);
+#if defined(__vita__)
+    {   /* (v202) always on the Vita, the first 64 different ones: why v201's cameras were never widened */
+        extern int tt_in_scene(void);
+        static float seen[64][2]; static int ns; int q;
+        float fa = MEMF(esp + 8), ff = MEMF(esp + 4);
+        for (q = 0; q < ns && !(seen[q][0] == fa && seen[q][1] == ff); q++) {}
+        if (q == ns && ns < 64) { seen[ns][0] = fa; seen[ns][1] = ff; ns++;
+            tt_dbg("  [WIDE] SetPerspective fov %.3f aspect %.3f near %.3f far %.3f, screen %u, in a scene %d, shape factor %.3f, from %08X\n", ff, fa, MEMF(esp + 12), MEMF(esp + 16), MEM32(0x4AD050u), tt_in_scene(), k, MEM32(esp)); }
+    }
+#endif
     if (getenv("TT_WIDE_TRACE")) {
         static float seen[64][2]; static int ns; int q;
         float fa = MEMF(esp + 8), ff = MEMF(esp + 4);
@@ -959,7 +1208,14 @@ void sub_0004E890(void)
          * widens them): their cameras look where the levels' skies and
          * distant cards were only made for a 4:3 view -- widened, the
          * skybox's corners and the mountain cards' edges showed */
+#if defined(__vita__)
+        /* (v203) on the Vita the scenes too: the play camera's projection is set once, when its shot starts, and
+         * the HUD has not been drawn yet then -- "in a scene" was true at every call (v202 log) and no camera
+         * was ever widened */
+        if (scr != 6 && scr != 8) {
+#else
         if (scr != 6 && scr != 8 || (tt_in_scene() && xbox_GfxGet(26) != 1)   /* (GFX_WIDE_SCENES) */) {
+#endif
             extern volatile unsigned long long g_ws_cam_tick;
             g_ws_cam_tick = 0;
             k = 1.0f;
@@ -976,6 +1232,19 @@ void sub_0004E890(void)
             if (++n < 5 || n % 500 == 0) tt_dbg("  [WIDE] camera %u widened at %llu ms\n", n, g_ws_cam_tick);
         }
     }
+#if defined(__vita__)
+    {   /* (v208) the view's far end nearer in play: 300 units as the game sets it, x TT_FAR (default 0.75).
+         * Rohan's second level sends 2300-3000 draws a frame (v207 log: the render thread 90-122 ms a frame,
+         * the game's code 63-75) -- what lies beyond is neither prepared nor drawn. TT_FAR=1: as the game. */
+        static float fk = -1.0f; static int told;
+        uint32_t scr = MEM32(0x4AD050u);
+        if (fk < 0.0f) { const char *e = getenv("TT_FAR"); fk = e && *e ? (float)atof(e) : 1.0f;   /* (v213: off by default -- the user saw the far world vanish for no felt gain; TT_FAR=0.75 for v208's) */ if (fk < 0.3f || fk > 1.0f) fk = 1.0f; }
+        if (fk < 1.0f && (scr == 6 || scr == 8) && MEMF(esp + 16) >= 100.0f) {
+            if (!told) { told = 1; tt_dbg("  [FAR] the view's far end %.0f -> %.0f units\n", MEMF(esp + 16), MEMF(esp + 16) * fk); }
+            MEMF(esp + 16) = MEMF(esp + 16) * fk;
+        }
+    }
+#endif
     sub_0004E890_gen();
 }
 
@@ -1015,6 +1284,13 @@ int tt_in_scene(void)
     extern __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
     extern int xbox_MoviePlaying(void);
     return MEM32(0x4AD050u) == 6 && !xbox_MoviePlaying() && GetTickCount64() - tt_hud_drawn_ms > 300;
+}
+/* (v225) play itself: play's screen, no film, the HUD drawn lately (the pacing, nv2a_pb_exec.c, only there) */
+int tt_in_play(void)
+{
+    extern __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
+    extern int xbox_MoviePlaying(void);
+    return MEM32(0x4AD050u) == 6 && !xbox_MoviePlaying() && GetTickCount64() - tt_hud_drawn_ms < 300;
 }
 /* testing: TT_DTSCAN=1 -- find the game's clock: guest memory words (float
  * seconds or milliseconds, or whole ms) that advance as fast as the time the
@@ -1270,6 +1546,73 @@ void tt_fps_init(void)
         tt_dbg("  [FPS] experimental frame-rate mode: %s (cap %d)\n", tt_fps_mode == 1 ? "60" : "unlocked", tt_fps_cap);
 }
 
+/* (v76, PS Vita) the game's SSE matrix helpers in NEON, straight from and
+ * to guest memory: the lifted SSE kept its registers in memory and moved
+ * every value through the stack, and these three were ~8% of the game
+ * thread (the v75 profile). Same results: multiplies and adds in the
+ * guest's order, no fused multiply-add. (The original code leaves xmm0-5
+ * changed; nothing reads them after the call.) On the generated code's
+ * stack conventions: stdcall, ret 12 / ret 8. */
+#if defined(__vita__)
+#include <arm_neon.h>
+extern void sub_000FF200_gen(void);
+extern void sub_000FF246_gen(void);
+extern void sub_000FF344_gen(void);
+/* (v158) the lanes taken straight from the NEON register (vmul/vmla by a
+ * scalar lane): v76's vgetq_lane + vmulq_n went through an ARM register and
+ * back, 16 transfers a matrix -- each a pipeline stall on the Cortex-A9.
+ * NEON's VMLA rounds the product before the add (not fused): the same
+ * (p0 + p1) + p2 + p3 as before. Registers through the thread's struct
+ * (recomp_ctx), not emutls. */
+static inline float32x4_t tt_v4m4(float32x4_t a, float32x4_t m0, float32x4_t m1, float32x4_t m2, float32x4_t m3)
+{
+    const float32x2_t lo = vget_low_f32(a), hi = vget_high_f32(a);
+    float32x4_t r = vmulq_lane_f32(m0, lo, 0);
+    r = vmlaq_lane_f32(r, m1, lo, 1);
+    r = vmlaq_lane_f32(r, m2, hi, 0);
+    return vmlaq_lane_f32(r, m3, hi, 1);
+}
+void sub_000FF200(void)
+{
+    TT_PROF_NATIVE(0xF2000000u | 0x000FF200u);   /* (v173) its own line in [PROF] */
+    RecompRegs *const c = recomp_ctx();
+    const uint32_t sp = c->r_esp, d = MEM32(sp + 4), v = MEM32(sp + 8), m = MEM32(sp + 0xC);
+    const float *M = (const float *)XBOX_PTR(m);
+    vst1q_f32((float *)XBOX_PTR(d), tt_v4m4(vld1q_f32((const float *)XBOX_PTR(v)), vld1q_f32(M), vld1q_f32(M + 4), vld1q_f32(M + 8), vld1q_f32(M + 12)));
+    c->r_eax = d;
+    c->r_esp = sp + 16;
+}
+/* mat4 x mat4: dst row i = A row i x B */
+void sub_000FF246(void)
+{
+    TT_PROF_NATIVE(0xF2000000u | 0x000FF246u);   /* (v173) its own line in [PROF] */
+    RecompRegs *const c = recomp_ctx();
+    const uint32_t sp = c->r_esp, d = MEM32(sp + 4), ap = MEM32(sp + 8), bp = MEM32(sp + 0xC);
+    const float *A = (const float *)XBOX_PTR(ap), *B = (const float *)XBOX_PTR(bp);
+    const float32x4_t b0 = vld1q_f32(B), b1 = vld1q_f32(B + 4), b2 = vld1q_f32(B + 8), b3 = vld1q_f32(B + 12);
+    const float32x4_t a0 = vld1q_f32(A), a1 = vld1q_f32(A + 4), a2 = vld1q_f32(A + 8), a3 = vld1q_f32(A + 12);
+    float *D = (float *)XBOX_PTR(d);
+    vst1q_f32(D, tt_v4m4(a0, b0, b1, b2, b3));
+    vst1q_f32(D + 4, tt_v4m4(a1, b0, b1, b2, b3));
+    vst1q_f32(D + 8, tt_v4m4(a2, b0, b1, b2, b3));
+    vst1q_f32(D + 12, tt_v4m4(a3, b0, b1, b2, b3));
+    c->r_eax = d; c->r_ecx = d;
+    c->r_esp = sp + 16;
+}
+/* transpose: dst = src^T */
+void sub_000FF344(void)
+{
+    TT_PROF_NATIVE(0xF2000000u | 0x000FF344u);   /* (v173) its own line in [PROF] */
+    RecompRegs *const c = recomp_ctx();
+    const uint32_t s0 = c->r_esp, d = MEM32(s0 + 4), sp = MEM32(s0 + 8);
+    float32x4x4_t m = vld4q_f32((const float *)XBOX_PTR(sp));   /* (de-interleaved: the columns) */
+    float *D = (float *)XBOX_PTR(d);
+    vst1q_f32(D, m.val[0]); vst1q_f32(D + 4, m.val[1]); vst1q_f32(D + 8, m.val[2]); vst1q_f32(D + 12, m.val[3]);
+    c->r_eax = d;
+    c->r_ecx = sp;
+    c->r_esp = s0 + 12;
+}
+#endif
 recomp_func_t twotowers_lookup_manual(uint32_t xbox_va)
 {
     switch (xbox_va) {
@@ -1375,9 +1718,59 @@ extern void sub_0012DB00(void);
 extern void sub_0012DA17(void);
 __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
 __declspec(dllimport) void __stdcall GetSystemTimeAsFileTime(void *ft);
+/* (v131) The game's sound manager stops a voice and then polls GetStatus
+ * until it reads stopped (0x000EB080, up to 10000 polls of StopEx +
+ * GetStatus), and starts one the same way (0x000ECA50). Here the stop only
+ * completes at the sound chip's next 5.3 ms frame, so each one held the
+ * game thread spinning through DirectSound's locks -- in a crowd, where
+ * voices are stolen all the time, many times a frame. While in those waits
+ * a voice still stopping is force-stopped at once with DirectSound's own
+ * routine (0x0012DA17, the one its timeout uses). TT_FASTSTOP=0: as before.
+ * [SNDWAIT] every 5 s: the waits and the time in them. */
+static int tt_snd_wait;   /* 1 in the stop wait, 2 in the start wait */
+static unsigned tt_sw_n[3]; static unsigned long long tt_sw_us[3], tt_sw_t0; static unsigned tt_sw_forced;
+extern unsigned long long sceKernelGetProcessTimeWide(void);
+static int tt_faststop_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TT_FASTSTOP"); on = !(e && *e == '0'); } return on; }
+static void tt_sw_note(int k, unsigned long long t0)
+{
+    unsigned long long now = sceKernelGetProcessTimeWide();
+    tt_sw_n[k]++; tt_sw_us[k] += now - t0;
+    if (!tt_sw_t0) tt_sw_t0 = now;
+    if (now - tt_sw_t0 >= 5000000ull) {
+        tt_dbg("  [SNDWAIT] in %llu ms: %u voice stops waited for (%.1f ms in them, %u forced), %u starts (%.1f ms)\n",
+               (now - tt_sw_t0) / 1000, tt_sw_n[1], tt_sw_us[1] / 1000.0, tt_sw_forced, tt_sw_n[2], tt_sw_us[2] / 1000.0);
+        tt_sw_t0 = now; tt_sw_n[1] = tt_sw_n[2] = 0; tt_sw_us[1] = tt_sw_us[2] = 0; tt_sw_forced = 0;
+    }
+}
+void sub_000EB080(void)
+{
+    unsigned long long t0 = sceKernelGetProcessTimeWide();
+    int was = tt_snd_wait;
+    tt_snd_wait = 1;
+    sub_000EB080_gen();
+    tt_snd_wait = was;
+    tt_sw_note(1, t0);
+}
+void sub_000ECA50(void)
+{
+    unsigned long long t0 = sceKernelGetProcessTimeWide();
+    int was = tt_snd_wait;
+    tt_snd_wait = 2;
+    sub_000ECA50_gen();
+    tt_snd_wait = was;
+    tt_sw_note(2, t0);
+}
 void sub_0012F10A(void)
 {
     uint32_t v = ecx;
+    if (tt_snd_wait == 1 && (MEM16(v + 0x12) & 0x8001u) == 0x8001u && tt_faststop_on()) {
+        uint32_t se = esi, sd = edi, sb = ebx;
+        esp -= 4; MEM32(esp) = 0;
+        sub_0012DA17();   /* (DirectSound's forced stop) */
+        esi = se; edi = sd; ebx = sb;
+        ecx = v;
+        tt_sw_forced++;
+    }
     { static int m; if (m < 40 && tt_dbg_on()) { m++; tt_dbg("  [DSOUND] GetStatus voice 0x%08X flags 0x%04X caller 0x%08X\n", v, MEM16(v + 0x12), MEM32(esp + 0x10)); } }
     /* One voice at a time is enough to track: the one being polled. */
     static uint32_t track_v;
@@ -1441,6 +1834,7 @@ void sub_0012F10A(void)
 extern void sub_00117AD0_gen(void);
 void sub_00117AD0(void)
 {
+    TT_PROF_NATIVE(0xF2117AD0u);
     uint32_t tex = MEM32(esp + 8);
     if (tex && MEM32(tex + 0x0C) == 0 && tt_dbg_on()) {
         static uint32_t callers[64], counts[64];
@@ -1779,6 +2173,7 @@ extern void sub_000D2310_gen(void);
 int coop_moves_hero_swap(uint32_t ret, uint8_t *keep);
 void sub_000D2310(void)
 {
+    TT_PROF_NATIVE(0xF20D2310u);
     uint32_t r[4] = { eax, ecx, edx, esp }; uint8_t keep = 0; int sw = coop_moves_hero_swap(MEM32(esp), &keep);
     coop_testupg_early();
     if (!tt_hk(4, 0, r)) sub_000D2310_gen(); else { eax = r[0]; esp = r[3]; }
@@ -2140,11 +2535,102 @@ void sub_000B4220(void)
 extern void sub_000BA110_gen(void);
 extern void tt_sweep(uint32_t a0, double res);
 #include "heroes_sweep_query.inc"
+/* (v225) THE SWING'S ARC AT A LOW FRAME RATE. The sweep tests the blade between its place last frame (weapon +0xA0)
+ * and now (+0x60): a straight path. A swing turns about its wielder, so between two frames far apart (13 a second:
+ * 2.3 times the 30 it was made for) the straight path cuts inside the arc, nearer the wielder than the blade went, and
+ * an enemy at the edge of reach is missed. When the player's weapon (id 1) misses and the frame is long (45 ms or
+ * more), the sweep is asked again in two halves, with the blade's place halfway along the arc between (turned about
+ * the player's place, the radius and height in between; its orientation the two's normalised mean): a hit in either
+ * is the hit (that half's answer). Only the geometric query is repeated (the damage is the caller's,
+ * once). TT_SWEEPARC=0: as before. [ARC] every 10 s: the player's long-frame misses asked again, and hits found. */
+static unsigned tt_arc_n[2];
+static int tt_arc_mid(const float *m0, const float *m1, const float *o, float *mh)
+{
+    int i, k;
+    float len[3], r[3][3], a0, a1, da, r0, r1, rh, zh, ah, v0x, v0y, v1x, v1y;
+    for (i = 0; i < 3; i++) {
+        float l0 = sqrtf(m0[4*i]*m0[4*i] + m0[4*i+1]*m0[4*i+1] + m0[4*i+2]*m0[4*i+2]);
+        float l1 = sqrtf(m1[4*i]*m1[4*i] + m1[4*i+1]*m1[4*i+1] + m1[4*i+2]*m1[4*i+2]);
+        float s0[3], l;
+        if (!(l0 > 1e-6f && l1 > 1e-6f)) return 0;
+        for (k = 0; k < 3; k++) s0[k] = m0[4*i+k] / l0 + m1[4*i+k] / l1;
+        l = sqrtf(s0[0]*s0[0] + s0[1]*s0[1] + s0[2]*s0[2]);
+        if (!(l > 0.2f)) return 0;   /* (turned half round or more: left alone) */
+        for (k = 0; k < 3; k++) r[i][k] = s0[k] / l;
+        len[i] = 0.5f * (l0 + l1);
+    }
+    /* back to right angles (rows 1 and 2 against row 0, then 2 against 1), each with its mean length */
+    {
+        float d = r[1][0]*r[0][0] + r[1][1]*r[0][1] + r[1][2]*r[0][2], l;
+        for (k = 0; k < 3; k++) r[1][k] -= d * r[0][k];
+        l = sqrtf(r[1][0]*r[1][0] + r[1][1]*r[1][1] + r[1][2]*r[1][2]); if (!(l > 1e-4f)) return 0;
+        for (k = 0; k < 3; k++) r[1][k] /= l;
+        d = r[2][0]*r[0][0] + r[2][1]*r[0][1] + r[2][2]*r[0][2];
+        for (k = 0; k < 3; k++) r[2][k] -= d * r[0][k];
+        d = r[2][0]*r[1][0] + r[2][1]*r[1][1] + r[2][2]*r[1][2];
+        for (k = 0; k < 3; k++) r[2][k] -= d * r[1][k];
+        l = sqrtf(r[2][0]*r[2][0] + r[2][1]*r[2][1] + r[2][2]*r[2][2]); if (!(l > 1e-4f)) return 0;
+        for (k = 0; k < 3; k++) r[2][k] /= l;
+    }
+    for (i = 0; i < 3; i++) { for (k = 0; k < 3; k++) mh[4*i+k] = r[i][k] * len[i]; mh[4*i+3] = 0.5f * (m0[4*i+3] + m1[4*i+3]); }
+    /* the place: about the player, on the ground plane (x, y), the height (z) halfway */
+    v0x = m0[12] - o[0]; v0y = m0[13] - o[1]; v1x = m1[12] - o[0]; v1y = m1[13] - o[1];
+    r0 = sqrtf(v0x*v0x + v0y*v0y); r1 = sqrtf(v1x*v1x + v1y*v1y);
+    if (!(r0 > 1e-3f && r1 > 1e-3f) || r0 > 50.0f || r1 > 50.0f) return 0;
+    a0 = atan2f(v0y, v0x); a1 = atan2f(v1y, v1x);
+    da = a1 - a0; while (da > 3.14159265f) da -= 6.2831853f; while (da < -3.14159265f) da += 6.2831853f;
+    ah = a0 + 0.5f * da; rh = 0.5f * (r0 + r1); zh = 0.5f * (m0[14] + m1[14]);
+    mh[12] = o[0] + rh * cosf(ah); mh[13] = o[1] + rh * sinf(ah); mh[14] = zh; mh[15] = 0.5f * (m0[15] + m1[15]);
+    for (k = 0; k < 16; k++) if (!isfinite(mh[k])) return 0;
+    return 1;
+}
+static void tt_sweep_arc(uint32_t a0, const TTSweepCPU *entry, const uint32_t *args, uint32_t seh)
+{
+    static int on = -1;
+    uint32_t w, h, i, m0w[16], m1w[16], mhw[16];
+    float m0[16], m1[16], mh[16], o[3], dt;
+    if (on < 0) { const char *e = getenv("TT_SWEEPARC"); on = !(e && *e == '0'); }
+    if (!on || !(g_fp_stack[g_fp_top] < 0.0) || a0 < 0x10000u || a0 >= 0x84000000u) return;
+    w = MEM32(a0 + 0x14); if (w < 0x10000u || w >= 0x84000000u || MEM32(w + 0x2F4) != 1u) return;
+    dt = MEMF(0x4B8BA0u); if (!(dt >= 0.045f && dt < 0.25f)) return;
+    h = MEM32(0x43B15Cu); if (h < 0x10000u || h >= 0x84000000u) return;
+    for (i = 0; i < 16; i++) { m0w[i] = MEM32(w + 0xA0 + 4 * i); m1w[i] = MEM32(w + 0x60 + 4 * i); }
+    memcpy(m0, m0w, 64); memcpy(m1, m1w, 64);
+    o[0] = MEMF(h + 0xF0); o[1] = MEMF(h + 0xF4); o[2] = MEMF(h + 0xF8);
+    if (!tt_arc_mid(m0, m1, o, mh)) return;
+    memcpy(mhw, mh, 64);
+    tt_arc_n[0]++;
+    {
+        TTSweepCPU miss; int half;
+        tt_sweep_cpu_save(&miss);
+        for (half = 0; half < 2; half++) {
+            tt_sweep_cpu_restore(entry); MEM32(XBOX_FS_BASE) = seh; for (i = 0; i < 6; i++) MEM32(g_esp + 4 * i) = args[i];
+            for (i = 0; i < 16; i++) { MEM32(w + 0xA0 + 4 * i) = half ? mhw[i] : m0w[i]; MEM32(w + 0x60 + 4 * i) = half ? m1w[i] : mhw[i]; }
+            tt_sweep_query(a0);
+            if (g_fp_stack[g_fp_top] >= 0.0) {   /* a hit: the half's answer as it gives it */
+                tt_arc_n[1]++;
+                break;
+            }
+        }
+        for (i = 0; i < 16; i++) { MEM32(w + 0xA0 + 4 * i) = m0w[i]; MEM32(w + 0x60 + 4 * i) = m1w[i]; }
+        if (half == 2) tt_sweep_cpu_restore(&miss);   /* (no hit: as the first answer left it) */
+    }
+    {
+        extern __declspec(dllimport) tt_dword __stdcall GetTickCount(void);
+        static uint32_t tl; const uint32_t now = (uint32_t)GetTickCount();
+        if (!tl) tl = now;
+        if (now - tl >= 10000u) { tl = now; if (tt_arc_n[0]) tt_dbg("[ARC] in 10 s: %u of the player's long-frame misses asked again along the arc, %u hits found\n", tt_arc_n[0], tt_arc_n[1]); tt_arc_n[0] = tt_arc_n[1] = 0; }
+    }
+}
 void sub_000BA110(void)
 {
-    uint32_t a0 = MEM32(esp + 4), a1 = MEM32(esp + 8);
+    uint32_t a0 = MEM32(esp + 4), a1 = MEM32(esp + 8), args[6], seh = MEM32(XBOX_FS_BASE), i;
+    TTSweepCPU entry;
     extern void tt_sweep2(uint32_t, uint32_t, double);
+    tt_sweep_cpu_save(&entry);
+    for (i = 0; i < 6; i++) args[i] = MEM32(g_esp + 4 * i);
     tt_sweep_query(a0);
+    tt_sweep_arc(a0, &entry, args, seh);
     tt_sweep(a0, g_fp_stack[g_fp_top]);
     tt_sweep2(a0, a1, g_fp_stack[g_fp_top]);
 }
@@ -2249,12 +2735,109 @@ void sub_0007A4D0(void)
 /* the game's wait for the next frame (in the front end and in play): the
  * menus' frame (menus.c) */
 extern void sub_000E00E0_gen(void);
+/* (v159, PS Vita speed) the game a frame ahead of the GPU.
+ *
+ * The GPU's frame callback (0xDFFA0: 0 at a frame's start sets 0x4B7601, 1 at its end clears it) and the game's wait
+ * at its frame's end (0xE00E0, its first loop: while 0x4B7601 is set). So the game never began a frame while the GPU
+ * was inside one: with the render thread as slow as the game (a battle: 65-72 ms each, v158), the frame was the game's
+ * time plus the render thread's tail of it -- 3-9 ms a frame spent waiting. Here the game may begin the next frame
+ * while the GPU draws the one it just finished (never two: with two frames not yet drawn the game waits for the older
+ * as before). Counted: frames the game finished (s_ga_sub) and frames the GPU ended (s_ga_done); with the GPU between
+ * frames the count starts again. Pushbuffer space, D3D's fences and the vblank pacing stay as they were.
+ * TT_GPU_AHEAD=0: the stock wait. */
+static volatile uint32_t s_ga_sub, s_ga_done, s_ga_skip, s_ga_wait, s_ga_n;
+extern int xbox_MoviePlaying(void);
+extern void sub_000DFFA0_gen(void);
+void sub_000DFFA0(void)
+{
+    if (MEM32(esp + 4) == 1u) __atomic_add_fetch(&s_ga_done, 1u, __ATOMIC_RELEASE);
+    sub_000DFFA0_gen();
+}
+static int tt_ga_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TT_GPU_AHEAD"); on = e && *e == '1'; }   /* (v160: off -- v159's log: the game was a frame ahead already, never began one with the GPU in the last; its waits were for the one before, as stock) */
+    return on;
+}
+#ifdef TT_PGO_GEN
+extern int snprintf(char *, size_t, const char *, ...);
+extern void *fopen(const char *, const char *);
+extern size_t fwrite(const void *, size_t, size_t, void *);
+extern int fclose(void *);
+/* (v194) the counts so far, each object's in ux0:data/twotowers/pgo/<its name>
+ * (the whole run's: the files are written over each time) */
+struct gcov_info;
+extern void __gcov_info_to_gcda(const struct gcov_info *, void (*)(const char *, void *),
+                                void (*)(const void *, unsigned, void *), void *(*)(unsigned, void *), void *);
+extern const struct gcov_info *__start_gcov_info[], *__stop_gcov_info[];
+static void pgo_name(const char *f, void *arg)
+{
+    const char *b = strrchr(f, '/');
+    char path[512];
+    snprintf(path, sizeof path, "ux0:data/twotowers/pgo/%s", b ? b + 1 : f);
+    *(void **)arg = fopen(path, "wb");
+}
+static void pgo_write(const void *d, unsigned n, void *arg)
+{
+    void *fp = *(void **)arg;
+    if (fp) fwrite(d, 1, n, fp);
+}
+static void *pgo_alloc(unsigned n, void *arg) { (void)arg; return malloc(n); }
+static unsigned pgo_dump(void)
+{
+    const struct gcov_info **p;
+    unsigned n = 0;
+    for (p = __start_gcov_info; p < __stop_gcov_info; p++) {
+        void *fp = NULL;
+        __gcov_info_to_gcda(*p, pgo_name, pgo_write, pgo_alloc, &fp);
+        if (fp) { fclose(fp); n++; }
+    }
+    return n;
+}
+#endif
 void sub_000E00E0(void)
 {
     extern void tt_menus_tick(void);
     uint32_t sa = eax, sb = ebx, sc = ecx, sd = edx, ss = esi, sdi = edi, sp = esp;
+#ifdef TT_PGO_GEN
+    {   /* (v194) every 3 minutes: the counts so far written out */
+        extern __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
+        static unsigned long long tl;
+        static unsigned nd;
+        unsigned long long t = GetTickCount64();
+        if (!tl) tl = t;
+        else if (t - tl > 180000u) {
+            unsigned nf = pgo_dump();
+            tt_dbg("  [PGO] counts written (%u: %u files), %.1f s\n", ++nd, nf, (GetTickCount64() - t) / 1000.0);
+            tl = GetTickCount64();
+        }
+    }
+#endif
     tt_menus_tick();
     eax = sa; ebx = sb; ecx = sc; edx = sd; esi = ss; edi = sdi; esp = sp;
+    if (tt_ga_on() && !MEM32(0x4B75F4u) && !xbox_MoviePlaying()) {
+        uint32_t done = __atomic_load_n(&s_ga_done, __ATOMIC_ACQUIRE);
+        s_ga_n++;
+        if (!MEM8(0x4B7601u)) s_ga_sub = done + 1u;   /* (the GPU between frames: this frame waits to be begun) */
+        else {
+            s_ga_sub++;
+            if (s_ga_sub - done > 2u) s_ga_sub = done + 2u;   /* (more than ever can be: counted wrong) */
+            if (s_ga_sub - done <= 1u) { MEM8(0x4B7601u) = 0; s_ga_skip++; }   /* (the GPU inside this very frame: go on) */
+            else {   /* (still inside the one before: until it ends, then on) */
+                extern int sceKernelDelayThread(unsigned int us);
+                unsigned k;
+                for (k = 0; k < 4000u && s_ga_sub - __atomic_load_n(&s_ga_done, __ATOMIC_ACQUIRE) > 1u; k++) sceKernelDelayThread(250);
+                MEM8(0x4B7601u) = 0;
+                s_ga_wait++;
+            }
+        }
+        {   /* ([AHEAD] every 10 s) */
+            extern __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
+            static unsigned long long tl;
+            unsigned long long t = GetTickCount64();
+            if (t - tl > 10000u) { if (tl) tt_dbg("  [AHEAD] in 10 s: %u frames, %u begun with the GPU still drawing the last, %u waited for the one before\n", s_ga_n, s_ga_skip, s_ga_wait); tl = t; s_ga_n = s_ga_skip = s_ga_wait = 0; }
+        }
+    }
     sub_000E00E0_gen();
 }
 /* a list (the dialogs' and others': Yes / No, ...) drawn at (x, y) (menus.c) */
@@ -12278,8 +12861,113 @@ void sub_0003F9A0(void)
  * walked into were never shown -- the ground cut off at a brown nothing, the heroes in it unseen (Amon Hen, Gates of
  * Moria, Fangorn). TT_VS_CULL: the level's own */
 extern void sub_000F79C0_gen(void);
+#include "f79_native.inc"
+static int tt_f79_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TT_NATIVE_VIS"); on = !(e && *e == '0'); } return on; }
+/* (v221) THE OBJECTS OF A FEW PIXELS. The draw walk (0x42AF0) tests every object's box against each view (0x42C4E: its
+ * world box, model +0xF0 / +0x100; 0x42C09: the box its 0xBC / 0xB8 methods give) and hands the visible ones to their
+ * draw. An object whose box, seen from the camera, spans fewer than TT_TINY pixels (its diagonal over its depth, on the
+ * 480 lines of the picture; default 4) is taken as out: neither the game (~12 us an object) nor the renderer (~25 us a
+ * draw) spend anything on a speck (the way the Vita's Halo port skips "objects covering only a few pixels"). The camera
+ * comes from the view's six planes (+0x140, 0x1C apart: the two opposite ones the near and far, the four others meet at
+ * the camera; their angle to the view the field of view); a view they do not fit (a shadow's parallel one) is left
+ * alone. Only those two callers: the sectors' walk (0x42D05), the ground (0x485FA) and the rest as before.
+ * TT_TINY=0: off. [TINY] every 10 s: objects tested, skipped, and how many were under 2 / 4 / 8 / 16 px. */
+typedef struct { uint32_t v; uint32_t w[24]; int ok; float cam[3], vd[3], k; } TtTinyView;
+static TtTinyView tt_tiny_v[4];
+static unsigned tt_tiny_n[6], tt_tiny_rot;
+static float tt_tiny_thr(void) { static float t = -1.0f; if (t < 0.0f) { const char *e = getenv("TT_TINY"); t = e ? (float)atof(e) : 4.0f; if (!(t >= 0.0f)) t = 0.0f; } return t; }
+static const TtTinyView *tt_tiny_view(uint32_t v)
+{
+    uint32_t w[24], i, j;
+    TtTinyView *c = NULL;
+    double n[6][3], d[6];
+    for (i = 0; i < 6; i++) { uint32_t pl = v + 0x140u + 0x1Cu * i; w[4 * i] = MEM32(pl); w[4 * i + 1] = MEM32(pl + 4); w[4 * i + 2] = MEM32(pl + 8); w[4 * i + 3] = MEM32(pl + 0x10); }
+    for (i = 0; i < 4; i++) if (tt_tiny_v[i].v == v && !memcmp(tt_tiny_v[i].w, w, sizeof w)) return &tt_tiny_v[i];
+    c = &tt_tiny_v[tt_tiny_rot++ & 3u];
+    c->v = v; memcpy(c->w, w, sizeof w); c->ok = 0;
+    for (i = 0; i < 6; i++) {
+        float f[4]; double l;
+        memcpy(f, &w[4 * i], 16);
+        l = sqrt((double)f[0] * f[0] + (double)f[1] * f[1] + (double)f[2] * f[2]);
+        if (!(l > 1e-12) || !isfinite(l)) return c;
+        n[i][0] = f[0] / l; n[i][1] = f[1] / l; n[i][2] = f[2] / l; d[i] = f[3] / l;
+        if (!isfinite(d[i])) return c;
+    }
+    {
+        int a = -1, b = -1, s[4], ns = 0, k;
+        double best = 0, cam[3], vd[3], tmin = 1e30;
+        for (i = 0; i < 6; i++) for (j = i + 1; j < 6; j++) {
+            double dt = n[i][0] * n[j][0] + n[i][1] * n[j][1] + n[i][2] * n[j][2];
+            if (dt < best) { best = dt; a = (int)i; b = (int)j; }
+        }
+        if (best > -0.999) return c;
+        for (i = 0; i < 6; i++) if ((int)i != a && (int)i != b) s[ns++] = (int)i;
+        {   /* the camera: where three side planes meet (n . x = -d), the fourth through it too */
+            const double *r0 = n[s[0]], *r1 = n[s[1]], *r2 = n[s[2]];
+            const double det = r0[0] * (r1[1] * r2[2] - r1[2] * r2[1]) - r0[1] * (r1[0] * r2[2] - r1[2] * r2[0]) + r0[2] * (r1[0] * r2[1] - r1[1] * r2[0]);
+            const double y0 = -d[s[0]], y1 = -d[s[1]], y2 = -d[s[2]];
+            double q;
+            if (!(fabs(det) > 1e-6)) return c;
+            cam[0] = (y0 * (r1[1] * r2[2] - r1[2] * r2[1]) - r0[1] * (y1 * r2[2] - r1[2] * y2) + r0[2] * (y1 * r2[1] - r1[1] * y2)) / det;
+            cam[1] = (r0[0] * (y1 * r2[2] - r1[2] * y2) - y0 * (r1[0] * r2[2] - r1[2] * r2[0]) + r0[2] * (r1[0] * y2 - y1 * r2[0])) / det;
+            cam[2] = (r0[0] * (r1[1] * y2 - y1 * r2[1]) - r0[1] * (r1[0] * y2 - y1 * r2[0]) + y0 * (r1[0] * r2[1] - r1[1] * r2[0])) / det;
+            if (!isfinite(cam[0]) || !isfinite(cam[1]) || !isfinite(cam[2])) return c;
+            q = n[s[3]][0] * cam[0] + n[s[3]][1] * cam[1] + n[s[3]][2] * cam[2] + d[s[3]];
+            if (fabs(q) > 0.01 * (1.0 + fabs(cam[0]) + fabs(cam[1]) + fabs(cam[2]))) return c;
+        }
+        {   /* the near plane: of the opposite two, the one by the camera; the view looks against its outward normal */
+            const double da = fabs(n[a][0] * cam[0] + n[a][1] * cam[1] + n[a][2] * cam[2] + d[a]);
+            const double db = fabs(n[b][0] * cam[0] + n[b][1] * cam[1] + n[b][2] * cam[2] + d[b]);
+            const int nr = da <= db ? a : b;
+            for (k = 0; k < 3; k++) vd[k] = -n[nr][k];
+        }
+        for (k = 0; k < 4; k++) {   /* the narrowest half-angle: sin = |n_side . view| */
+            double sn = fabs(n[s[k]][0] * vd[0] + n[s[k]][1] * vd[1] + n[s[k]][2] * vd[2]), cs, t;
+            if (!(sn > 1e-4 && sn < 0.9999)) return c;
+            cs = sqrt(1.0 - sn * sn); t = sn / cs;
+            if (t < tmin) tmin = t;
+        }
+        for (k = 0; k < 3; k++) { c->cam[k] = (float)cam[k]; c->vd[k] = (float)vd[k]; }
+        c->k = (float)(240.0 / tmin);
+        c->ok = 1;
+    }
+    return c;
+}
+/* 1: the box (low A, high B) is a speck from view v */
+static int tt_tiny(uint32_t v, uint32_t A, uint32_t B)
+{
+    const float thr = tt_tiny_thr();
+    const TtTinyView *t;
+    float lo[3], hi[3], cx, cy, cz, dg, z, px;
+    int k;
+    if (!(thr > 0.0f) || v < 0x10000u || A < 0x10000u || B < 0x10000u) return 0;
+    t = tt_tiny_view(v);
+    if (!t->ok) return 0;
+    for (k = 0; k < 3; k++) { lo[k] = MEMF(A + 4u * k); hi[k] = MEMF(B + 4u * k); }
+    cx = 0.5f * (lo[0] + hi[0]); cy = 0.5f * (lo[1] + hi[1]); cz = 0.5f * (lo[2] + hi[2]);
+    dg = sqrtf((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) + (hi[2] - lo[2]) * (hi[2] - lo[2]));
+    z = (cx - t->cam[0]) * t->vd[0] + (cy - t->cam[1]) * t->vd[1] + (cz - t->cam[2]) * t->vd[2];
+    if (!(dg >= 0.0f) || !isfinite(dg) || !(z > dg)) return 0;   /* (the camera inside or near the box: never a speck) */
+    px = dg * t->k / z;
+    tt_tiny_n[0]++;
+    if (px < 2.0f) tt_tiny_n[2]++; if (px < 4.0f) tt_tiny_n[3]++; if (px < 8.0f) tt_tiny_n[4]++; if (px < 16.0f) tt_tiny_n[5]++;
+    if (px < thr) { tt_tiny_n[1]++; return 1; }
+    return 0;
+}
+static void tt_tiny_log(void)
+{
+    static uint32_t tl;
+    const uint32_t now = coop_now();
+    if (!tl) tl = now;
+    if (now - tl < 10000u) return;
+    tl = now;
+    if (tt_tiny_n[0]) tt_dbg("[TINY] in 10 s: %u objects tested, %u not drawn (under %.1f px); under 2 px %u, 4 px %u, 8 px %u, 16 px %u\n",
+                             tt_tiny_n[0], tt_tiny_n[1], (double)tt_tiny_thr(), tt_tiny_n[2], tt_tiny_n[3], tt_tiny_n[4], tt_tiny_n[5]);
+    memset(tt_tiny_n, 0, sizeof tt_tiny_n);
+}
 void sub_000F79C0(void)
 {
+    TT_PROF_NATIVE(0xF20F79C0u);
     uint32_t ra = MEM32(esp);
     if (getenv("TT_F79LOG")) { static uint32_t ras[16], c0[16], c1[16], tl; int i; uint32_t sp0 = esp; sub_000F79C0_gen(); (void)sp0;
         for (i = 0; i < 16 && ras[i] && ras[i] != ra; i++) ; if (i < 16) { ras[i] = ra; if (eax) c1[i]++; else c0[i]++; }
@@ -12290,7 +12978,144 @@ void sub_000F79C0(void)
         if (eax == 0) eax = ra == 0x00042D05u ? 2u : 1u;
         return;
     }
+    if ((ra == 0x00042C4Eu || ra == 0x00042C09u) && tt_tiny_thr() > 0.0f) {   /* (v221) the draw walk's objects */
+        const uint32_t v = ecx, A = MEM32(esp + 4), B = MEM32(esp + 8);
+        const int sp = tt_tiny(v, A, B);
+        tt_tiny_log();
+        if (!(tt_f79_on() && tt_f79_native())) sub_000F79C0_gen();
+        if (sp && eax) eax = 0;
+        return;
+    }
+    if (tt_f79_on() && tt_f79_native()) return;   /* (v149, f79_native.inc) */
     sub_000F79C0_gen();
+}
+/* (v178) [FXCENSUS] where the effects are: every particle quad (0x48CD0) and every weapon trail (0x24C80's 13 slots
+ * at 0x1FE7C4, 0x370 apart: [+0] its points, the first at -0x35C) put in a distance bin, in camera-to-hero
+ * lengths as the pose LOD counts them: the hero's own (within 2 units of him), near him (within 1.5 lengths of him),
+ * then from the camera <1.5, <2.5, <4, more. Every 10 s. TT_FXCENSUS=0: off. */
+static int tt_fx_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TT_FXCENSUS"); on = !(e && *e == '0'); } return on; }
+static unsigned tt_fx_part[7], tt_fx_trail[7], tt_fx_trailpts[7], tt_fx_trailcalls;
+static int tt_fx_bin(float x, float y, float z)
+{
+    const uint32_t h = MEM32(0x43B15Cu), cm = MEM32(0x43B164u);
+    float ex, ey, ez, dx, dy, dz, d2, hx, hy, hz, h2, fx, fy, fz, f2;
+    if (h < 0x10000u || h >= 0x84000000u || cm < 0x10000u || cm >= 0x84000000u) return 6;
+    ex = MEMF(cm + 0x50); ey = MEMF(cm + 0x54); ez = MEMF(cm + 0x58);
+    dx = x - ex; dy = y - ey; dz = z - ez; d2 = dx * dx + dy * dy + dz * dz;
+    hx = MEMF(h + 0xF0) - ex; hy = MEMF(h + 0xF4) - ey; hz = MEMF(h + 0xF8) - ez; h2 = hx * hx + hy * hy + hz * hz;
+    fx = x - MEMF(h + 0xF0); fy = y - MEMF(h + 0xF4); fz = z - MEMF(h + 0xF8); f2 = fx * fx + fy * fy + fz * fz;
+    if (!(d2 < 1e12f) || !(h2 < 1e12f) || !(f2 < 1e12f)) return 6;
+    if (f2 < 4.0f) return 0;
+    if (f2 < 2.25f * h2) return 1;
+    if (d2 < 2.25f * h2) return 2;
+    if (d2 < 6.25f * h2) return 3;
+    if (d2 < 16.0f * h2) return 4;
+    return 5;
+}
+static void tt_fx_report(void)
+{
+    static uint32_t tl;
+    const uint32_t t = coop_now();
+    if (t - tl < 10000u) return;
+    if (tl) tt_dbg("  [FXCENSUS] in 10 s, by distance (hero's own / near him / camera <1.5 / <2.5 / <4 / more / no hero): particle quads %u %u %u %u %u %u %u; "
+                   "weapon trails (%u draws) %u %u %u %u %u %u %u, their points %u %u %u %u %u %u %u\n",
+                   tt_fx_part[0], tt_fx_part[1], tt_fx_part[2], tt_fx_part[3], tt_fx_part[4], tt_fx_part[5], tt_fx_part[6], tt_fx_trailcalls,
+                   tt_fx_trail[0], tt_fx_trail[1], tt_fx_trail[2], tt_fx_trail[3], tt_fx_trail[4], tt_fx_trail[5], tt_fx_trail[6],
+                   tt_fx_trailpts[0], tt_fx_trailpts[1], tt_fx_trailpts[2], tt_fx_trailpts[3], tt_fx_trailpts[4], tt_fx_trailpts[5], tt_fx_trailpts[6]);
+    tl = t;
+    memset(tt_fx_part, 0, sizeof tt_fx_part); memset(tt_fx_trail, 0, sizeof tt_fx_trail); memset(tt_fx_trailpts, 0, sizeof tt_fx_trailpts); tt_fx_trailcalls = 0;
+}
+extern void sub_00024C80_gen(void);
+/* (v229) TT_TRAILS=0 (the default): the weapons' swing trails not made or drawn (0x24C80, cdecl, answer unused by
+ * its callers): ~2% of the game thread in crowds. TT_TRAILS=1: drawn. */
+static int tt_trails_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TT_TRAILS"); on = e && e[0] == '1'; } return on; }
+void sub_00024C80(void)
+{
+    if (!tt_trails_on()) { esp += 4u; return; }
+    if (tt_fx_on()) {
+        uint32_t k, sl = 0x1FE7C4u;
+        tt_fx_trailcalls++;
+        for (k = 0; k < 13; k++, sl += 0x370u) {
+            const int32_t n = (int32_t)MEM32(sl);
+            if (!MEM8(sl - 19u) || n <= 0) continue;
+            {
+                const uint32_t p = sl - 0x35Cu;   /* (0x24200: its points at [ecx = slot - 0x36C] + i*0x1C + 0x10) */
+                const int b = tt_fx_bin(MEMF(p), MEMF(p + 4), MEMF(p + 8));
+                tt_fx_trail[b]++; tt_fx_trailpts[b] += (unsigned)n;
+            }
+        }
+        tt_fx_report();
+    }
+    sub_00024C80_gen();
+}
+/* (v185) DirectSound's object lock (0x12C3AD) and unlock (0x12C3E0), thiscall, natively: raise IRQL to
+ * DISPATCH unless already there ([this+4] = 1 then, [this] the old level), lower it back. In Moria the
+ * DirectSound code was ~23% of the game thread and these two 7% on their own: each went through the
+ * import table's indirect call and the kernel bridge. The same registers and memory as the lifted code
+ * leaves them (the import's bridge: eax = the old level / 0). TT_DSLOCK_NATIVE=0: the lifted ones. */
+extern void sub_0012C3AD_gen(void);
+extern void sub_0012C3E0_gen(void);
+extern unsigned char xbox_KfRaiseIrql(unsigned char);
+extern void xbox_KfLowerIrql(unsigned char);
+static inline uint32_t tt_xio_r32(uint32_t a) { extern uint32_t xbox_apu_r32(uint32_t); return (a - 0xFE800000u) < 0x80000u ? xbox_apu_r32(a) : MEM32(a); }
+static inline void tt_xio_w32(uint32_t a, uint32_t v) { extern void xbox_apu_w32(uint32_t, uint32_t); if ((a - 0xFE800000u) < 0x80000u) xbox_apu_w32(a, v); else MEM32(a) = v; }
+static int tt_dsl_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TT_DSLOCK_NATIVE"); on = !(e && *e == '0'); } return on; }
+void sub_0012C3AD(void)
+{
+    TT_PROF_NATIVE(0xF212C3ADu);
+    RecompRegs *const c = recomp_ctx();
+    const uint32_t th = c->r_ecx;
+    uint32_t a;
+    if (!tt_dsl_on() || !c->r_fs_base) { sub_0012C3AD_gen(); return; }
+    a = (uint32_t)(MEM8(c->r_fs_base + 0x24u) < 2u);
+    tt_xio_w32(th + 4u, a);
+    c->r_edx = th;
+    if (tt_xio_r32(th + 4u)) {
+        a = (uint32_t)xbox_KfRaiseIrql(2);
+        MEM8(th) = (uint8_t)a;
+        c->r_ecx = th;
+    } else c->r_ecx = (th & 0xFFFFFF00u) | 2u;
+    c->r_eax = a;
+    c->r_esp += 4u;
+}
+void sub_0012C3E0(void)
+{
+    TT_PROF_NATIVE(0xF212C3E0u);
+    RecompRegs *const c = recomp_ctx();
+    const uint32_t th = c->r_ecx;
+    if (!tt_dsl_on()) { sub_0012C3E0_gen(); return; }
+    if (tt_xio_r32(th + 4u)) {
+        const uint8_t lv = MEM8(th);
+        c->r_ecx = (th & 0xFFFFFF00u) | lv;
+        xbox_KfLowerIrql(lv);
+        c->r_eax = 0;
+        tt_xio_w32(th + 4u, tt_xio_r32(th + 4u) & 0u);
+    }
+    c->r_esp += 4u;
+}
+/* (v153) 0x48CD0, the particle quad builder, natively (n48_native.inc). TT_NATIVE_PART=0: the lifted one */
+extern void sub_00048CD0_gen(void);
+#include "n48_native.inc"
+void sub_00048CD0(void)
+{
+    TT_PROF_NATIVE(0xF2048CD0u);
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TT_NATIVE_PART"); on = !(e && *e == '0'); }
+    {   /* (v178) [FXCENSUS]; (v229) TT_FARFX=0 (the default): particle quads 2.5+ camera-to-hero lengths from the
+         * camera not built (bins 4/5: ~40% of them in Helm's Deep's explosions). TT_FARFX=1: all built. */
+        static int farfx = -1;
+        const uint32_t th = ecx;
+        if (farfx < 0) { const char *e = getenv("TT_FARFX"); farfx = e && e[0] == '1'; }
+        if ((!farfx || tt_fx_on()) && th >= 0x10000u && th < 0x84000000u) {
+            const int b = tt_fx_bin(MEMF(th + 0xA0u), MEMF(th + 0xA4u), MEMF(th + 0xA8u));
+            if (tt_fx_on()) { tt_fx_part[b]++; tt_fx_report(); }
+            /* (v230) never the bucket's first quad: its caller (0x48F30) draws [0x407E30] quads after the loop, and a
+             * draw of none crashed in 0x1181A0 (v229, Helm's Deep 2's start) */
+            if (!farfx && (b == 4 || b == 5) && (int32_t)MEM32(0x407E30u) > 0) { esp += 4u; return; }
+        }
+    }
+    if (on && tt_n48_native()) return;
+    sub_00048CD0_gen();
 }
 /* (1.9.7 debug) the scene's draw walk (0x42AF0: a node of the level's tree, its objects list at +0x4C, the moving
  * objects' list [0x3C3474] handed down the tree): which nodes hold the heroes. TT_DRAWTREE */
@@ -12427,7 +13252,188 @@ extern void sub_00084220_gen(void); void sub_00084220(void)
         { static int n; if (n++ < 20) tt_dbg("[IMPOSSIBLE] the second blow: health %d -> %d\n", h0, now); } }
     if (sw) tt_coop_leave();
 }
-extern void sub_000843F0_gen(void); void sub_000843F0(void) { int sw = tt_coop_enter(ecx, 0x000843F0u); tt_coop_p1_pre(ecx, 0x000843F0u); if (coop_probe_on()) coop_count(26); sub_000843F0_gen(); tt_coop_p1_post(); if (sw) tt_coop_leave(); }
+
+/* (v224) THE SAME RAY TWICE. 0x44760 casts a ray record (stack, filled by the caller: +0x00 .. +0x48 its start, end and
+ * mask) against the world: 0x46010 clears its answer, 0x46120 gathers the sectors it crosses (the list at 0x3C3DA8 /
+ * 0x3C3DAC), 0x46040 tests their meshes; the answer lands at +0x30 and +0x4C .. +0x6C (normal, distance, mesh, face,
+ * flags). Characters standing still ask the very same rays every frame (the ground under their feet, what is in front).
+ * A ray whose input bytes (+0x00 .. +0x30, +0x34 .. +0x4C) and caller are exactly those of one computed in the frame
+ * before is given that answer (the record's answer words, the sector list, eax/ecx/edx) instead of being cast -- every
+ * other time only: the next one is cast again, so a moving thing (a ladder) is seen at worst a frame late.
+ * TT_RAYREUSE=0: every ray cast. [RAYQ] every 10 s: rays, reused, and the callers that cast the most. */
+/* (v228) the ground's height grid walked along a line (0x43D00, the rain's drops): native_hot.c. TT_NATIVE_GRID=0: lifted */
+extern void sub_00043D00_gen(void);
+extern int tt_nat_00043D00(void);
+void sub_00043D00(void)
+{
+    if (tt_nat_00043D00()) return;
+    sub_00043D00_gen();
+}
+/* (v225) the sectors a ray crosses (0x46120), by hand for 0x44760's walk: native_hot.c */
+extern void sub_00046120_gen(void);
+extern int tt_nat_00046120(void);
+void sub_00046120(void)
+{
+    { const uint32_t ra = MEM32(esp);   /* (0x44760's walk, and 0x447xx's twin before 0x460B0: both reload all after) */
+      if ((ra == 0x0004478Eu || ra == 0x000447C7u) && tt_nat_00046120()) return; }
+    sub_00046120_gen();
+}
+extern void sub_00044760_gen(void);
+extern uint32_t tt_gframe;
+#define RQ_N 1024
+typedef struct { uint32_t ra, in[18], out[10], sl_n, sl[16], r_ax, r_cx, r_dx, f; uint8_t st; } TtRq;
+static TtRq *tt_rq;
+static struct { uint32_t ra, n, r; } tt_rq_by[16];
+static unsigned tt_rq_n, tt_rq_hit;
+static void tt_rq_count(uint32_t ra, int hit)
+{
+    int i, lo = 0;
+    tt_rq_n++; if (hit) tt_rq_hit++;
+    for (i = 0; i < 16; i++) { if (tt_rq_by[i].ra == ra) { tt_rq_by[i].n++; tt_rq_by[i].r += hit; return; } if (tt_rq_by[i].n < tt_rq_by[lo].n) lo = i; }
+    tt_rq_by[lo].ra = ra; tt_rq_by[lo].n = 1; tt_rq_by[lo].r = hit;
+}
+static void tt_rq_log(void)
+{
+    static uint32_t tl;
+    const uint32_t now = coop_now();
+    int i, j;
+    char line[512]; int o = 0;
+    if (!tl) tl = now;
+    if (now - tl < 10000u) return;
+    tl = now;
+    if (!tt_rq_n) return;
+    for (i = 0; i < 6; i++) {   /* the six that cast the most */
+        int b = -1;
+        for (j = 0; j < 16; j++) if (tt_rq_by[j].n && (b < 0 || tt_rq_by[j].n > tt_rq_by[b].n)) b = j;
+        if (b < 0) break;
+        o += snprintf(line + o, sizeof line - o, " %06X %u/%u", tt_rq_by[b].ra, tt_rq_by[b].r, tt_rq_by[b].n);
+        tt_rq_by[b].n = 0;
+    }
+    tt_dbg("[RAYQ] in 10 s: %u rays, %u reused; by caller (reused/cast):%s\n", tt_rq_n, tt_rq_hit, line);
+    memset(tt_rq_by, 0, sizeof tt_rq_by);
+    tt_rq_n = tt_rq_hit = 0;
+}
+void sub_00044760(void)
+{
+    static int on = -1;
+    const uint32_t ra = MEM32(esp), r = MEM32(esp + 4);
+    uint32_t in[18], h, i, slot;
+    TtRq *e;
+    if (on < 0) { const char *v = getenv("TT_RAYREUSE"); on = v && *v == '1';   /* (v225: off unless TT_RAYREUSE=1 -- v224's log: under 10% reused, no gain) */ if (on) { tt_rq = (TtRq *)calloc(RQ_N, sizeof(TtRq)); if (!tt_rq) on = 0; } }
+    if (!on || r < 0x10000u || r >= 0x84000000u) { sub_00044760_gen(); return; }
+    tt_rq_log();
+    for (i = 0; i < 12; i++) in[i] = MEM32(r + 4 * i);
+    for (i = 0; i < 6; i++) in[12 + i] = MEM32(r + 0x34 + 4 * i);
+    h = ra * 2654435761u;
+    for (i = 0; i < 18; i++) h = (h ^ in[i]) * 16777619u;
+    slot = (h >> 22) & (RQ_N - 1);
+    e = &tt_rq[slot];
+    if (e->st == 1 && e->ra == ra && e->f + 1u == tt_gframe && !memcmp(e->in, in, sizeof in)) {
+        /* the same ray, cast in the frame before: its answer again (and the next one cast) */
+        MEM32(r + 0x30) = e->out[0];
+        for (i = 0; i < 9; i++) MEM32(r + 0x4C + 4 * i) = e->out[1 + i];
+        MEM32(0x3C3DA8u) = e->sl_n;
+        for (i = 0; i < e->sl_n; i++) MEM32(0x3C3DACu + 4 * i) = e->sl[i];
+        eax = e->r_ax; ecx = e->r_cx; edx = e->r_dx;
+        e->st = 2; e->f = tt_gframe;
+        tt_rq_count(ra, 1);
+        esp += 4;   /* (ret) */
+        return;
+    }
+    sub_00044760_gen();
+    tt_rq_count(ra, 0);
+    {
+        const uint32_t n = MEM32(0x3C3DA8u);
+        if (n > 16u) { e->st = 0; return; }
+        e->ra = ra; memcpy(e->in, in, sizeof in);
+        e->out[0] = MEM32(r + 0x30);
+        for (i = 0; i < 9; i++) e->out[1 + i] = MEM32(r + 0x4C + 4 * i);
+        e->sl_n = n;
+        for (i = 0; i < n; i++) e->sl[i] = MEM32(0x3C3DACu + 4 * i);
+        e->r_ax = eax; e->r_cx = ecx; e->r_dx = edx;
+        e->f = tt_gframe;
+        e->st = 1;
+    }
+}
+extern void sub_000843F0_gen(void);
+/* (v222) FAR ENEMIES THINK EVERY OTHER FRAME. 0x843F0 is a character's whole step (thiscall, the frame's seconds as its
+ * one float argument, ret 4): its moves, its fighting, its reading of the world. An enemy (the characters' own vtable
+ * 0x1741C0 -- the heroes have 0x1743C8) far from the camera (over 1.5 times the camera's distance to the hero, as the
+ * pose LOD counts) and from the hero (over 1.5 times that distance from him too, like the pose LOD's near rule), standing
+ * on the ground (fall speed +0x2B4 at its resting -0.1), takes every other step: the step it skips is left out, the next
+ * gets both frames' seconds (as argument and in the frame time at 0x4B8BA0 while it runs), so it moves, fights and
+ * counts down its timers at the same pace, in steps twice as long -- as at 15 frames a second. Never in co-op, never the
+ * heroes, never one off the ground. TT_AILOD=0: every step. [AILOD] every 10 s: steps, skipped, run doubled. */
+#define TT_AI_N 1024
+static struct { uint32_t o; float acc; uint8_t skipped; } tt_ai[TT_AI_N];
+static unsigned tt_ai_n[3];
+static int tt_ai_far(uint32_t o)
+{
+    const uint32_t h = MEM32(0x43B15Cu), cm = MEM32(0x43B164u);
+    float ex, ey, ez, dx, dy, dz, hx, hy, hz, fx, fy, fz, d2, h2, v;
+    if (h < 0x10000u || h >= 0x84000000u || cm < 0x10000u || cm >= 0x84000000u || o == h) return 0;
+    if (MEM32(o) != 0x001741C0u) return 0;
+    v = MEMF(o + 0x2B4);
+    if (!(v >= -0.1001f && v <= -0.0999f)) return 0;   /* (off the ground, or not at rest on it) */
+    ex = MEMF(cm + 0x50); ey = MEMF(cm + 0x54); ez = MEMF(cm + 0x58);
+    dx = MEMF(o + 0xF0) - ex; dy = MEMF(o + 0xF4) - ey; dz = MEMF(o + 0xF8) - ez;
+    hx = MEMF(h + 0xF0) - ex; hy = MEMF(h + 0xF4) - ey; hz = MEMF(h + 0xF8) - ez;
+    d2 = dx * dx + dy * dy + dz * dz; h2 = hx * hx + hy * hy + hz * hz;
+    if (!(d2 < 1e12f) || !(h2 < 1e12f) || h2 < 1.0f) return 0;
+    fx = MEMF(o + 0xF0) - MEMF(h + 0xF0); fy = MEMF(o + 0xF4) - MEMF(h + 0xF4); fz = MEMF(o + 0xF8) - MEMF(h + 0xF8);
+    if (fx * fx + fy * fy + fz * fz < 2.25f * h2) return 0;
+    return d2 > 2.25f * h2;
+}
+static void tt_ai_log(void)
+{
+    static uint32_t tl;
+    const uint32_t now = coop_now();
+    if (!tl) tl = now;
+    if (now - tl < 10000u) return;
+    tl = now;
+    if (tt_ai_n[0]) tt_dbg("[AILOD] in 10 s: %u enemy steps, %u skipped (far), %u run with two frames' time\n", tt_ai_n[0], tt_ai_n[1], tt_ai_n[2]);
+    memset(tt_ai_n, 0, sizeof tt_ai_n);
+}
+/* 1: the step was taken care of here (skipped, or run with the time it saved) */
+static int tt_ai_lod(void)
+{
+    static int on = -1;
+    const uint32_t o = ecx;
+    unsigned i, k;
+    if (on < 0) { const char *e = getenv("TT_AILOD"); on = e && *e == '1'; }   /* (v223: off unless TT_AILOD=1 -- v222's log: only ~5% of the enemy steps were far enough, no gain to see, and more stutter) */
+    if (!on || coop_p2 || o < 0x10000u || o >= 0x84000000u) return 0;
+    if (MEM32(o) != 0x001741C0u) return 0;
+    tt_ai_n[0]++;
+    tt_ai_log();
+    i = ((o >> 4) * 2654435761u) >> 22;   /* (10 bits) */
+    for (k = 0; k < 8; k++, i = (i + 1) & (TT_AI_N - 1)) if (tt_ai[i].o == o || !tt_ai[i].o) break;
+    if (k == 8) return 0;
+    if (tt_ai[i].o != o) { tt_ai[i].o = o; tt_ai[i].acc = 0.0f; tt_ai[i].skipped = 0; }
+    {
+        const float dt = MEMF(esp + 4);
+        if (!(dt > 0.0f && dt < 0.25f)) { tt_ai[i].skipped = 0; tt_ai[i].acc = 0.0f; return 0; }
+        if (!tt_ai[i].skipped) {
+            if (!tt_ai_far(o)) return 0;
+            tt_ai[i].skipped = 1; tt_ai[i].acc = dt;
+            tt_ai_n[1]++;
+            esp += 8;   /* (its ret 4) */
+            return 1;
+        }
+        {   /* the step after a skipped one: both frames' time */
+            const float sum = dt + tt_ai[i].acc;
+            const uint32_t gk = MEM32(0x4B8BA0u);
+            const int glob = MEMF(0x4B8BA0u) == dt;
+            tt_ai[i].skipped = 0; tt_ai[i].acc = 0.0f;
+            MEMF(esp + 4) = sum;
+            if (glob) MEMF(0x4B8BA0u) = sum;
+            sub_000843F0_gen();
+            if (glob) MEM32(0x4B8BA0u) = gk;
+            tt_ai_n[2]++;
+            return 1;
+        }
+    }
+}
+void sub_000843F0(void) { int sw = tt_coop_enter(ecx, 0x000843F0u); tt_coop_p1_pre(ecx, 0x000843F0u); if (coop_probe_on()) coop_count(26); if (!tt_ai_lod()) sub_000843F0_gen(); tt_coop_p1_post(); if (sw) tt_coop_leave(); }
 extern void sub_00085340_gen(void); void sub_00085340(void) { if (getenv("TT_SETPOSLOG") && ecx == coop_first_char && coop_first_char >= 0x10000u) { uint32_t m = MEM16(esp + 4), d = MEM32(esp + 8); if (1) { static uint32_t ras[8], cnt[8], tl; int i; uint32_t ra = MEM32(esp) ^ (m << 24); for (i = 0; i < 8 && ras[i] && ras[i] != ra; i++) ; if (i < 8) { ras[i] = ra; cnt[i]++; } if (coop_now() - tl > 3000u) { tl = coop_now(); tt_dbg("[POSMSG] msg %X data %08X pos %.1f %.1f %.1f; senders:", m, d, MEMF(d + 0x18), MEMF(d + 0x1C), MEMF(d + 0x20)); for (i = 0; i < 8 && ras[i]; i++) tt_dbg(" %06X x%u", ras[i], cnt[i]); tt_dbg(" | stack %08X %08X %08X %08X %08X %08X\n", MEM32(esp + 12), MEM32(esp + 16), MEM32(esp + 20), MEM32(esp + 24), MEM32(esp + 28), MEM32(esp + 32)); } } } int sw = tt_coop_enter(ecx, 0x00085340u); tt_coop_p1_pre(ecx, 0x00085340u); if (coop_probe_on()) coop_count(27); sub_00085340_gen(); tt_coop_p1_post(); if (sw) tt_coop_leave(); }
 extern void sub_00086120_gen(void); void sub_00086120(void) { int sw = tt_coop_enter(ecx, 0x00086120u); tt_coop_p1_pre(ecx, 0x00086120u); if (coop_probe_on()) coop_count(28); sub_00086120_gen(); tt_coop_p1_post(); if (sw) tt_coop_leave(); }
 extern void sub_00086140_gen(void); void sub_00086140(void) { int sw = tt_coop_enter(ecx, 0x00086140u); tt_coop_p1_pre(ecx, 0x00086140u); if (coop_probe_on()) coop_count(29); sub_00086140_gen(); tt_coop_p1_post(); if (sw) tt_coop_leave(); }
@@ -13108,6 +14114,123 @@ void sub_0002D5C0(void)
     sub_0002D5C0_gen();
 }
 
+/* (v154, PS Vita speed) the skeleton's pose (0x2CA60, thiscall: the skinned object, its time, a flag; ret 8): its bones'
+ * matrices into the object's own buffer (+0x5E0, made for it alone at 0x28090), [+0x90] set once done -- the frame's
+ * later calls (the shadow, the draw) take them as they are. 11-12% of the game thread in a crowd. A pose LOD: a figure
+ * far from the camera (its owner [+0x11C] at +0xF0 more than 2 times as far as the hero; v154: 2.5) keeps the pose it has
+ * every other time it is asked anew (more than 4 times as far: two times in three) -- the lifted function is called with
+ * [+0x90] already set, its own "done" path. Never for the heroes; only for a figure whose pose was made last time into
+ * the same buffer, of the same model. TT_ANIMLOD=0: every pose made. */
+extern void sub_0002CA60_gen(void);
+#define TT_AL_N 512
+static struct { uint32_t o, buf, mdl; uint8_t skip, made; } tt_al[TT_AL_N];
+static unsigned tt_al_skipped, tt_al_made, tt_al_nofig;
+static uint32_t tt_bc_fn[2][16], tt_bc_n[2][16], tt_bc_poses, tt_bc_bones;   /* (v172) */
+unsigned tt_al_hist[6], tt_al_why[3];
+static int tt_al_far(uint32_t o, uint32_t wm)
+{
+    /* (v157) where the figure is: the world matrix it is posed for -- 0x2CA60's first argument, the same one 0x2D5C0
+     * multiplies the bones by (row-major, translation at +0x30); v154-v156 read [+0x11C], which is 0 on these */
+    const uint32_t h = MEM32(0x43B15Cu), cm = MEM32(0x43B164u);
+    float ex, ey, ez, dx, dy, dz, d2, hx, hy, hz, h2;
+    (void)o;
+    if (wm < 0x10000u || wm >= 0x84000000u || h < 0x10000u || h >= 0x84000000u || cm < 0x10000u || cm >= 0x84000000u) {
+        extern unsigned tt_al_why[3];
+        tt_al_nofig++; tt_al_why[(wm < 0x10000u || wm >= 0x84000000u) ? 0 : (h < 0x10000u || h >= 0x84000000u) ? 1 : 2]++;
+        return 0;
+    }
+    ex = MEMF(cm + 0x50); ey = MEMF(cm + 0x54); ez = MEMF(cm + 0x58);
+    dx = MEMF(wm + 0x30) - ex; dy = MEMF(wm + 0x34) - ey; dz = MEMF(wm + 0x38) - ez;
+    hx = MEMF(h + 0xF0) - ex; hy = MEMF(h + 0xF4) - ey; hz = MEMF(h + 0xF8) - ez;
+    d2 = dx * dx + dy * dy + dz * dz; h2 = hx * hx + hy * hy + hz * hz;
+    if (!(d2 < 1e12f) || !(h2 < 1e12f) || h2 < 1.0f) return 0;   /* (not numbers, or the camera on the hero: never far) */
+    if (coop_p2 >= 0x10000u && coop_p2 < 0x84000000u) {   /* (the second hero: never) */
+        float px = MEMF(wm + 0x30) - MEMF(coop_p2 + 0xF0), py = MEMF(wm + 0x34) - MEMF(coop_p2 + 0xF4), pz = MEMF(wm + 0x38) - MEMF(coop_p2 + 0xF8);
+        if (px * px + py * py + pz * pz < 4.0f) return 0;
+    }
+    {   /* (v155, [ANIMLOD]) how far the figures are, in camera-to-hero distances: <1 <1.5 <2 <3 <4 more */
+        extern unsigned tt_al_hist[6];
+        float r = d2 / h2;
+        tt_al_hist[r < 1.0f ? 0 : r < 2.25f ? 1 : r < 4.0f ? 2 : r < 9.0f ? 3 : r < 16.0f ? 4 : 5]++;
+    }
+    {   /* (v165) further in: a crowd stands within twice the hero's distance (v157's histogram: 90% under 2x), and the
+         * poses were 20% of the game thread in the crowded level (v164). Past the hero's own distance a pose every
+         * other time, past 2x two in three, past 4x three in four. TT_ANIMLOD=1: v161's steps (2x / 4x). */
+        static int mode = -1;
+        if (mode < 0) { const char *e = getenv("TT_ANIMLOD"); mode = (e && *e == '1') ? 1 : (e && *e == '3') ? 3 : 2; }
+        if (mode == 1) { if (d2 > 16.0f * h2) return 2; return d2 > 4.0f * h2 ? 1 : 0; }
+        {   /* (v166) near the hero -- within 1.5 times the camera's distance to him, wherever the camera is -- always whole:
+             * v165 counted from the camera alone, and the ones just behind the hero, fighting him, went every other frame
+             * (the user: too close, and still jerky when he walked up to them) */
+            const float fx = MEMF(wm + 0x30) - MEMF(h + 0xF0), fy = MEMF(wm + 0x34) - MEMF(h + 0xF4), fz = MEMF(wm + 0x38) - MEMF(h + 0xF8);
+            if (fx * fx + fy * fy + fz * fz < 2.25f * h2) return 0;
+        }
+        if (mode == 3) {   /* (v223) TT_ANIMLOD=3: the middle distance whole too -- every other pose only past 2.5x, two in three past 4x, three in four past 6x */
+            if (d2 > 36.0f * h2) return 3;
+            if (d2 > 16.0f * h2) return 2;
+            return d2 > 6.25f * h2 ? 1 : 0;
+        }
+        if (d2 > 16.0f * h2) return 3;
+        if (d2 > 6.25f * h2) return 2;
+        return d2 > 2.25f * h2 ? 1 : 0;
+    }
+}
+void sub_0002CA60(void)
+{
+    static int on = -1;
+    const uint32_t o = ecx;
+    if (on < 0) { const char *e = getenv("TT_ANIMLOD"); on = !(e && *e == '0'); }
+    if (on && o >= 0x10000u && o < 0x84000000u && MEM8(o + 0x90u) == 0) {
+        const uint32_t buf = MEM32(o + 0x5E0u), mdl = MEM32(o + 0x58u);
+        unsigned i = ((o >> 4) * 2654435761u) >> 23, k;   /* (9 bits) */
+        for (k = 0; k < 8; k++, i = (i + 1) & (TT_AL_N - 1)) if (tt_al[i].o == o || !tt_al[i].o) break;
+        if (k < 8) {
+            int far = tt_al_far(o, MEM32(esp + 4));
+            if (tt_al[i].o == o && tt_al[i].made && tt_al[i].buf == buf && tt_al[i].mdl == mdl && far && tt_al[i].skip < (unsigned)far) {
+                tt_al[i].skip++;
+                tt_al_skipped++;
+                MEM8(o + 0x90u) = 1;   /* (the pose made last time stands) */
+                sub_0002CA60_gen();
+                return;
+            }
+            tt_al[i].o = o; tt_al[i].buf = buf; tt_al[i].mdl = mdl; tt_al[i].skip = 0; tt_al[i].made = 1;
+            tt_al_made++;
+        }
+    }
+    {   /* (v172) [BONES] which functions sample the bones' tracks ([+0x5E4] per bone: rotation, position), for a native pose */
+        static int cen = -1;
+        if (cen < 0) { const char *e = getenv("TT_BONECENSUS"); cen = !(e && *e == '0'); }
+        if (cen && o >= 0x10000u && o < 0x84000000u && MEM8(o + 0x90u) == 0) {
+            const uint32_t m = MEM32(o + 0x58u), t = MEM32(o + 0x5E4u);
+            if (m >= 0x10000u && m < 0x84000000u && t >= 0x10000u && t < 0x84000000u) {
+                const uint32_t h = MEM32(m + 8u), nb = (h < 0x1000000u) ? MEM32(m + h + 8u) : 0;
+                uint32_t j, q;
+                tt_bc_poses++;
+                if (nb <= 128u) for (j = 0; j < nb; j++) for (q = 0; q < 2; q++) {
+                    const uint32_t f = MEM32(t + j * 8u + q * 4u);
+                    int z;
+                    for (z = 0; z < 16 && tt_bc_fn[q][z] && tt_bc_fn[q][z] != f; z++) ;
+                    if (z < 16) { tt_bc_fn[q][z] = f; tt_bc_n[q][z]++; }
+                }
+                tt_bc_bones += nb <= 128u ? nb : 0;
+            }
+        }
+    }
+    sub_0002CA60_gen();
+    {   /* ([ANIMLOD] every 10 s) */
+        static uint32_t tl;
+        uint32_t t = coop_now();
+        if (t - tl > 10000u) { if (tl && on) tt_dbg("  [ANIMLOD] in 10 s: %u poses made, %u kept from the time before (far figures); %u without a figure or camera (matrix %u, hero %u, camera %u); distance in camera-hero lengths <1 %u, <1.5 %u, <2 %u, <3 %u, <4 %u, more %u\n",
+            tt_al_made, tt_al_skipped, tt_al_nofig, tt_al_why[0], tt_al_why[1], tt_al_why[2], tt_al_hist[0], tt_al_hist[1], tt_al_hist[2], tt_al_hist[3], tt_al_hist[4], tt_al_hist[5]);
+            if (tl && tt_bc_poses) { char bb[700]; int q2 = 0, z, w;
+                for (w = 0; w < 2; w++) { q2 += snprintf(bb + q2, sizeof bb - q2, w ? "; positions" : " rotations");
+                    for (z = 0; z < 16 && tt_bc_fn[w][z]; z++) q2 += snprintf(bb + q2, sizeof bb - q2, " %08X x%u", tt_bc_fn[w][z], tt_bc_n[w][z]); }
+                tt_dbg("  [BONES] in 10 s: %u poses, %u bones;%s\n", tt_bc_poses, tt_bc_bones, bb); }
+            tt_bc_poses = tt_bc_bones = 0; memset(tt_bc_fn, 0, sizeof tt_bc_fn); memset(tt_bc_n, 0, sizeof tt_bc_n);
+            tl = t; tt_al_made = tt_al_skipped = tt_al_nofig = 0; memset(tt_al_hist, 0, sizeof tt_al_hist); memset(tt_al_why, 0, sizeof tt_al_why); }
+    }
+}
+
 /* (1.9.8) player 2's own sword: the HUD's health update (0xCCF30: the green fill, the red under it, the silver strip
  * and its teeth -- from the health [0x4ACB80], the most [0x4ACB14] and the hero's record) run a second time each frame
  * for player 2, in his context (his record), on his own copy of the sword's elements and its state, which is kept
@@ -13347,4 +14470,233 @@ void sub_000181C0(void)
     if (getenv("TT_SETPOSLOG") && ecx == coop_first_char && coop_first_char >= 0x10000u) { static uint32_t ras[8], cnt[8], tl; int i; uint32_t ra = MEM32(esp); for (i = 0; i < 8 && ras[i] && ras[i] != ra; i++) ; if (i < 8) { ras[i] = ra; cnt[i]++; }
         if (coop_now() - tl > 3000u) { tl = coop_now(); tt_dbg("[SETPOS2] callers:"); for (i = 0; i < 8 && ras[i]; i++) tt_dbg(" %06X x%u", ras[i], cnt[i]); tt_dbg("\n"); } }
     sub_000181C0_gen();
+}
+
+/* (v107, PS Vita speed) the line-triangle test and the six stages of a
+ * character's shadow volume written by hand: src/native_hot.c (the entry
+ * points stay here, where the recompiler's override scan looks) */
+#define TT_NAT(a) extern void tt_nat_##a(void); void sub_##a(void) { tt_nat_##a(); }
+TT_NAT(0003FD30)
+TT_NAT(000458D0)
+TT_NAT(0002FA10)
+TT_NAT(0002FAC0)
+TT_NAT(0002FCA0)
+TT_NAT(0002FD30)
+TT_NAT(0002FE40)
+TT_NAT(0002FED0)
+#undef TT_NAT
+
+/* ---- (v132) the films on the Vita's video decoder (hwmovie.c) ----
+ * Bink's calls from the game's film loop (0x000E8B70), all stdcall:
+ * BinkOpen 0x0013E9E0 (name, flags), BinkDoFrame 0x00140190 (bink),
+ * BinkCopyToBuffer 0x0013F950 (bink, dest, pitch, height, x, y, flags),
+ * BinkClose 0x00140990 (bink), BinkSetVolume 0x00140CD0 (bink, track, vol).
+ * HBINK: +8 frames, +0xC the frame now, +0x14 / +0x18 the rate. */
+#if defined(__vita__)
+extern int hwm_open(const char *name);
+extern int hwm_have(const char *name);
+extern int hwm_placeholder_ok(void);
+extern void hwm_set_loop(int on);
+extern int hwm_active(void);
+extern int hwm_wait_frame(uint32_t frame, uint32_t num, uint32_t den);
+extern void hwm_copy(uint8_t *dst, uint32_t guest, uint32_t pitch, uint32_t height);
+extern void hwm_close(void);
+extern void sub_0013E9E0_gen(void);
+extern void sub_00140190_gen(void);
+extern void sub_0013F950_gen(void);
+extern void sub_00140990_gen(void);
+extern void sub_00140CD0_gen(void);
+static uint32_t tt_hwm_bink;
+/* (v142) A film with an .mp4 does not need its .bik: Bink opens a small
+ * placeholder instead (game_files/_hwm.bik, a copy of death.bik: no sound,
+ * 24 frames), so the game gets a real HBINK for its loop, and the film's own
+ * frame count is made "endless" -- the player says when it ends. Bink never
+ * reads past the placeholder's frames: BinkNextFrame is ours for it too. */
+static int tt_hwm_fake;
+void sub_0013E9E0(void)
+{
+    char nm[128];
+    uint32_t np = MEM32(esp + 4), flags = MEM32(esp + 8), i, len;
+    int fake = 0;
+    for (i = 0; np && i < sizeof nm - 1 && MEM8(np + i); i++) nm[i] = (char)MEM8(np + i);
+    nm[i] = 0; len = i;
+    hwm_set_loop((flags & 0x04000000u) != 0);   /* (the second film player, 0x000E9200, plays its film round and round) */
+    if (nm[0] && len >= 11 && hwm_have(nm) && hwm_placeholder_ok()) {
+        static const char ph[] = "d:\\_hwm.bik";
+        for (i = 0; i <= sizeof ph - 1; i++) MEM8(np + i) = (uint8_t)ph[i];
+        fake = 1;
+    }
+    sub_0013E9E0_gen();
+    if (fake) {
+        uint32_t h = eax;
+        for (i = 0; i <= len; i++) MEM8(np + i) = (uint8_t)nm[i];   /* (the game's own name back) */
+        if (h) { MEM32(h + 8) = 0x7FFFFFF0u; tt_dbg("  [HWMOVIE] %s: its .bik not opened (the placeholder stands in)\n", nm); }
+        else tt_dbg("  [HWMOVIE] the placeholder _hwm.bik did not open\n");
+    }
+    tt_hwm_fake = 0;
+    if (eax && nm[0] && hwm_open(nm)) { tt_hwm_bink = eax; tt_hwm_fake = fake; }
+    else if (eax && fake) MEM32(eax + 8) = 2;   /* (no player after all: the film ends at once) */
+}
+extern void sub_001407D0_gen(void);
+void sub_001407D0(void)   /* BinkNextFrame (bink), ret 4 */
+{
+    uint32_t b = MEM32(esp + 4);
+    if (b && b == tt_hwm_bink && tt_hwm_fake) {
+        MEM32(b + 0xC) = MEM32(b + 0xC) + 1;
+        eax = 0;
+        esp += 8;
+        return;
+    }
+    sub_001407D0_gen();
+}
+void sub_00140190(void)
+{
+    uint32_t b = MEM32(esp + 4);
+    if (b && b == tt_hwm_bink && hwm_active()) {
+        uint32_t frames = MEM32(b + 8);
+        if (hwm_wait_frame(MEM32(b + 0xC), MEM32(b + 0x14), MEM32(b + 0x18)) && frames >= 2)
+            MEM32(b + 0xC) = frames - 2;   /* (the film's end: the next BinkNextFrame makes it frames - 1, where the loop stops) */
+        eax = 0;
+        esp += 8;   /* ret 4 */
+        return;
+    }
+    sub_00140190_gen();
+}
+void sub_0013F950(void)
+{
+    uint32_t b = MEM32(esp + 4);
+    if (b && b == tt_hwm_bink && hwm_active()) {
+        uint32_t dest = MEM32(esp + 8), pitch = MEM32(esp + 12), height = MEM32(esp + 16);
+        if (dest && pitch >= 4 && pitch <= 8192 && height && height <= 1088)
+            hwm_copy((uint8_t *)XBOX_PTR(dest), dest, pitch, height);
+        eax = 0;
+        esp += 32;   /* ret 28 */
+        return;
+    }
+    sub_0013F950_gen();
+}
+void sub_00140CD0(void)
+{
+    uint32_t b = MEM32(esp + 4);
+    if (b && b == tt_hwm_bink) MEM32(esp + 12) = 0;   /* (its sound comes from the player) */
+    sub_00140CD0_gen();
+}
+void sub_00140990(void)
+{
+    uint32_t b = MEM32(esp + 4);
+    if (b && b == tt_hwm_bink) { hwm_close(); tt_hwm_bink = 0; tt_hwm_fake = 0; }
+    sub_00140990_gen();
+}
+#endif
+
+/* ---- (v147) DirectSound setters called again with the same values ----
+ * The game's sound manager sets every voice's 3D parameters, volume and
+ * pitch every frame through DirectSound's C entry points (0x13495E ...
+ * 0x134C45, stdcall, the buffer first): each call takes DirectSound's lock
+ * (and IRQL), recomputes and rewrites the voice's sound-chip registers --
+ * 15% of the game thread in a crowd. A call with the same arguments as the
+ * last one on the same buffer, under half a second ago, changes nothing and
+ * is answered S_OK here. An argument that may be a pointer (a getter's out
+ * value, a struct) is never compared: such calls always go through. Every
+ * value is applied again at least twice a second (a buffer let go and made
+ * again at the same address gets its settings). TT_DSDEDUP=0: all go through.
+ * [DSDEDUP] every 10 s: calls and those answered here. */
+extern __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
+static struct { uint32_t fn, obj, a[4]; uint32_t t; } tt_dsd[2048];
+static unsigned tt_dsd_calls, tt_dsd_skips; static unsigned long long tt_dsd_t0;
+static int tt_dsd_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TT_DSDEDUP"); on = !(e && *e == '0'); } return on; }
+static int tt_dsd_ptrlike(uint32_t v) { return (v >= 0x00010000u && v < 0x04000000u) || (v >= 0x80000000u && v < 0x84000000u); }
+static int tt_dsd_skip(uint32_t fn, int n)
+{
+    uint32_t obj = MEM32(esp + 4), a[4] = { 0, 0, 0, 0 }, h, now;
+    int i;
+    unsigned long long t64 = GetTickCount64();
+    tt_dsd_calls++;
+    if (!tt_dsd_t0) tt_dsd_t0 = t64;
+    if (t64 - tt_dsd_t0 >= 10000) {
+        tt_dbg("  [DSDEDUP] in %llu ms: %u DirectSound setter calls, %u answered here (same values)\n", t64 - tt_dsd_t0, tt_dsd_calls, tt_dsd_skips);
+        tt_dsd_t0 = t64; tt_dsd_calls = tt_dsd_skips = 0;
+    }
+    if (!tt_dsd_on() || !obj) return 0;
+    for (i = 0; i < n - 1 && i < 4; i++) { a[i] = MEM32(esp + 8 + 4 * i); if (tt_dsd_ptrlike(a[i])) return 0; }
+    now = (uint32_t)t64;
+    h = ((obj >> 2) * 2654435761u ^ fn * 40503u) >> 21 & 2047u;
+    if (tt_dsd[h].fn == fn && tt_dsd[h].obj == obj && now - tt_dsd[h].t < 500u
+        && tt_dsd[h].a[0] == a[0] && tt_dsd[h].a[1] == a[1] && tt_dsd[h].a[2] == a[2] && tt_dsd[h].a[3] == a[3]) {
+        tt_dsd_skips++;
+        return 1;
+    }
+    tt_dsd[h].fn = fn; tt_dsd[h].obj = obj; tt_dsd[h].t = now;
+    tt_dsd[h].a[0] = a[0]; tt_dsd[h].a[1] = a[1]; tt_dsd[h].a[2] = a[2]; tt_dsd[h].a[3] = a[3];
+    return 0;
+}
+#define TT_DSD(addr, n) extern void sub_##addr##_gen(void); \
+    void sub_##addr(void) { if (tt_dsd_skip(0x##addr##u, n)) { eax = 0; esp += 4u + 4u * (n); return; } sub_##addr##_gen(); }
+TT_DSD(0013495E, 3)
+TT_DSD(0013499D, 4)
+TT_DSD(001349E0, 3)
+TT_DSD(00134A1F, 2)
+TT_DSD(00134A5A, 3)
+TT_DSD(00134A99, 3)
+TT_DSD(00134AB9, 3)
+TT_DSD(00134AF8, 2)
+TT_DSD(00134B33, 3)
+TT_DSD(00134B72, 2)
+TT_DSD(00134BD8, 3)
+TT_DSD(00134C0B, 5)
+TT_DSD(00134C45, 4)
+
+/* (v168) the same for the mixbin calls (0x129F79 and 0x129F95: the buffer, a {count, pairs} struct; stdcall 8): the
+ * game's sound manager (0xEC3C0) sets every voice's five mixbin volumes each frame, with the same values most of the
+ * time -- 10% of the game thread in the crowded level went to its sound update. The struct's contents compared
+ * (up to 8 pairs), the same half-second rule. TT_DSDEDUP=0: all through. */
+static struct { uint32_t fn, obj, n, pr[16]; uint32_t t; } tt_mix[512];
+static unsigned tt_mix_calls, tt_mix_skips;
+static int tt_mix_skip(uint32_t fn)
+{
+    const uint32_t obj = MEM32(esp + 4), st = MEM32(esp + 8);
+    uint32_t n, pp, pr[16], h, now, i;
+    tt_mix_calls++;
+    {   /* ([MIXDEDUP] every 10 s) */
+        static unsigned long long t0;
+        unsigned long long t64 = GetTickCount64();
+        if (!t0) t0 = t64;
+        if (t64 - t0 >= 10000) { tt_dbg("  [MIXDEDUP] in %llu ms: %u mixbin calls, %u answered here (same values)\n", t64 - t0, tt_mix_calls, tt_mix_skips); t0 = t64; tt_mix_calls = tt_mix_skips = 0; }
+    }
+    if (!tt_dsd_on() || !obj || st < 0x10000u || st >= 0x84000000u) return 0;
+    n = MEM32(st); pp = MEM32(st + 4);
+    if (n == 0 || n > 8 || pp < 0x10000u || pp >= 0x84000000u) return 0;
+    for (i = 0; i < 2 * n; i++) pr[i] = MEM32(pp + 4 * i);
+    now = (uint32_t)GetTickCount64();
+    h = ((obj >> 2) * 2654435761u ^ fn * 40503u) >> 23 & 511u;
+    if (tt_mix[h].fn == fn && tt_mix[h].obj == obj && tt_mix[h].n == n && now - tt_mix[h].t < 500u && !memcmp(tt_mix[h].pr, pr, 8u * n)) {
+        tt_mix_skips++;
+        return 1;
+    }
+    tt_mix[h].fn = fn; tt_mix[h].obj = obj; tt_mix[h].n = n; tt_mix[h].t = now; memcpy(tt_mix[h].pr, pr, 8u * n);
+    return 0;
+}
+#define TT_MIX(addr) extern void sub_##addr##_gen(void); \
+    void sub_##addr(void) { if (tt_mix_skip(0x##addr##u)) { eax = 0; esp += 12u; return; } sub_##addr##_gen(); }
+TT_MIX(00129F79)
+TT_MIX(00129F95)
+
+/* (v149) 0x000FF7BC, the CRT's _ftol2: st(0) to a 64-bit integer, toward
+ * zero, in edx:eax (1.2% of the game thread: every float made an integer).
+ * Out of range or not a number: 0x8000000000000000, as the x87's fistp.
+ * The frame registers as the lifted one leaves them. TT_NATIVE_FTOL=0: lifted. */
+extern void sub_000FF7BC_gen(void);
+void sub_000FF7BC(void)
+{
+    static int on = -1;
+    double x;
+    int64_t r;
+    if (__builtin_expect(on < 0, 0)) { const char *e = getenv("TT_NATIVE_FTOL"); on = !(e && *e == '0'); }
+    if (!on) { sub_000FF7BC_gen(); return; }
+    x = g_fp_stack[g_fp_top & 7u];
+    r = (x > -9223372036854775808.0 && x < 9223372036854775808.0) ? (int64_t)x : INT64_MIN;
+    eax = (uint32_t)(uint64_t)r; edx = (uint32_t)((uint64_t)r >> 32);
+    g_fp_top = (g_fp_top + 1u) & 7u;   /* (v150: it takes its value off the x87 stack, as the lifted one -- v149 left it on: every float after it read wrong) */
+    g_ebp = g_seh_ebp = esp - 4u;
+    esp += 4;
 }

@@ -428,11 +428,20 @@ void recomp_trace_esp(const char *name, const char *tag);
  */
 extern uintptr_t g_xbox_region_base[256];
 extern uint32_t  g_xbox_region_mask[256];
+#if !defined(RECOMP_COMPACT_MASKED)
+/* (v93) one load and one add: g_xbox_region_lin (xbox_memory_layout.c) */
+extern uintptr_t g_xbox_region_lin[256];
+static inline uintptr_t recomp_xbox_ptr(uint32_t a)
+{
+    return g_xbox_region_lin[a >> 24] + (uintptr_t)a;
+}
+#else
 static inline uintptr_t recomp_xbox_ptr(uint32_t a)
 {
     uint32_t i = a >> 24;
     return g_xbox_region_base[i] + (uintptr_t)(a & g_xbox_region_mask[i]);
 }
+#endif
 #define XBOX_PTR(addr) recomp_xbox_ptr((uint32_t)(addr))
 #else
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
@@ -595,6 +604,20 @@ static inline RecompXmm XMM_MEM(uint32_t addr) {
 static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
     _mm_storeu_ps((float *)XBOX_PTR(addr), xmm_v(v));
 }
+#elif defined(__vita__) && !defined(RECOMP_XMM_PORTABLE)
+/* (PS Vita, v74) NEON: one 16-byte load or store, and add / subtract /
+ * multiply on all four lanes at once (NEON flushes denormals to zero; the
+ * rest -- division, min/max, square roots -- stays lane-wise IEEE) */
+#define RECOMP_XMM_NEON 1
+#include <arm_neon.h>
+static inline float32x4_t xmm_n(RecompXmm a) { float32x4_t v; memcpy(&v, &a, 16); return v; }
+static inline RecompXmm xmm_rn(float32x4_t v) { RecompXmm r; memcpy(&r, &v, 16); return r; }
+static inline RecompXmm XMM_MEM(uint32_t addr) {
+    return xmm_rn(vld1q_f32((const float *)XBOX_PTR(addr)));
+}
+static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
+    vst1q_f32((float *)XBOX_PTR(addr), xmm_n(v));
+}
 #else
 static inline RecompXmm XMM_MEM(uint32_t addr) {
     RecompXmm r;
@@ -656,9 +679,15 @@ static inline RecompXmm XMM_MIN(RecompXmm a, RecompXmm b) { return xmm_r(_mm_min
 static inline RecompXmm XMM_MAX(RecompXmm a, RecompXmm b) { return xmm_r(_mm_max_ps(xmm_v(a), xmm_v(b))); }
 static inline RecompXmm XMM_SQRT(RecompXmm a, RecompXmm b) { (void)a; return xmm_r(_mm_sqrt_ps(xmm_v(b))); }
 #else
+#if defined(RECOMP_XMM_NEON)
+static inline RecompXmm XMM_ADD(RecompXmm a, RecompXmm b) { return xmm_rn(vaddq_f32(xmm_n(a), xmm_n(b))); }
+static inline RecompXmm XMM_SUB(RecompXmm a, RecompXmm b) { return xmm_rn(vsubq_f32(xmm_n(a), xmm_n(b))); }
+static inline RecompXmm XMM_MUL(RecompXmm a, RecompXmm b) { return xmm_rn(vmulq_f32(xmm_n(a), xmm_n(b))); }
+#else
 RECOMP_XMM_LANEWISE(XMM_ADD, a.f[i] + b.f[i])
 RECOMP_XMM_LANEWISE(XMM_SUB, a.f[i] - b.f[i])
 RECOMP_XMM_LANEWISE(XMM_MUL, a.f[i] * b.f[i])
+#endif
 RECOMP_XMM_LANEWISE(XMM_DIV, a.f[i] / b.f[i])
 /* MINPS/MAXPS return the second operand when the lanes are unordered or
  * equal -- that is the hardware's tie-break, not a C fmin/fmax. */
@@ -669,6 +698,126 @@ RECOMP_XMM_LANEWISE(XMM_SQRT, sqrtf(b.f[i]))
 #endif
 RECOMP_XMM_LANEWISE(XMM_RSQRT, 1.0f / sqrtf(b.f[i]))
 RECOMP_XMM_LANEWISE(XMM_RCP, 1.0f / b.f[i])
+
+/* ================================================================
+ * (v107, postproc_fast.py) faster forms the post-pass puts in the lifted
+ * functions it can follow.
+ *
+ * K accessors: the guest stack and constant addresses are always in guest
+ * RAM, and RAM is one host block -- host = _k0 + va, with _k0 a local the
+ * pass declares in each function (no slice lookup: a shift and a table
+ * load less on every such access).
+ *
+ * XL: the SSE registers as locals of the host's vector type inside a
+ * function (written back to the register file around calls, like the
+ * integer registers): the lifted form kept them in memory, each operation
+ * a load of both operands, a store of the result and a 16-byte copy.
+ * ================================================================ */
+#if defined(RECOMP_COMPACT_GUEST)
+#define RECOMP_K0 (g_xbox_region_lin[0])
+#else
+#define RECOMP_K0 ((uintptr_t)g_xbox_mem_offset)
+#endif
+#define RECOMP_KP(addr) (_k0 + (uintptr_t)(uint32_t)(addr))
+#if defined(__vita__)
+#define KMEM8(addr)   (*(volatile uint8_t  *)RECOMP_KP(addr))
+#define KMEM16(addr)  (*(volatile uint16_t *)RECOMP_KP(addr))
+#define KMEM32(addr)  (*(volatile uint32_t *)RECOMP_KP(addr))
+#define KSMEM8(addr)  (*(volatile int8_t   *)RECOMP_KP(addr))
+#define KSMEM16(addr) (*(volatile int16_t  *)RECOMP_KP(addr))
+#define KSMEM32(addr) (*(volatile int32_t  *)RECOMP_KP(addr))
+#define KSMEM64(addr) (((recomp_s64_t *)RECOMP_KP(addr))->v)
+#define KMEMF(addr)   (((recomp_f32_t *)RECOMP_KP(addr))->v)
+#define KMEMD(addr)   (((recomp_f64_t *)RECOMP_KP(addr))->v)
+#else
+#define KMEM8(addr)   MEM8(addr)
+#define KMEM16(addr)  MEM16(addr)
+#define KMEM32(addr)  MEM32(addr)
+#define KSMEM8(addr)  SMEM8(addr)
+#define KSMEM16(addr) SMEM16(addr)
+#define KSMEM32(addr) SMEM32(addr)
+#define KSMEM64(addr) SMEM64(addr)
+#define KMEMF(addr)   MEMF(addr)
+#define KMEMD(addr)   MEMD(addr)
+#undef RECOMP_KP
+#define RECOMP_KP(addr) ((void)_k0, XBOX_PTR(addr))
+#endif
+#define KPUSH32(sp, val) do { \
+    uint32_t _pv = (uint32_t)(val); \
+    (sp) -= 4; \
+    KMEM32(sp) = _pv; \
+} while(0)
+#define KPOP32(sp, dst) do { \
+    (dst) = KMEM32(sp); \
+    (sp) += 4; \
+} while(0)
+
+#if defined(__GNUC__)
+#define RECOMP_XL 1
+typedef uint32_t rxm_t __attribute__((vector_size(16)));
+#if defined(RECOMP_XMM_NEON)
+typedef float32x4_t rxl_t;
+#define XL_IN(g)        vld1q_f32((g).f)
+#define XL_OUT(g, x)    vst1q_f32((g).f, (x))
+#define XL_ADD(a, b)    vaddq_f32((a), (b))
+#define XL_SUB(a, b)    vsubq_f32((a), (b))
+#define XL_MUL(a, b)    vmulq_f32((a), (b))
+#define XL_MEM_P(p)     vld1q_f32((const float *)(p))
+#define XL_STORE_P(p, v) vst1q_f32((float *)(p), (v))
+#define XL_LOAD_LOW_P(dst, p)  ((dst) = vcombine_f32(vld1_f32((const float *)(p)), vget_high_f32(dst)))
+#define XL_LOAD_HIGH_P(dst, p) ((dst) = vcombine_f32(vget_low_f32(dst), vld1_f32((const float *)(p))))
+#define XL_STORE_LOW_P(p, v)   vst1_f32((float *)(p), vget_low_f32(v))
+#define XL_STORE_HIGH_P(p, v)  vst1_f32((float *)(p), vget_high_f32(v))
+#define XL_HALF_DUP(a, i) vdup_lane_f32((((i) & 2) ? vget_high_f32(a) : vget_low_f32(a)), (i) & 1)
+#define XL_SHUFFLE_DUP(a, b, imm) vcombine_f32(XL_HALF_DUP((a), (imm) & 3), XL_HALF_DUP((b), (imm) & 3))
+#else
+typedef float rxl_t __attribute__((vector_size(16)));
+typedef struct __attribute__((packed, may_alias)) { rxl_t v; } rxl_pk_t;
+typedef struct __attribute__((packed, may_alias)) { float v[2]; } rxl_h_t;
+#define XL_IN(g)        (((const rxl_pk_t *)&(g))->v)
+#define XL_OUT(g, x)    ((void)(((rxl_pk_t *)&(g))->v = (x)))
+#define XL_ADD(a, b)    ((a) + (b))
+#define XL_SUB(a, b)    ((a) - (b))
+#define XL_MUL(a, b)    ((a) * (b))
+#define XL_MEM_P(p)     (((const rxl_pk_t *)(p))->v)
+#define XL_STORE_P(p, x) ((void)(((rxl_pk_t *)(p))->v = (x)))
+#define XL_LOAD_LOW_P(dst, p)  do { const rxl_h_t *_h = (const rxl_h_t *)(p); (dst)[0] = _h->v[0]; (dst)[1] = _h->v[1]; } while (0)
+#define XL_LOAD_HIGH_P(dst, p) do { const rxl_h_t *_h = (const rxl_h_t *)(p); (dst)[2] = _h->v[0]; (dst)[3] = _h->v[1]; } while (0)
+#define XL_STORE_LOW_P(p, x)   do { rxl_h_t *_h = (rxl_h_t *)(p); rxl_t _x = (x); _h->v[0] = _x[0]; _h->v[1] = _x[1]; } while (0)
+#define XL_STORE_HIGH_P(p, x)  do { rxl_h_t *_h = (rxl_h_t *)(p); rxl_t _x = (x); _h->v[0] = _x[2]; _h->v[1] = _x[3]; } while (0)
+#define XL_SHUFFLE_DUP(a, b, imm) __builtin_shuffle((a), (b), (rxm_t){(imm) & 3u, (imm) & 3u, 4u + ((imm) & 3u), 4u + ((imm) & 3u)})
+#endif
+#define XL_ZERO()       ((rxl_t){0.0f, 0.0f, 0.0f, 0.0f})
+#define XL_SCALAR(f)    ((rxl_t){(f), 0.0f, 0.0f, 0.0f})
+/* (the immediate is always a literal in the lifted code) */
+#define XL_SHUFFLE(a, b, imm) __builtin_shuffle((a), (b), (rxm_t){(imm) & 3u, ((imm) >> 2) & 3u, 4u + (((imm) >> 4) & 3u), 4u + (((imm) >> 6) & 3u)})
+#define XL_UNPACK_LOW(a, b)  __builtin_shuffle((a), (b), (rxm_t){0u, 4u, 1u, 5u})
+#define XL_UNPACK_HIGH(a, b) __builtin_shuffle((a), (b), (rxm_t){2u, 6u, 3u, 7u})
+#define XL_MOVE_HIGH_TO_LOW(a, b) __builtin_shuffle((a), (b), (rxm_t){6u, 7u, 2u, 3u})
+#define XL_MOVE_LOW_TO_HIGH(a, b) __builtin_shuffle((a), (b), (rxm_t){0u, 1u, 4u, 5u})
+#define XL_XOR(a, b)    ((rxl_t)((rxm_t)(a) ^ (rxm_t)(b)))
+static inline __attribute__((always_inline)) rxl_t XL_RCP(rxl_t a, rxl_t b) {
+    rxl_t r; (void)a; r[0] = 1.0f / b[0]; r[1] = 1.0f / b[1]; r[2] = 1.0f / b[2]; r[3] = 1.0f / b[3]; return r;
+}
+static inline __attribute__((always_inline)) rxl_t XL_MIN(rxl_t a, rxl_t b) {
+    rxl_t r; int i; for (i = 0; i < 4; i++) r[i] = (a[i] < b[i]) ? a[i] : b[i]; return r;
+}
+static inline __attribute__((always_inline)) rxl_t XL_MAX(rxl_t a, rxl_t b) {
+    rxl_t r; int i; for (i = 0; i < 4; i++) r[i] = (a[i] > b[i]) ? a[i] : b[i]; return r;
+}
+#define XL_MEM(addr)             XL_MEM_P(XBOX_PTR(addr))
+#define XL_STORE(addr, v)        XL_STORE_P(XBOX_PTR(addr), (v))
+#define XL_LOAD_LOW(dst, addr)   XL_LOAD_LOW_P(dst, XBOX_PTR(addr))
+#define XL_LOAD_HIGH(dst, addr)  XL_LOAD_HIGH_P(dst, XBOX_PTR(addr))
+#define XL_STORE_LOW(addr, v)    XL_STORE_LOW_P(XBOX_PTR(addr), (v))
+#define XL_STORE_HIGH(addr, v)   XL_STORE_HIGH_P(XBOX_PTR(addr), (v))
+#define KXL_MEM(addr)            XL_MEM_P(RECOMP_KP(addr))
+#define KXL_STORE(addr, v)       XL_STORE_P(RECOMP_KP(addr), (v))
+#define KXL_LOAD_LOW(dst, addr)  XL_LOAD_LOW_P(dst, RECOMP_KP(addr))
+#define KXL_LOAD_HIGH(dst, addr) XL_LOAD_HIGH_P(dst, RECOMP_KP(addr))
+#define KXL_STORE_LOW(addr, v)   XL_STORE_LOW_P(RECOMP_KP(addr), (v))
+#define KXL_STORE_HIGH(addr, v)  XL_STORE_HIGH_P(RECOMP_KP(addr), (v))
+#endif
 
 /* x87 80-bit extended <-> double, for fld/fstp tbyte. The FPU model keeps
    doubles, so a tbyte load rounds to double and a tbyte store widens. */

@@ -29,6 +29,10 @@ if(VITA)
     include_directories(BEFORE SYSTEM "${XBOXRECOMP_VITA_INCLUDE}")
     add_compile_options("SHELL:-include ${XBOXRECOMP_VITA_INCLUDE}/vita_compat.h")
 endif()
+if(VITA)
+    # (v74) scheduled for the Vita's own processor, not a generic ARMv7
+    add_compile_options(-mtune=cortex-a9)
+endif()
 
 # Compact guest address space: no 4 GB reservation, no fixed host addresses,
 # a 256-entry region table instead (recomp_types.h, xbox_memory_layout.c).

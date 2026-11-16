@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "tt_env.h"   /* (1.9.3) getenv looked up once per name */
+#include "tt_prof.h"   /* (v154) hooks in the profile */
 #include <string.h>
 #include <math.h>
 #include <sys/stat.h>
@@ -7478,6 +7479,7 @@ static void coop_beam_flush(void)
 static int s_launch_p2;
 int tt_hk(int id, int phase, uint32_t *r)
 {
+    TT_PROF_NATIVE(0xF1000000u + (uint32_t)id);
     if (s_p2beam_n) coop_beam_flush();
     if (id == 24 && phase == 0 && getenv("TT_INPLOG")) {   /* testing: actors' inputs (this, input id), the player's marked */
         uint32_t inp = G32(r[3] + 4) & 0xFFFFu, act = r[1];

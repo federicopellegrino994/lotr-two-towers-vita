@@ -32,6 +32,9 @@
 #include <psp2/gxm.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/io/stat.h>
+#include <psp2/ctrl.h>
+extern volatile const char *g_vgl_where;   /* (nv2a_gl.inc: the render thread's zone) */
+#define VWHERE(x) (g_vgl_where = (x))
 
 #ifndef GL_DEPTH_CLAMP
 #define GL_DEPTH_CLAMP 0x864F
@@ -97,6 +100,19 @@
 /* the picture owner (fb_present.c): vitaGL is started by whichever of the
  * renderer and the picture thread asks first */
 extern int xbox_VitaGLAcquire(void);
+extern void xbox_VitaUniPoolFrame(void);
+extern volatile unsigned g_gxm_vc, g_gxm_vf, g_gxm_fc, g_gxm_ff, g_gxm_nullv, g_gxm_nullf;
+extern volatile int g_gxm_last_err;
+/* (v81) vitaGL's own state, read in the capture (libvitaGL.a globals): the
+ * draws that change no pixel, compared with the same draws that do */
+extern uint8_t no_polygons_mode, cull_face_state, is_rendering_display, depth_test_state, depth_mask_state;
+extern uint8_t scissor_test_state, stencil_test_state, blend_state, phase, dirty_framebuffer, skip_viewport_override;
+extern uint32_t gl_cull_mode, depth_func, vgl_error, blend_info;
+extern void *active_write_fb, *in_use_framebuffer, *cur_program, *gxm_render_target;
+extern int gl_viewport[4];
+extern int region[8];
+
+extern void xbox_VitaUniPoolReport(double frames);
 extern void xbox_VitaGLRelease(void);
 
 static int g_vgl_flip;                 /* see the top of this file */
@@ -113,8 +129,15 @@ static void vgl_tr_init(void)
     const char *e = getenv("RECOMP_VGL_TRACE");
     g_vgl_tr = e && *e ? atoi(e) : 0;   /* (off unless asked: each line is a write to the card) */
 }
+/* (v66) the render thread's last GL call, for the hang report (main.c
+ * wd_dump): the game's long black stalls were the render thread stuck
+ * inside the present for 10 to 24 s */
+volatile const char *g_vgl_last_fn = "none";
+volatile int g_vgl_last_line;
+volatile unsigned g_vgl_seq;
 static void vgl_tr(const char *fn, int line)
 {
+    g_vgl_last_fn = fn; g_vgl_last_line = line; g_vgl_seq++;
     if (g_vgl_tr <= 0) return;
     g_vgl_tr--;
     fprintf(stderr, "  [VGLT] %u %d %s\n", g_vgl_tr_n++, line, fn);
@@ -180,8 +203,36 @@ static uint32_t vfb_h(GLuint fbo)
     return 0;
 }
 
+/* (v187) [TGTSEQ] one frame's drawn-to framebuffers in order, every 10 s: each change of the draw target
+ * starts a new GPU scene (v186: 10-50 scenes a frame, and sceGxmEndScene 35% of the render thread where it
+ * is slowest): which targets, how many draws each time, and who switched (the zone). */
+static int g_tt_on, g_tt_n, g_tt_draws;
+static char g_tt_buf[3000]; static int g_tt_len;
+static GLuint g_tt_last = 0xFFFFFFFFu;
+extern volatile const char *g_vgl_where;
+static void vgl_tgt_note(GLuint f)
+{
+    if (!g_tt_on || f == g_tt_last) return;
+    if (g_tt_len < (int)sizeof g_tt_buf - 120) {
+        uint32_t h = vfb_h(f);
+        g_tt_len += snprintf(g_tt_buf + g_tt_len, sizeof g_tt_buf - g_tt_len, " [%u draws] -> fb %u%s%u (%s)", g_tt_draws, f, h ? " h" : "", h,
+                             g_vgl_where ? (const char *)g_vgl_where : "?");
+    }
+    g_tt_draws = 0; g_tt_n++; g_tt_last = f;
+}
+static void vgl_tgt_frame(void)
+{
+    static uint32_t tl;
+    const uint32_t t = (uint32_t)(sceKernelGetProcessTimeWide() / 1000u);
+    if (g_tt_on) {
+        g_tt_len += snprintf(g_tt_buf + g_tt_len, sizeof g_tt_buf - g_tt_len, " [%u draws] -> present", g_tt_draws);
+        fprintf(stderr, "  [TGTSEQ] one frame, %d target changes:%s\n", g_tt_n, g_tt_buf);
+        g_tt_on = 0;
+    } else if (t - tl > 10000u) { tl = t; g_tt_on = 1; g_tt_n = 0; g_tt_len = 0; g_tt_draws = 0; g_tt_last = g_vgl_dfb; }
+}
 static void vgl_bind_fb(GLenum t, GLuint f)
 {
+    if (t == GL_FRAMEBUFFER || t == GL_DRAW_FRAMEBUFFER) vgl_tgt_note(f);
     if (t == GL_FRAMEBUFFER || t == GL_DRAW_FRAMEBUFFER) g_vgl_dfb = f;
     if (t == GL_FRAMEBUFFER || t == GL_READ_FRAMEBUFFER) g_vgl_rfb = f;
     glBindFramebuffer(t, f);
@@ -222,6 +273,25 @@ static GLuint vgl_create_shader(GLenum t)
 {
     return glCreateShader(t == GL_VERTEX_SHADER ? GL_CG_VERTEX_SHADER_EXT
                           : t == GL_FRAGMENT_SHADER ? GL_CG_FRAGMENT_SHADER_EXT : t);
+}
+/* what the renderer keeps of a shader's source: its inputs' names and its
+ * range of the vertex constants. (v119) Apart, for a shader read from the
+ * card: it has no glShaderSource, and without this its program got the
+ * wrong attribute names and a stale constant range -- the v117/v118 crash
+ * at the second start. */
+static void vgl_shader_note_src(GLuint s, const char *b)
+{
+    if (s < VGL_IDS) {
+        const char *q = strstr(b, "uniform float4 c[");
+        g_vgl_vin_sh[s] = strstr(b, "float4 vin0") != NULL || q != NULL;
+        g_vgl_sh_clo[s] = 0; g_vgl_sh_cn[s] = 0;
+        if (q) {
+            int n = atoi(q + 17), lo = 0;
+            const char *l = strstr(q, "// c_lo ");
+            if (l) lo = atoi(l + 8);
+            if (n > 0 && n <= 192 && lo >= 0 && lo + n <= 192) { g_vgl_sh_clo[s] = (uint16_t)lo; g_vgl_sh_cn[s] = (uint16_t)n; }
+        }
+    }
 }
 static void vgl_shader_source(GLuint s, GLsizei n, const GLchar *const *src, const GLint *len)
 {
@@ -349,7 +419,7 @@ static void vgl_ub_set(int binding, const void *data, uint32_t bytes)
 /* the uniforms a program may have, and where their values come from */
 typedef struct { const char *name; uint8_t block, row; uint16_t n; } VUni;   /* (n: rows, 0 = 1) */
 static const VUni g_vuni[] = {
-    { "bsrc", VB_PSC, 72 }, { "bmisc", VB_PSC, 73 },
+    { "bsrc", VB_PSC, 72 }, { "bmisc", VB_PSC, 73 }, { "gfb", VB_PSC, 74 },
     { "vp", VB_VSC, 0 }, { "vsw", VB_VSC, 4, 4 }, { "clear_color", VB_CLC, 0 }, { "clc_f", VB_CLC, 0 }, { "post", VB_POST, 0 },
     { "c0_0", VB_PSC, 5 }, { "c0_1", VB_PSC, 12 }, { "c0_2", VB_PSC, 19 }, { "c0_3", VB_PSC, 26 },
     { "c0_4", VB_PSC, 33 }, { "c0_5", VB_PSC, 40 }, { "c0_6", VB_PSC, 47 }, { "c0_7", VB_PSC, 54 },
@@ -438,6 +508,7 @@ static void vgl_ub_flush(void)
 }
 
 /* the full-screen triangle (gl_VertexID's corners in the desktop shader) */
+static void vgl_va_forget0(void);
 static const float g_vgl_tri_xy[6] = { 0, 0, 2, 0, 0, 2 };
 static void vgl_draw_arrays(GLenum m, GLint f, GLsizei c)
 {
@@ -446,14 +517,84 @@ static void vgl_draw_arrays(GLenum m, GLint f, GLsizei c)
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, g_vgl_tri_xy);
+        vgl_va_forget0();   /* (v94: set behind the attribute cache's back) */
     }
     glDrawArrays(m, f, c);
 }
+/* (v92) THE HUD BUG. The v91 probe: in a frame without the HUD, the HUD's
+ * draw through glDrawElements with 32-bit indices gives 0 pixels, the same
+ * vertices through glDrawArrays 48 -- and in a frame with the HUD both 48.
+ * vitaGL copies the vertices of a client array for glDrawElements as far as
+ * the indices go, and with GL_UNSIGNED_INT it does not get all of them: the
+ * rest is read from whatever its per-frame data pool held there (the same
+ * draw of a frame before, when the frames match -- the HUD there; else
+ * nothing). The direct path's 16-bit indices were always right. So every
+ * 32-bit index list that fits is drawn as 16-bit (any larger one: counted,
+ * g_i32_left, and drawn as before). */
+static uint16_t *g_i16; static uint32_t g_i16_cap;
+static unsigned g_i32_left;
+/* (v120) WHERE THE RENDER THREAD STANDS STILL. It is busy ~145 ms of a heavy
+ * frame but runs ~105 of them ([CPU]): the rest it is blocked inside vitaGL
+ * or GXM (the GPU behind, a full ring) or put aside. Wall time against the
+ * thread's own run time around: the draws (one in 8), the target changes,
+ * the clears, the copies, the present. [VGLBLK] in the log. */
+enum { BK_DRAW, BK_TARGETS, BK_CLEAR, BK_BLIT, BK_PRESENT, BK_N };
+static uint64_t g_bk_wall[BK_N], g_bk_run[BK_N];
+static unsigned g_bk_n[BK_N], g_bk_tick;
+extern long long xbox_thread_run_us(int thid);
+extern int sceKernelGetThreadId(void);
+/* (v121) only with RECOMP_VGL_TIMERS=1: the two system calls a measure cost
+ * ~12 us, 35 ms of a heavy frame in v120 */
+extern int g_vgl_timers;
+#define BK_T0() uint64_t _bw = 0; long long _br = 0; if (g_vgl_timers) { _bw = sceKernelGetProcessTimeWide(); _br = xbox_thread_run_us(sceKernelGetThreadId()); }
+#define BK_END(z) do { if (g_vgl_timers) { g_bk_wall[z] += sceKernelGetProcessTimeWide() - _bw; g_bk_run[z] += (uint64_t)(xbox_thread_run_us(sceKernelGetThreadId()) - _br); g_bk_n[z]++; } } while (0)
+static void vgl_draw_elements_(GLenum m, GLsizei c, GLenum t, const void *idx);
 static void vgl_draw_elements(GLenum m, GLsizei c, GLenum t, const void *idx)
 {
+    g_tt_draws++;
+    if (g_vgl_timers && (g_bk_tick++ & 7) == 0) { BK_T0(); vgl_draw_elements_(m, c, t, idx); BK_END(BK_DRAW); }
+    else vgl_draw_elements_(m, c, t, idx);
+}
+static void vgl_draw_elements_(GLenum m, GLsizei c, GLenum t, const void *idx)
+{
     vgl_trf("glDrawElements %d indices", (int)c);
+    VWHERE("batch: uniform upload");
     vgl_ub_flush();
+    VWHERE("batch: vitaGL glDrawElements");
+    if (t == GL_UNSIGNED_INT && idx && c > 0) {
+        const uint32_t *s32 = (const uint32_t *)idx;
+        uint32_t mx = 0; GLsizei i;
+        for (i = 0; i < c; i++) if (s32[i] > mx) mx = s32[i];
+        if (mx < 65536u) {
+            if ((uint32_t)c > g_i16_cap) {
+                uint16_t *nb = (uint16_t *)realloc(g_i16, (size_t)c * 2 * sizeof(uint16_t));
+                if (nb) { g_i16 = nb; g_i16_cap = (uint32_t)c * 2; }
+            }
+            if ((uint32_t)c <= g_i16_cap) {
+                for (i = 0; i < c; i++) g_i16[i] = (uint16_t)s32[i];
+                glDrawElements(m, c, GL_UNSIGNED_SHORT, g_i16);
+                VWHERE("batch: after the draw");
+                return;
+            }
+        }
+        g_i32_left++;
+    }
     glDrawElements(m, c, t, idx);
+    VWHERE("batch: after the draw");
+}
+/* (v216) a 16-bit triangle list with its top index known (the direct path
+ * has it: hi - lo): glDrawRangeElements, so vitaGL does not scan the indices
+ * for it. idx: a client pointer, or the offset in the bound element buffer. */
+static void vgl_draw_range(GLenum m, GLuint top, GLsizei c, const void *idx)
+{
+    g_tt_draws++;
+    vgl_trf("glDrawRangeElements %d indices", (int)c);
+    VWHERE("batch: uniform upload");
+    vgl_ub_flush();
+    VWHERE("batch: vitaGL glDrawElements");
+    if (g_vgl_timers && (g_bk_tick++ & 7) == 0) { BK_T0(); glDrawRangeElements(m, 0, top, c, GL_UNSIGNED_SHORT, idx); BK_END(BK_DRAW); }
+    else glDrawRangeElements(m, 0, top, c, GL_UNSIGNED_SHORT, idx);
+    VWHERE("batch: after the draw");
 }
 /* u_ys = +1 draws into a surface: flipped when surfaces are */
 static void vgl_uniform1f(GLint l, GLfloat v)
@@ -527,8 +668,17 @@ static const char s_cg_vs_main[] =
 "}\n";
 
 /* until a program's own fragment shader is compiled (or if it fails) */
+/* (v63: stage 0's texture times the diffuse, D3D's default -- the colour
+ * alone drew a draw whose shader failed (AC8BD4C6, the v62 log) or was not
+ * ready as a flat dark shape: the black textures flickering) */
 static const char s_cg_ps_main[] =
-"float4 main(float4 v_d0 : TEXCOORD4) : COLOR { return v_d0; }\n";
+"uniform sampler2D tx0;\n"
+"uniform float4 gfb;\n"
+"float4 main(float4 v_t0 : TEXCOORD0, float4 v_d0 : TEXCOORD4) : COLOR {\n"
+"  float4 c = v_d0;\n"
+"  if (gfb.z > 0.5) c *= tex2D(tx0, v_t0.xy * gfb.xy);\n"
+"  return c;\n"
+"}\n";
 
 /* full-screen triangles; BLIT / CLEAR / PRESENT defined before */
 static const char s_cg_vs_tri[] =
@@ -550,6 +700,11 @@ static const char s_cg_ps_tri[] =
 "  return clc_f;\n"
 "#elif defined(PRESENT)\n"
 "  float3 c = saturate(tex2D(tx0, v_uv).rgb);\n"
+"  if (post.y > 0.0) {\n"   /* (v167) sharpening: the picture is drawn at 85% and stretched; clc_f.zw the texel */
+"    float3 n = tex2D(tx0, v_uv - float2(0.0, clc_f.w)).rgb, s = tex2D(tx0, v_uv + float2(0.0, clc_f.w)).rgb;\n"
+"    float3 w = tex2D(tx0, v_uv - float2(clc_f.z, 0.0)).rgb, e = tex2D(tx0, v_uv + float2(clc_f.z, 0.0)).rgb;\n"
+"    c = saturate(c + (c * 4.0 - n - s - w - e) * (0.25 * post.y));\n"
+"  }\n"
 "  c = pow(c, float3(1.0 / post.x, 1.0 / post.x, 1.0 / post.x));\n"
 "  float l = dot(c, float3(0.299, 0.587, 0.114));\n"
 "  return float4(saturate(float3(l, l, l) + (c - float3(l, l, l)) * post.z), 1.0);\n"
@@ -727,7 +882,157 @@ static void vgl_del_rbs(GLsizei n, const GLuint *r)
 #define glGenerateMipmap(t) (VGLT("glGenerateMipmap"), glGenerateMipmap(t))
 #define glBindTexture(t, x) (VGLT("glBindTexture"), glBindTexture(t, x))
 #define glBindSampler(u, x) (VGLT("glBindSampler"), glBindSampler(u, x))
-#define glBindVertexArray(v) (VGLT("glBindVertexArray"), glBindVertexArray(v))
+/* (v94) vertex attribute state cached per vertex array: the direct path
+ * set all 16 attributes again on every draw (~20000 vitaGL calls a frame,
+ * "batch: vertex attributes" 14-17% of the render thread); a call that
+ * changes nothing is skipped. The bound GL_ARRAY_BUFFER is part of what a
+ * pointer means, so it is tracked too. */
+typedef struct { uint8_t en_ok, en, p_ok; GLint size; GLenum type; GLboolean norm; GLsizei stride; const void *ptr; GLuint buf; } VAttr;
+static struct { GLuint vao; VAttr a[16]; } s_vas[4];
+static GLuint s_va_vao = 0xFFFFFFFFu, s_va_abuf = 0xFFFFFFFFu;
+static VAttr *s_va_cur;
+static unsigned g_va_calls, g_va_skipped;
+static void vgl_bind_vao(GLuint v)
+{
+    int i;
+    if (v == s_va_vao) return;
+    (glBindVertexArray)(v);
+    s_va_vao = v; s_va_cur = NULL;
+    for (i = 0; i < 4; i++) if (s_vas[i].vao == v && v) { s_va_cur = s_vas[i].a; break; }
+    if (!s_va_cur && v) for (i = 0; i < 4; i++) if (!s_vas[i].vao) { s_vas[i].vao = v; memset(s_vas[i].a, 0, sizeof s_vas[i].a); s_va_cur = s_vas[i].a; break; }
+}
+static void vgl_bind_buffer(GLenum t, GLuint b)
+{
+    if (t == GL_ARRAY_BUFFER) { if (b == s_va_abuf) return; s_va_abuf = b; }
+    (glBindBuffer)(t, b);
+}
+static void vgl_va_enable(GLuint i, int on)
+{
+    VAttr *a = (s_va_cur && i < 16) ? &s_va_cur[i] : NULL;
+    g_va_calls++;
+    if (a && a->en_ok && a->en == (uint8_t)on) { g_va_skipped++; return; }
+    if (on) (glEnableVertexAttribArray)(i); else (glDisableVertexAttribArray)(i);
+    if (a) { a->en_ok = 1; a->en = (uint8_t)on; }
+}
+static void vgl_va_pointer(GLuint i, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void *ptr)
+{
+    VAttr *a = (s_va_cur && i < 16) ? &s_va_cur[i] : NULL;
+    g_va_calls++;
+    if (a && a->p_ok && a->size == size && a->type == type && a->norm == norm && a->stride == stride && a->ptr == ptr && a->buf == s_va_abuf) { g_va_skipped++; return; }
+    (glVertexAttribPointer)(i, size, type, norm, stride, ptr);
+    if (a) { a->p_ok = 1; a->size = size; a->type = type; a->norm = norm; a->stride = stride; a->ptr = ptr; a->buf = s_va_abuf; }
+}
+/* (v122) THE VERTICES READ IN PLACE. From a client array vitaGL copies, for
+ * every attribute, stride x vertices into its pool -- an interleaved vertex
+ * of five attributes five times, each draw (its glDrawElements is half of
+ * the render thread, v121 log). For an attribute with a buffer object it
+ * copies nothing: the stream is the object's memory + the pointer given
+ * (_glDrawElements_CustomShadersIMPL: vao+84 the object, its [0] the
+ * memory, [12] the frame it was last used). g_ip_obj is such an object
+ * with memory 0, so the pointer given is the address itself: the guest's
+ * vertex buffer, which the GPU may read once its 16 MB slice is mapped for
+ * GXM (ip_slice). RECOMP_VGL_INPLACE=1 turns it on (off: not yet seen on a
+ * Vita); only draws of 24 vertices or more -- the small ones are the
+ * effects' quads, rewritten every frame, and the GPU reads at the scene's
+ * end. */
+extern void *vertex_array_unit;
+static uint32_t g_ip_obj[16];
+static int8_t g_ip_map[256];
+static int g_ip_mode = -1;
+static unsigned g_ip_draws, g_ip_maps;
+static int ip_on(void)
+{
+    /* (v124) off for good: on the Vita (v123) the geometry came out wrong
+     * and the game froze -- the GPU reads a frame later what the title has
+     * already rewritten. RECOMP_VGL_INPLACE=2 still turns it on, for tests. */
+    if (g_ip_mode < 0) { const char *e = getenv("RECOMP_VGL_INPLACE"); g_ip_mode = e && e[0] == '2'; }
+    return g_ip_mode;
+}
+/* the 16 MB slice of the guest space with this address, mapped for the GPU */
+static int ip_slice(uint32_t ga, void *host_slice)
+{
+    uint32_t i = ga >> 24;
+    if (!g_ip_map[i]) {
+        /* (v123) only the contiguous window, a memory block of its own,
+         * mapped whole the first time: a piece of the C heap was refused */
+        extern void *g_xbox_contig_block;
+        static int blk = 0;   /* 0 not tried, 1 mapped, -1 refused */
+        uint8_t *b = (uint8_t *)g_xbox_contig_block, *h = (uint8_t *)host_slice;
+        int r = -1;
+        if (b && h >= b && h + 0x1000000u <= b + 0x4000000u) {
+            if (!blk) {
+                r = sceGxmMapMemory(b, 0x4000000u, 1 /* SCE_GXM_MEMORY_ATTRIB_READ */);
+                blk = r >= 0 ? 1 : -1;
+                fprintf(stderr, "  [VGL] vertices in place: the contiguous window at %p %s (%08X)\n", (void *)b, r >= 0 ? "mapped for the GPU" : "NOT mapped", (unsigned)r);
+            }
+            r = blk > 0 ? 0 : -1;
+        }
+        g_ip_map[i] = r >= 0 ? 1 : -1;
+        g_ip_maps++;
+        if (r < 0) fprintf(stderr, "  [VGL] vertices in place: guest slice %02X at %p not in a mapped block: copied as before\n", (unsigned)i, host_slice);
+    }
+    return g_ip_map[i] > 0;
+}
+static void vgl_va_pointer_inplace(GLuint i, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void *ptr)
+{
+    VAttr *a = (s_va_cur && i < 16) ? &s_va_cur[i] : NULL;
+    void *was;
+    g_va_calls++;
+    if (a && a->p_ok && a->size == size && a->type == type && a->norm == norm && a->stride == stride && a->ptr == ptr && a->buf == 0xFFFFFFFEu) { g_va_skipped++; return; }
+    was = vertex_array_unit;
+    vertex_array_unit = g_ip_obj;
+    (glVertexAttribPointer)(i, size, type, norm, stride, ptr);
+    vertex_array_unit = was;
+    if (a) { a->p_ok = 1; a->size = size; a->type = type; a->norm = norm; a->stride = stride; a->ptr = ptr; a->buf = 0xFFFFFFFEu; }
+}
+/* (v170) THE VERTICES COPIED ONCE. For a client array vitaGL copies, for
+ * EVERY attribute, stride x (top index + 1) bytes into its frame pool
+ * (_glDrawElements_CustomShadersIMPL: vgl_reserve_data_pool + memcpy per
+ * attribute, each its own stream): an interleaved vertex of five attributes
+ * copied five times, each draw. Now the direct path copies the span of
+ * guest memory all the attributes read (lo..hi) once into the same pool
+ * (the same lifetime as vitaGL's own copies: valid until the GPU is done)
+ * and gives each attribute an object (g_dz_obj, [0] its memory) with the
+ * offset in the span: vitaGL copies nothing for those. The copy is made
+ * right before the draw (a joined list's whole range). TT_VCOPY1=0: off. */
+extern void *vgl_reserve_data_pool(uint32_t size);
+static uint32_t g_dz_obj[5] = { 0, 0, 0, 0xFFFFFFFFu, 0 };
+static unsigned g_dz_draws, g_dz_fb;
+/* (v216) the static vertex cache (nv2a_gl.inc, vc_find): what it did, for [VCACHE] */
+static unsigned g_vc_hit, g_vc_miss, g_vc_new, g_vc_chg, g_vc_dyn, g_vc_nomem, g_vc_evict, g_ix_hit, g_ix_new, g_ix_miss;
+static uint64_t g_vc_hit_b, g_vc_hash_b, g_ix_hit_b;
+static uint32_t g_vc_used, g_vc_size, g_vc_entries;
+static uint64_t g_dz_bytes, g_dz_old;
+static void vgl_va_pointer_dz(GLuint i, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void *ptr)
+{
+    VAttr *a = (s_va_cur && i < 16) ? &s_va_cur[i] : NULL;
+    void *was;
+    g_va_calls++;
+    if (a && a->p_ok && a->size == size && a->type == type && a->norm == norm && a->stride == stride && a->ptr == ptr && a->buf == 0xFFFFFFFDu) { g_va_skipped++; return; }
+    was = vertex_array_unit;
+    vertex_array_unit = g_dz_obj;
+    (glVertexAttribPointer)(i, size, type, norm, stride, ptr);
+    vertex_array_unit = was;
+    if (a) { a->p_ok = 1; a->size = size; a->type = type; a->norm = norm; a->stride = stride; a->ptr = ptr; a->buf = 0xFFFFFFFDu; }
+}
+/* one past the highest attribute that may be enabled in the bound vertex array */
+static uint32_t vgl_va_top(void)
+{
+    int i;
+    if (!s_va_cur) return 16;
+    for (i = 15; i >= 0; i--) if (!s_va_cur[i].en_ok || s_va_cur[i].en) return (uint32_t)i + 1;
+    return 0;
+}
+static void vgl_va_forget0(void)
+{
+    s_va_abuf = 0;
+    if (s_va_cur) { s_va_cur[0].en_ok = 0; s_va_cur[0].p_ok = 0; }
+}
+#define glBindVertexArray(v) (VGLT("glBindVertexArray"), vgl_bind_vao(v))
+#define glBindBuffer(t, b) vgl_bind_buffer(t, b)
+#define glEnableVertexAttribArray(i) vgl_va_enable(i, 1)
+#define glDisableVertexAttribArray(i) vgl_va_enable(i, 0)
+#define glVertexAttribPointer(i, s, t, n, st, p) vgl_va_pointer(i, s, t, n, st, p)
 #define glPixelStorei(a, b) (VGLT("glPixelStorei"), glPixelStorei(a, b))
 #define glFinish() (VGLT("glFinish"), glFinish())
 #define glClearDepth(z) (VGLT("glClearDepth"), glClearDepth(z))
@@ -741,5 +1046,6 @@ static void vgl_make_room(uint64_t need);
 static unsigned g_vp_draws, g_vp_verts, g_vp_up, g_vp_upkb, g_vp_hw;   /* ([VGLPERF] counters: nv2a_gl.inc) */
 static int g_cap_hw, g_cap_cpu;   /* (nv2a_gl.inc cap_save) */
 static unsigned g_vp_direct;      /* (nv2a_gl.inc gpu_batch_hw_direct) */
+static int g_cap_marked;   /* (v84: the HUD markers, once per capture) */
 static int g_cap_wait = -2, g_cap_on, g_cap_n, g_cap_mode;   /* (mode, for the GPU draws: 0 as they are, 1 depth func ALWAYS, 2 GEQUAL made LEQUAL, 3 depth cleared to 0 just before each) */
 static void cap_note_draw(const char *path, uint32_t hash, uint32_t nidx);
