@@ -72,10 +72,14 @@ This produces `TwoTowers.vpk`. Technical notes on the port are in `PORTING-ARM.m
 
 ## Credits
 
-- The Two Towers Recompiled: Gumpolas and contributors (https://github.com/Gumpolas/TooTawersRecomp).
-- The128ReBits for their contributions to it (see `CONTRIBUTION_NOTICES.md`).
-- xboxrecomp: sp00nz and contributors.
-- vitaGL: Rinnegatamante. vitasdk and the Vita homebrew community.
+- The Two Towers Recompiled: Gumpolas and contributors -- https://github.com/Gumpolas/TooTawersRecomp
+- The128ReBits, for their contributions to it (see `CONTRIBUTION_NOTICES.md`) -- https://github.com/The128ReBits
+- xboxrecomp: sp00nz and contributors -- https://github.com/sp00nznet/xboxrecomp
+- xemu, which parts of the runtime derive from (LGPL-2.1-or-later) -- https://github.com/xemu-project/xemu
+- Volverine-Dude, co-op work on the PC version -- https://github.com/Volverine-Dude/TooTawersRecomp-coop
+- vitaGL: Rinnegatamante -- https://github.com/Rinnegatamante/vitaGL
+- PSVshell: Electry -- https://github.com/Electry/PSVshell
+- vitasdk and the Vita homebrew community -- https://vitasdk.org
 - PS Vita port: federicopellegrino994 (with technical assistance from Claude).
 
 *The Lord of the Rings: The Two Towers* is © its respective owners. This project is not affiliated with
