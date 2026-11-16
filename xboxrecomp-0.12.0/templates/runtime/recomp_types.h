@@ -299,29 +299,46 @@ static inline uint16_t recomp_fxam(double value) {
  * NaN, the infinities and values already integral come back unchanged, and a
  * zero result keeps the operand's sign, as FRNDINT's does. */
 static inline double recomp_frndint(double value, uint16_t control) {
-    double rounded;
-    if (!isfinite(value)) return value;
-    switch((control>>10)&3) {
-    case 1: rounded=floor(value); break;
-    case 2: rounded=ceil(value); break;
-    case 3: rounded=trunc(value); break;
-    default: {
-        double lo=floor(value), fraction=value-lo;
-        rounded=lo;
-        if(fraction>0.5 || (fraction==0.5 && fmod(lo,2.0)!=0.0)) rounded=lo+1.0;
-        break;
+    if (fabs(value) < 4503599627370496.0) {   /* (|v| < 2^52: an int64 holds it exactly; NaN fails the test) */
+        int64_t i = fabs(value) < 2147483648.0 ? (int64_t)(int32_t)value : (int64_t)value;   /* (toward zero; the 32-bit one a single VFP conversion) */
+        double r;
+        switch ((control >> 10) & 3) {
+        case 1: if ((double)i > value) i--; break;
+        case 2: if ((double)i < value) i++; break;
+        case 3: break;
+        default: {
+            const double f = value - (double)i;   /* (exact) */
+            if (f > 0.5 || (f == 0.5 && (i & 1))) i++;
+            else if (f < -0.5 || (f == -0.5 && (i & 1))) i--;
+            break; }
+        }
+        r = (double)i;
+        return r == 0.0 ? copysign(0.0, value) : r;
     }
-    }
-    return rounded == 0.0 ? copysign(0.0, value) : rounded;
+    return value;   /* (NaN, the infinities, |v| >= 2^52: already integral) */
 }
-/* x87 integer stores use the guest RC bits, independently of host rounding.
- * Masked invalid conversions store the signed integer-indefinite value. */
 static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
-    double rounded = recomp_frndint(value, control);
-    double limit=ldexp(1.0,(int)bits-1);
-    if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
-        return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
-    return (int64_t)rounded;
+    if (bits == 32 && value > -2147483648.0 && value < 2147483648.0) {
+        int64_t i = (int32_t)value;
+        switch ((control >> 10) & 3) {
+        case 1: if ((double)i > value) i--; break;
+        case 2: if ((double)i < value) i++; break;
+        case 3: break;
+        default: {
+            const double f = value - (double)i;
+            if (f > 0.5 || (f == 0.5 && (i & 1))) i++;
+            else if (f < -0.5 || (f == -0.5 && (i & 1))) i--;
+            break; }
+        }
+        return (i < -2147483648LL || i > 2147483647LL) ? -(INT64_C(1) << 31) : i;
+    }
+    {
+        double rounded = recomp_frndint(value, control);
+        double limit = ldexp(1.0, (int)bits - 1);
+        if (!isfinite(rounded) || rounded < -limit || rounded >= limit)
+            return bits == 64 ? INT64_MIN : -(INT64_C(1) << (bits - 1));
+        return (int64_t)rounded;
+    }
 }
 
 /* ================================================================
