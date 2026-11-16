@@ -2258,7 +2258,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v231) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v232) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif
@@ -6997,7 +6997,14 @@ static void gpu_present(uint32_t base, uint32_t pitch)
     gpu_sh_reset();
     {
         static int said;
+#if defined(__vita__)
+        /* (v232) not with the GL worker: an answer from it waits for the whole frame queued before (EndScene's GPU wait
+         * included) -- v231 log: 6-9 ms a frame of the render thread waiting here */
+        extern int glt_active(void);
+        GLenum err = glt_active() ? GL_NO_ERROR : glGetError();
+#else
         GLenum err = glGetError();
+#endif
         if (err != GL_NO_ERROR && said++ < 10) fprintf(stderr, "  [GL] error 0x%04X during the frame\n", err);
     }
 settings:
