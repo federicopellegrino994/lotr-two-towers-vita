@@ -310,7 +310,7 @@ static unsigned long __stdcall xw_thread(void *arg)
         extern int sceKernelChangeThreadPriority(int thid, int prio);
         const char *e = getenv("TT_XACTW_CORE"), *p = getenv("TT_XACTW_PRIO");
         extern volatile int g_core3_ok;
-        int m = e && *e ? (int)strtol(e, NULL, 16) : 0x40000, pr = p && *p ? atoi(p) : (g_core3_ok > 0 ? 158 : 130);   /* (v210: 158 with core 2 to itself) */   /* (v191: 130, above the sound chip's 140 -- at 158 it was put aside holding XACT's and DirectSound's locks, 3-9 ms a run, and the game waited on them: 0x128C07 up to 16%, 0x134940 up to 18%) */
+        int m = e && *e ? (int)strtol(e, NULL, 16) : 0x40000, pr = p && *p ? atoi(p) : (g_core3_ok > 0 ? 158 : 150);   /* (v235: 150 -- below the sound chip (140), which is ~28% busy now, not v192's 85%; above the game/GL worker) */   /* (v210: 158 with core 2 to itself) */   /* (v191: 130, above the sound chip's 140 -- at 158 it was put aside holding XACT's and DirectSound's locks, 3-9 ms a run, and the game waited on them: 0x128C07 up to 16%, 0x134940 up to 18%) */
         s_xw_thid = sceKernelGetThreadId();
         if (m) sceKernelChangeThreadCpuAffinityMask(s_xw_thid, m);
         if (pr) sceKernelChangeThreadPriority(s_xw_thid, pr);
@@ -349,16 +349,17 @@ static int xw_on(void)
         /* (v192: off unless TT_XACTW=1 -- v191 took core 2 from the sound chip in crowds, crackle, for no clear gain.)
          * (v210: on by itself when the sound chip has the fourth core: core 2 is then free for it.) */
         (void)g_core3_ok;
-        if (!(e && *e == '1')) { s_xw_state = 0; return 0; }   /* (v211: off again unless TT_XACTW=1 -- cutscenes froze with it in v210) */
+        if (e && *e == '0') { s_xw_state = 0; return 0; }   /* (v211: off unless TT_XACTW=1 -- cutscenes froze with it in v210; v235: on again by default, in play only -- see sub_00135CAB) */
         s_xw_state = 2;
         s_xw_ev = CreateEventA(NULL, 0, 0, NULL);
         if (!s_xw_ev || !CreateThread(NULL, 0x10000, xw_thread, NULL, 0, NULL)) { s_xw_state = 0; return 0; }
         return 0;   /* (this request the game's own: the worker starts) */
     }
 }
+int tt_in_play(void);
 void sub_00135CAB(void)
 {
-    if (xw_on()) {
+    if (tt_in_play() && xw_on()) {   /* (v235) only in play: menus, films and scenes keep XACT's work on the game thread */
         s_xw_req++;
         SetEvent(s_xw_ev);
         {   /* ([XACTW] every 10 s) */
@@ -14132,25 +14133,34 @@ static struct { uint32_t o, buf, mdl; uint8_t skip, made; } tt_al[TT_AL_N];
 static unsigned tt_al_skipped, tt_al_made, tt_al_nofig;
 static uint32_t tt_bc_fn[2][16], tt_bc_n[2][16], tt_bc_poses, tt_bc_bones;   /* (v172) */
 unsigned tt_al_hist[6], tt_al_why[3];
+static int tt_al_owner_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TT_ANIMLOD_OWNER"); on = !(e && *e == '0'); } return on; }
 static int tt_al_far(uint32_t o, uint32_t wm)
 {
     /* (v157) where the figure is: the world matrix it is posed for -- 0x2CA60's first argument, the same one 0x2D5C0
      * multiplies the bones by (row-major, translation at +0x30); v154-v156 read [+0x11C], which is 0 on these */
     const uint32_t h = MEM32(0x43B15Cu), cm = MEM32(0x43B164u);
     float ex, ey, ez, dx, dy, dz, d2, hx, hy, hz, h2;
-    (void)o;
-    if (wm < 0x10000u || wm >= 0x84000000u || h < 0x10000u || h >= 0x84000000u || cm < 0x10000u || cm >= 0x84000000u) {
+    uint32_t P;
+    /* (v235) a figure posed without a world matrix (about half of them in the v234 log): where its owner [+0x11C]
+     * stands (+0xF0, as the hero's), never the heroes themselves. TT_ANIMLOD_OWNER=0: those never kept. */
+    if (wm >= 0x10000u && wm < 0x84000000u) P = wm + 0x30u;
+    else {
+        const uint32_t ow = (o >= 0x10000u && o < 0x84000000u) ? MEM32(o + 0x11Cu) : 0;
+        if (ow >= 0x10000u && ow < 0x84000000u && ow != h && ow != coop_p2 && tt_al_owner_on()) P = ow + 0xF0u;
+        else P = 0;
+    }
+    if (!P || h < 0x10000u || h >= 0x84000000u || cm < 0x10000u || cm >= 0x84000000u) {
         extern unsigned tt_al_why[3];
-        tt_al_nofig++; tt_al_why[(wm < 0x10000u || wm >= 0x84000000u) ? 0 : (h < 0x10000u || h >= 0x84000000u) ? 1 : 2]++;
+        tt_al_nofig++; tt_al_why[!P ? 0 : (h < 0x10000u || h >= 0x84000000u) ? 1 : 2]++;
         return 0;
     }
     ex = MEMF(cm + 0x50); ey = MEMF(cm + 0x54); ez = MEMF(cm + 0x58);
-    dx = MEMF(wm + 0x30) - ex; dy = MEMF(wm + 0x34) - ey; dz = MEMF(wm + 0x38) - ez;
+    dx = MEMF(P) - ex; dy = MEMF(P + 4) - ey; dz = MEMF(P + 8) - ez;
     hx = MEMF(h + 0xF0) - ex; hy = MEMF(h + 0xF4) - ey; hz = MEMF(h + 0xF8) - ez;
     d2 = dx * dx + dy * dy + dz * dz; h2 = hx * hx + hy * hy + hz * hz;
     if (!(d2 < 1e12f) || !(h2 < 1e12f) || h2 < 1.0f) return 0;   /* (not numbers, or the camera on the hero: never far) */
     if (coop_p2 >= 0x10000u && coop_p2 < 0x84000000u) {   /* (the second hero: never) */
-        float px = MEMF(wm + 0x30) - MEMF(coop_p2 + 0xF0), py = MEMF(wm + 0x34) - MEMF(coop_p2 + 0xF4), pz = MEMF(wm + 0x38) - MEMF(coop_p2 + 0xF8);
+        float px = MEMF(P) - MEMF(coop_p2 + 0xF0), py = MEMF(P + 4) - MEMF(coop_p2 + 0xF4), pz = MEMF(P + 8) - MEMF(coop_p2 + 0xF8);
         if (px * px + py * py + pz * pz < 4.0f) return 0;
     }
     {   /* (v155, [ANIMLOD]) how far the figures are, in camera-to-hero distances: <1 <1.5 <2 <3 <4 more */
@@ -14167,7 +14177,7 @@ static int tt_al_far(uint32_t o, uint32_t wm)
         {   /* (v166) near the hero -- within 1.5 times the camera's distance to him, wherever the camera is -- always whole:
              * v165 counted from the camera alone, and the ones just behind the hero, fighting him, went every other frame
              * (the user: too close, and still jerky when he walked up to them) */
-            const float fx = MEMF(wm + 0x30) - MEMF(h + 0xF0), fy = MEMF(wm + 0x34) - MEMF(h + 0xF4), fz = MEMF(wm + 0x38) - MEMF(h + 0xF8);
+            const float fx = MEMF(P) - MEMF(h + 0xF0), fy = MEMF(P + 4) - MEMF(h + 0xF4), fz = MEMF(P + 8) - MEMF(h + 0xF8);
             if (fx * fx + fy * fy + fz * fz < 2.25f * h2) return 0;
         }
         if (mode == 3) {   /* (v223) TT_ANIMLOD=3: the middle distance whole too -- every other pose only past 2.5x, two in three past 4x, three in four past 6x */
@@ -14204,7 +14214,7 @@ void sub_0002CA60(void)
     }
     {   /* (v172) [BONES] which functions sample the bones' tracks ([+0x5E4] per bone: rotation, position), for a native pose */
         static int cen = -1;
-        if (cen < 0) { const char *e = getenv("TT_BONECENSUS"); cen = !(e && *e == '0'); }
+        if (cen < 0) { const char *e = getenv("TT_BONECENSUS"); cen = e && *e == '1'; }   /* (v235: off unless =1) */
         if (cen && o >= 0x10000u && o < 0x84000000u && MEM8(o + 0x90u) == 0) {
             const uint32_t m = MEM32(o + 0x58u), t = MEM32(o + 0x5E4u);
             if (m >= 0x10000u && m < 0x84000000u && t >= 0x10000u && t < 0x84000000u) {
