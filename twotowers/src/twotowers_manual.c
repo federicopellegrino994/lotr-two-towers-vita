@@ -312,7 +312,7 @@ static unsigned long __stdcall xw_thread(void *arg)
         extern int sceKernelChangeThreadPriority(int thid, int prio);
         const char *e = getenv("TT_XACTW_CORE"), *p = getenv("TT_XACTW_PRIO");
         extern volatile int g_core3_ok;
-        int m = e && *e ? (int)strtol(e, NULL, 16) : 0x40000, pr = p && *p ? atoi(p) : (g_core3_ok > 0 ? 158 : 150);   /* (v235: 150 -- below the sound chip (140), which is ~28% busy now, not v192's 85%; above the game/GL worker) */   /* (v210: 158 with core 2 to itself) */   /* (v191: 130, above the sound chip's 140 -- at 158 it was put aside holding XACT's and DirectSound's locks, 3-9 ms a run, and the game waited on them: 0x128C07 up to 16%, 0x134940 up to 18%) */
+        int m = e && *e ? (int)strtol(e, NULL, 16) : 0x40000, pr = p && *p ? atoi(p) : (g_core3_ok > 0 ? 158 : 135);   /* (v238: 135, above the sound chip -- v237 runs up to 80 ms late, the sound out of step; v235: 150 -- below the sound chip (140), which is ~28% busy now, not v192's 85%; above the game/GL worker) */   /* (v210: 158 with core 2 to itself) */   /* (v191: 130, above the sound chip's 140 -- at 158 it was put aside holding XACT's and DirectSound's locks, 3-9 ms a run, and the game waited on them: 0x128C07 up to 16%, 0x134940 up to 18%) */
         s_xw_thid = sceKernelGetThreadId();
         if (m) sceKernelChangeThreadCpuAffinityMask(s_xw_thid, m);
         if (pr) sceKernelChangeThreadPriority(s_xw_thid, pr);
