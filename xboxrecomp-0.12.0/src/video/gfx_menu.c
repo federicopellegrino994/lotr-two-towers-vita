@@ -373,7 +373,7 @@ float xbox_GfxAspect(void)
 #if defined(__vita__)
     {   /* (v198) TT_WIDE=1: 16:9, the Vita's screen (experimental there) */
         static int w = -1;
-        if (w < 0) { const char *e = getenv("TT_WIDE"); w = e && e[0] == '1'; }   /* (v203: on unless TT_WIDE=0; v219: off unless TT_WIDE=1) */
+        if (w < 0) { const char *e = getenv("TT_WIDE"); w = !(e && e[0] == '0'); }   /* (v203: on unless TT_WIDE=0; v219: off unless TT_WIDE=1) */
         if (w) return 16.0f / 9.0f;
     }
 #endif

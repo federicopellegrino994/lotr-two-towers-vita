@@ -1355,7 +1355,7 @@ int main(int argc, char **argv)
 #endif
         {   /* (v201) 16:9 on the Vita unless TT_WIDE=0: the same switches the PC's ini sets ([Display] aspect), before anyone reads them */
             const char *w = getenv("TT_WIDE");
-            if (w && w[0] == '1') {   /* (v203: on again unless TT_WIDE=0, the cameras' widening fixed; v202 had it off. v219: 4:3 again unless TT_WIDE=1 -- the wider view draws more, Balin's tomb 43 -> 55 ms render) */
+            if (!(w && w[0] == '0')) {   /* (v237: 16:9 the default again, the user asked; TT_WIDE=0: 4:3) */   /* (v203: on again unless TT_WIDE=0, the cameras' widening fixed; v202 had it off. v219: 4:3 again unless TT_WIDE=1 -- the wider view draws more, Balin's tomb 43 -> 55 ms render) */
                 if (!getenv("RECOMP_ASPECT")) setenv("RECOMP_ASPECT", "1.7778", 1);
                 if (!getenv("TT_ASPECT")) setenv("TT_ASPECT", "1.7778", 1);
             }
