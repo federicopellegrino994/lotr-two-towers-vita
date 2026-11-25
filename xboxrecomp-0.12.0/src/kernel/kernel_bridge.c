@@ -683,9 +683,14 @@ static HANDLE bridge_take_handle(uint32_t token);
 volatile uint32_t g_movie_handle;   /* open .bik file, 0 when none */
 extern const wchar_t *xbox_LastHostPath(void);
 int xbox_MoviePlaying(void) { return g_movie_handle != 0; }
+/* (v235) a title-side worker running guest code beside the game (twotowers: XACT's DoWork, which streams from the
+ * wave banks' files) may be reading through a handle the game is closing: the native object freed under it (a crash
+ * in free() at a level's end). The title's hook waits until that worker is between runs. */
+__attribute__((weak)) void xbox_close_wait_hook(void) {}
 static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
+    xbox_close_wait_hook();
 
     if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
@@ -3009,19 +3014,25 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
 
 int xbox_bridge_handles_used(void) { int i, n = 0; for (i = 1; i < BRIDGE_HANDLE_MAX; i++) if (s_handle_table[i]) n++; return n; }
+static volatile long s_handle_lock;   /* (v235: two threads opening at once took the same slot) */
 static uint32_t bridge_handle_token(HANDLE h)
 {
     int i;
+    uint32_t r = 0;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
+    { int n = 0; while (__sync_lock_test_and_set(&s_handle_lock, 1)) if (++n > 64) Sleep(1); }
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == NULL) {
-            s_handle_table[i] = h;
-            return BRIDGE_HANDLE_TAG | (uint32_t)i;
-        }
-    fprintf(stderr, "  [BRIDGE] handle table full\n");
-    return 0;
+        if (s_handle_table[i] == h) { r = BRIDGE_HANDLE_TAG | (uint32_t)i; break; }
+    if (!r)
+        for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+            if (s_handle_table[i] == NULL) {
+                s_handle_table[i] = h;
+                r = BRIDGE_HANDLE_TAG | (uint32_t)i;
+                break;
+            }
+    __sync_lock_release(&s_handle_lock);
+    if (!r) fprintf(stderr, "  [BRIDGE] handle table full\n");
+    return r;
 }
 
 /* Store a native HANDLE into a 32-bit Xbox memory slot (as a token). */

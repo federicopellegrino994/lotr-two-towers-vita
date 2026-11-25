@@ -292,10 +292,12 @@ static void *s_xw_ev;
 static volatile int s_xw_state = -1;          /* -1 not decided, 0 off, 1 on, 2 starting */
 static volatile uint32_t s_xw_req, s_xw_runs, s_xw_us, s_xw_max;
 static volatile int s_xw_thid;
+static volatile int s_xw_busy;   /* (v235) the worker inside a run */
 #if defined(__vita__)
 extern int sceKernelGetThreadId(void);
 extern unsigned long long sceKernelGetProcessTimeWide(void);
 #endif
+int tt_in_play(void);
 static unsigned long __stdcall xw_thread(void *arg)
 {
     int slot = xbox_worker_stack_alloc();
@@ -329,7 +331,10 @@ static unsigned long __stdcall xw_thread(void *arg)
             unsigned long long t0 = sceKernelGetProcessTimeWide(), dt;
 #endif
             g_esp -= 4; MEM32(g_esp) = 0;   /* (a return address: the lifted ret takes it) */
-            sub_00135CAB_gen();
+            s_xw_busy = 1; __sync_synchronize();
+            if (tt_in_play()) sub_00135CAB_gen();   /* (v235: a request left over from play not run once play is over) */
+            else g_esp += 4;
+            __sync_synchronize(); s_xw_busy = 0;
 #if defined(__vita__)
             dt = sceKernelGetProcessTimeWide() - t0;
             s_xw_us += (uint32_t)dt; if (dt > s_xw_max) s_xw_max = (uint32_t)dt;
@@ -356,7 +361,19 @@ static int xw_on(void)
         return 0;   /* (this request the game's own: the worker starts) */
     }
 }
-int tt_in_play(void);
+/* (v235) the kernel's NtClose asks (kernel_bridge.c): a file the game closes may be a wave bank the worker is streaming
+ * from -- the worker's run let finish first (at most 200 ms: a run waiting on a lock the closer holds goes on) */
+extern __declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+void xbox_close_wait_hook(void)
+{
+    int n = 0;
+#if defined(__vita__)
+    if (!s_xw_busy || sceKernelGetThreadId() == s_xw_thid) return;
+#else
+    if (!s_xw_busy) return;
+#endif
+    while (s_xw_busy && n++ < 200) Sleep(1);
+}
 void sub_00135CAB(void)
 {
     if (tt_in_play() && xw_on()) {   /* (v235) only in play: menus, films and scenes keep XACT's work on the game thread */
