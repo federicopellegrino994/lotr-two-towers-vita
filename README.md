@@ -10,8 +10,10 @@ translated to the Vita's GPU through vitaGL.
 ## Status
 
 - Playable with sound, music and cutscenes (tested through every level up to Helm's Deep).
-- Frame rate: roughly 17–20 fps in most levels, 13–17 fps in the heaviest battles (Helm's Deep).
-- Overclocking to 500 MHz with PSVshell helps (about +12%).
+- Frame rate (500 MHz, 16:9): about 19–22 fps in most levels and in Helm's Deep, 15–18 fps in the busiest
+  moments of the biggest battles. It is not 30 fps: the recompiled game code is the limit on the Vita's CPU.
+- Overclocking to 500 MHz with PSVshell is recommended (about +12%).
+- 16:9 widescreen by default (640x360 internal); 4:3 (544x408) is a little faster.
 - Rain, weapon swing trails, far-away particles and the characters' round ground shadows are turned off
   for speed (see *Options* below to turn them back on).
 
@@ -57,7 +59,8 @@ Create `ux0:data/twotowers/env.txt` with one `NAME=VALUE` per line:
 | `TT_TRAILS=1` | weapon swing trails back on |
 | `TT_FARFX=1` | far-away particles back on |
 | `TT_BLOBS=1` | characters' round ground shadows back on |
-| `TT_WIDE=1` | 16:9 (slower than the default 4:3) |
+| `TT_WIDE=0` | 4:3 instead of the default 16:9 (a little faster) |
+| `TT_XACTW=0` | game sound work back on the game thread: sound effects exactly in time, about 3% slower |
 | `TT_PACE=1` | cap at 20 fps (15 when the game cannot keep up) |
 
 ## Building from source
