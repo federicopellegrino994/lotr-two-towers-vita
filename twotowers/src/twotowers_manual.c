@@ -784,8 +784,14 @@ void sub_0011A740(void)
     }
     if (!(flags & 0x2000u)) {
         uint32_t regs = MEM32(dev + 0x23BC);
+        const uint32_t issued0 = MEM32(dev + 0x30);
         MEM32(regs + 0x40) = ptr & 0x0FFFFFFFu;            /* PUT */
         xbox_Nv2aKickNow();
+        {   /* (v242) every time issued before this kick read into the render thread's ring, once GET has reached PUT
+             * (not while D3D records: its times are then in the recording) -- see sub_0011AC90 */
+            extern uint32_t tt_kicked_time; extern int tt_kicked_valid;
+            if (!(flags & 4u) && MEM32(regs + 0x44) == MEM32(regs + 0x40)) { tt_kicked_time = issued0; tt_kicked_valid = 1; }
+        }
         if (MEM32(0x00124184u)) {
             do {                                        /* wait for idle */
                 PUSH32(esp, 0x0011A7B5u);
@@ -1129,7 +1135,7 @@ void sub_0011A8E0(void)
  * is on (device flags 4 / 0x2000), and the pushbuffer not set on the device (0x780000). TT_PBNOWAIT=0: D3D's wait.
  * [BUNB] every 10 s: the waits by caller, ms in them. */
 extern void sub_0011AC90_gen(void);
-extern void sub_0011A740(void);
+uint32_t tt_kicked_time; int tt_kicked_valid;
 static unsigned tt_bunb_n[3], tt_bunb_skip; static double tt_bunb_ms[3]; static unsigned long long tt_bunb_t0;
 void sub_0011AC90(void)
 {
@@ -1141,16 +1147,13 @@ void sub_0011AC90(void)
     if (on && ret == 0x0011AFDBu && dev && res >= 0x10000u && res < 0x84000000u &&
         !(MEM32(res) & 0x780000u) && !(MEM32(dev + 8) & 0x2004u)) {
         const uint32_t t = MEM32(res + 8), done = MEM32(MEM32(dev + 0x34));
-        if (t && (int32_t)(t - done) > 0) {
-            const uint32_t sa = eax, sc = ecx, sd = edx, sb = ebx, ss = esi, si = edi;
-            ecx = dev;
-            esp -= 4; MEM32(esp) = 0x0011AFDBu;   /* (a return address: KickOff's ret pops it) */
-            sub_0011A740();
-            eax = sa; ecx = sc; edx = sd; ebx = sb; esi = ss; edi = si;
-            tt_bunb_skip++;
+        /* (v242) v241 kicked here, in the middle of BeginPushBuffer (after 0x00120370): the first load froze, GET stuck
+         * short of PUT. Now no kick: the wait is left out only when that time was already read at an earlier kick */
+        if (!t || (int32_t)(t - done) <= 0 || (tt_kicked_valid && (int32_t)(t - tt_kicked_time) <= 0)) {
+            if (t && (int32_t)(t - done) > 0) tt_bunb_skip++;
+            esp += 8;   /* ret 4 */
+            return;
         }
-        esp += 8;   /* ret 4 */
-        return;
     }
     k = ret == 0x0011AFDBu ? 0 : ret == 0x001191EEu ? 1 : 2;
     t0 = GetTickCount64();
@@ -1159,7 +1162,7 @@ void sub_0011AC90(void)
     tt_bunb_n[k]++; tt_bunb_ms[k] += (double)(t1 - t0);
     if (!tt_bunb_t0) tt_bunb_t0 = t1;
     if (t1 - tt_bunb_t0 >= 10000) {
-        tt_dbg("  [BUNB] in %u ms: pushbuffers %u waited (%.0f ms), %u kicked instead of waiting; vertex buffers %u (%.0f ms); others %u (%.0f ms)\n",
+        tt_dbg("  [BUNB] in %u ms: pushbuffers %u waited (%.0f ms), %u already read, not waited for; vertex buffers %u (%.0f ms); others %u (%.0f ms)\n",
                (unsigned)(t1 - tt_bunb_t0), tt_bunb_n[0], tt_bunb_ms[0], tt_bunb_skip, tt_bunb_n[1], tt_bunb_ms[1], tt_bunb_n[2], tt_bunb_ms[2]);
         tt_bunb_t0 = t1; tt_bunb_n[0] = tt_bunb_n[1] = tt_bunb_n[2] = tt_bunb_skip = 0; tt_bunb_ms[0] = tt_bunb_ms[1] = tt_bunb_ms[2] = 0;
     }
