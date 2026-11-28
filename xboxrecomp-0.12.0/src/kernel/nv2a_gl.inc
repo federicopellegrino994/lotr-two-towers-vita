@@ -287,8 +287,8 @@ static float vita_res_scale(void)
     static float f = -1.0f;
     if (f < 0.0f) {
         const char *e = getenv("TT_RES");
-        f = e ? (float)atof(e) : 0.85f;   /* (v147: 0.85 -- 544x408; v146 had 0.75) */
-        if (!e) { extern float xbox_GfxAspect(void); if (xbox_GfxAspect() > 1.34f) f = 0.75f; }   /* (v203: 16:9 at about the pixel count of 544x408; v204: 0.75 -- 640x360, whole numbers: at 0.74 (631.5 x 355.2) the last row and column showed stray dots) */
+        f = e ? (float)atof(e) : 0.8f;   /* (v147: 0.85 -- 544x408; v146 had 0.75; v241: 0.8 -- 512x384) */
+        if (!e) { extern float xbox_GfxAspect(void); if (xbox_GfxAspect() > 1.34f) f = 0.7125f; }   /* (v241: 0.7125 -- 608x342, whole numbers; 10% fewer pixels than 640x360) */   /* (v203: 16:9 at about the pixel count of 544x408; v204: 0.75 -- 640x360, whole numbers: at 0.74 (631.5 x 355.2) the last row and column showed stray dots) */
         if (!(f >= 0.5f)) f = 0.5f;
         if (f > 1.0f) f = 1.0f;
         { extern float xbox_GfxAspect(void); fprintf(stderr, "  [GL] internal resolution %.0f x %.0f (TT_RES %.2f)\n", 640.0f * f * (xbox_GfxAspect() > 1.34f ? xbox_GfxAspect() / (4.0f / 3.0f) : 1.0f), 480.0f * f, f); }
@@ -2258,7 +2258,7 @@ static int gpu_init(void)
         return 0;
     }
     g_win = (SDL_Window *)(uintptr_t)1;   /* (no SDL window: vitaGL draws to the display) */
-    fprintf(stderr, "  [VGL] GPU renderer (v240) on %s / %s; shaders compiled when first used (cached)\n",
+    fprintf(stderr, "  [VGL] GPU renderer (v241) on %s / %s; shaders compiled when first used (cached)\n",
             (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER));
     if (0)
 #endif

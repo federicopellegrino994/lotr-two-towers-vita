@@ -981,7 +981,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
  * battle streams two files in 18 KB pieces, each a trip to the memory card on
  * the game's own thread. 128 KB at a time is read and the pieces served from
  * it. An entry is forgotten when its descriptor is opened again or written. */
-#define RA_N 6   /* (v163: 6 -- two streams, each its piece and the next, and room) */
+#define RA_N 10   /* (v163: 6 -- two streams, each its piece and the next, and room; v241: 10 -- the battles stream more, and two ahead) */
 #define RA_SIZE (128 * 1024)
 /* (v157) and the next 128 KB of a file being read in order is fetched on a
  * thread of its own while the game uses this piece (state 1 while it is
@@ -990,7 +990,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
  * the descriptor's position (the game's own reads) is not touched; an entry
  * forgotten meanwhile (gen) drops what the fetch brings. RECOMP_PREFETCH=0:
  * the v68 read-ahead alone. */
-static struct { int fd; long long base; uint32_t len; uint32_t used; int state; uint32_t gen; } g_ra[RA_N];
+static struct { int fd; long long base; uint32_t len; uint32_t used; int state; uint32_t gen; int q; } g_ra[RA_N];   /* (v241: q -- asked of the fetch thread, not yet begun) */
 static uint8_t g_ra_buf[RA_N][RA_SIZE];
 static uint32_t g_ra_clock;
 #include <pthread.h>
@@ -1030,7 +1030,7 @@ void xbox_ra_forget_fd(int fd)
          * dropped, and the slot freed, by that reader) -- freed here, another read could be put into the same buffer
          * while the first was still writing it */
         g_ra[i].len = 0; g_ra[i].gen++;
-        if (g_ra[i].state == 2) g_ra[i].state = 0;
+        if (g_ra[i].state == 2 || g_ra[i].q) { g_ra[i].state = 0; g_ra[i].q = 0; }   /* (v241: a fetch not yet begun dropped) */
         else g_ra[i].fd = -1;   /* (no reader waits for a forgotten one) */
     }
     pthread_cond_broadcast(&g_ra_done);
@@ -1044,9 +1044,17 @@ static void *ra_thread(void *arg)
 #endif
     pthread_mutex_lock(&g_ra_mx);
     for (;;) {
-        int v, fd; long long base; uint32_t gen, have = 0;
-        while (g_ra_req < 0) pthread_cond_wait(&g_ra_cv, &g_ra_mx);
-        v = g_ra_req; g_ra_req = -1;
+        int v, fd, i; long long base; uint32_t gen, have = 0;
+        /* (v241) every piece asked for, oldest first -- v157-v240 took one request at a time and dropped any asked
+         * while one waited: with two or three streams, a stream's next piece often never fetched, its next read a
+         * 128 KB trip to the memory card on the reader's thread (the 20-100 ms stalls in v240's [READS]) */
+        for (;;) {
+            v = -1;
+            for (i = 0; i < RA_N; i++) if (g_ra[i].q && (v < 0 || g_ra[i].used < g_ra[v].used)) v = i;
+            if (v >= 0) break;
+            pthread_cond_wait(&g_ra_cv, &g_ra_mx);
+        }
+        g_ra[v].q = 0;
         if (g_ra[v].state != 1) continue;
         fd = g_ra[v].fd; base = g_ra[v].base; gen = g_ra[v].gen;
         pthread_mutex_unlock(&g_ra_mx);
@@ -1069,7 +1077,7 @@ static void ra_prefetch_after(int c)
     int i, v = -1, fd = g_ra[c].fd;
     long long nb = g_ra[c].base + g_ra[c].len;
     if (g_ra_pf < 0) { const char *e = getenv("RECOMP_PREFETCH"); g_ra_pf = !(e && e[0] == '0'); }
-    if (!g_ra_pf || g_ra[c].len < RA_SIZE || g_ra_req >= 0) return;
+    if (!g_ra_pf || g_ra[c].len < RA_SIZE) return;
     for (i = 0; i < RA_N; i++)
         if (g_ra[i].state && g_ra[i].fd == fd && g_ra[i].base <= nb && nb < g_ra[i].base + (g_ra[i].state == 1 ? RA_SIZE : g_ra[i].len)) return;
     for (i = 0; i < RA_N; i++) {
@@ -1087,7 +1095,7 @@ static void ra_prefetch_after(int c)
         g_ra_thr = 1;
     }
     g_ra[v].fd = fd; g_ra[v].base = nb; g_ra[v].len = 0; g_ra[v].state = 1; g_ra[v].gen++; g_ra[v].used = ++g_ra_clock;
-    g_ra_req = v;
+    g_ra[v].q = 1;
     pthread_cond_signal(&g_ra_cv);
 }
 /* 1 served (*got set), 0 not: read the usual way (under g_ra_mx) */

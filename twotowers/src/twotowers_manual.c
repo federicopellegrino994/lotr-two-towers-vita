@@ -1120,6 +1120,51 @@ void sub_0011A8E0(void)
     tt_bot_in = 0;
 }
 
+/* (v241) D3D's BlockUntilNotBusy(resource) at 0x0011AC90: the CPU about to write a resource the GPU may still be
+ * reading waits for the time the GPU was last given it. v240's profile, Helm's Deep 3: 5.8% of the game thread in
+ * it -- the game and the render thread no longer side by side. From BeginPushBuffer (0x0011AFC0, returning to
+ * 0x0011AFDB) the resource is a pushbuffer about to be recorded again, and here a pushbuffer's words are copied
+ * into the render thread's ring as they are kicked (nv2a_pb_scan.c): once kicked, the GPU no longer reads that
+ * memory. So: kick (everything given so far scanned), no wait. Only when D3D is not recording itself and the GPU
+ * is on (device flags 4 / 0x2000), and the pushbuffer not set on the device (0x780000). TT_PBNOWAIT=0: D3D's wait.
+ * [BUNB] every 10 s: the waits by caller, ms in them. */
+extern void sub_0011AC90_gen(void);
+extern void sub_0011A740(void);
+static unsigned tt_bunb_n[3], tt_bunb_skip; static double tt_bunb_ms[3]; static unsigned long long tt_bunb_t0;
+void sub_0011AC90(void)
+{
+    static int on = -1;
+    const uint32_t ret = MEM32(esp), res = MEM32(esp + 4), dev = MEM32(0x00124180u);
+    unsigned long long t0, t1;
+    int k;
+    if (on < 0) { const char *e = getenv("TT_PBNOWAIT"); on = !(e && *e == '0'); }
+    if (on && ret == 0x0011AFDBu && dev && res >= 0x10000u && res < 0x84000000u &&
+        !(MEM32(res) & 0x780000u) && !(MEM32(dev + 8) & 0x2004u)) {
+        const uint32_t t = MEM32(res + 8), done = MEM32(MEM32(dev + 0x34));
+        if (t && (int32_t)(t - done) > 0) {
+            const uint32_t sa = eax, sc = ecx, sd = edx, sb = ebx, ss = esi, si = edi;
+            ecx = dev;
+            esp -= 4; MEM32(esp) = 0x0011AFDBu;   /* (a return address: KickOff's ret pops it) */
+            sub_0011A740();
+            eax = sa; ecx = sc; edx = sd; ebx = sb; esi = ss; edi = si;
+            tt_bunb_skip++;
+        }
+        esp += 8;   /* ret 4 */
+        return;
+    }
+    k = ret == 0x0011AFDBu ? 0 : ret == 0x001191EEu ? 1 : 2;
+    t0 = GetTickCount64();
+    sub_0011AC90_gen();
+    t1 = GetTickCount64();
+    tt_bunb_n[k]++; tt_bunb_ms[k] += (double)(t1 - t0);
+    if (!tt_bunb_t0) tt_bunb_t0 = t1;
+    if (t1 - tt_bunb_t0 >= 10000) {
+        tt_dbg("  [BUNB] in %u ms: pushbuffers %u waited (%.0f ms), %u kicked instead of waiting; vertex buffers %u (%.0f ms); others %u (%.0f ms)\n",
+               (unsigned)(t1 - tt_bunb_t0), tt_bunb_n[0], tt_bunb_ms[0], tt_bunb_skip, tt_bunb_n[1], tt_bunb_ms[1], tt_bunb_n[2], tt_bunb_ms[2]);
+        tt_bunb_t0 = t1; tt_bunb_n[0] = tt_bunb_n[1] = tt_bunb_n[2] = tt_bunb_skip = 0; tt_bunb_ms[0] = tt_bunb_ms[1] = tt_bunb_ms[2] = 0;
+    }
+}
+
 static volatile unsigned tt_vbh_calls, tt_vbh_isr;
 void tt_dump_dev(void)
 {
