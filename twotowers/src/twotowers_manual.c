@@ -1143,7 +1143,7 @@ void sub_0011AC90(void)
     const uint32_t ret = MEM32(esp), res = MEM32(esp + 4), dev = MEM32(0x00124180u);
     unsigned long long t0, t1;
     int k;
-    if (on < 0) { const char *e = getenv("TT_PBNOWAIT"); on = !(e && *e == '0'); }
+    if (on < 0) { const char *e = getenv("TT_PBNOWAIT"); on = e && *e == '1'; }   /* (v243: off unless =1 -- v241/v242 froze at the first load, the GPU commands' reading stuck, GET short of PUT) */
     if (on && ret == 0x0011AFDBu && dev && res >= 0x10000u && res < 0x84000000u &&
         !(MEM32(res) & 0x780000u) && !(MEM32(dev + 8) & 0x2004u)) {
         const uint32_t t = MEM32(res + 8), done = MEM32(MEM32(dev + 0x34));
